@@ -1,0 +1,36 @@
+# FLiP.jl default parameter configuration
+# Edit values here to change package-wide defaults without modifying source code.
+# Reload at runtime with: FLiP.load_config!("path/to/this/file")
+
+[statistical_filter]
+k_neighbors = 6       # Number of nearest neighbors for mean-distance computation
+n_sigma     = 1.0     # Outlier threshold: mean + n_sigma * std
+
+[voxel_connected_component_filter]
+min_cc_size = 1       # Minimum component size (in points) to keep
+
+[upward_conic_filter]
+max_search_delta_z = 5.0  # Vertical span (m) used to cap horizontal search radius
+
+[rnn_filter]
+min_rnn_size = 1      # Minimum number of neighbors within radius to keep a point
+
+[segment_ground]
+voxel_size     = 0.5  # Voxel size (m) for connected-component pre-filter
+min_cc_size    = 50   # Minimum component size for connected-component pre-filter
+grid_size      = 0.5  # XY grid cell size (m) for grid z-min filter
+cone_theta_deg = 60.0 # Upward-cone half-angle (degrees)
+
+[pipeline]
+input_path = ""            # Input LAS/LAZ file path
+output_dir = ""            # Output directory path
+output_prefix = "output"   # Prefix for written files
+
+subsample_res = 0.05        # Minimum distance (m) for optional subsampling
+enable_subsample = false    # If true, downstream stages use subsampled cloud
+enable_agh = true           # If true, compute AGH and write AGH cloud
+overwrite_outputs = false   # If false, existing outputs are not overwritten
+
+xy_resolution = 0.05        # XY resolution (m) for IDW AGH interpolation grid
+idw_k = 8                   # Number of neighbors for IDW interpolation
+idw_power = 2.0             # IDW power parameter
