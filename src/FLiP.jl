@@ -33,6 +33,7 @@ module FLiP
 
 # Standard library imports
 using LinearAlgebra
+using SparseArrays
 using Statistics
 
 # External dependencies
@@ -50,9 +51,14 @@ include("io.jl")
 include("config.jl")
 include("subsampling.jl")
 include("filtering.jl")
-include("segmentation.jl")
+include("preprocess.jl")
+include("ground_segmentation.jl")
 include("mesh.jl")
-include("main_pipeline.jl")
+include("graph.jl")
+include("tree_segmentation.jl")
+include("qsm.jl")
+include("generate_report.jl")
+include("main.jl")
 include("transformations.jl")
 
 # Export types
@@ -78,12 +84,36 @@ export grid_zmin_filter_indices, upward_conic_filter_indices
 export voxel_connected_component_filter_indices
 export rnn_filter, rnn_filter_indices
 export segment_ground
+export ground_segmentation
 
 # Export mesh functions
 export delaunay_triangulation_xy, cloud_to_mesh_distance_z
 
+# Export graph functions
+export connected_component_labels
+export build_radius_graph
+export build_graph
+export ConnectedComponentSubsetWorkspace
+export ShortestPathSubsetWorkspace
+export GreedySearchWorkspace
+export connected_component_subset!
+export quotient_graph
+export shortest_path_distances
+export shortest_path_subset!
+export slice_by_shortest_path
+export generate_proto_nodes_from_slice_label
+export label_graph_by_connectivity
+export greedy_connected_neighborhood_search
+export longest_linear_path
+export tree_segmentation
+export label_non_branching_segments
+export refine_linear_connected_segment, assemble_linear_connected_segment
+
 # Export pipeline functions
+export preprocess
 export calculate_aboveground_height
+export qsm
+export generate_report
 export run_pipeline
 
 # Export transformation functions

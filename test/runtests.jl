@@ -34,5 +34,7 @@ end
     include("test_subsampling.jl")
     include("test_filtering.jl")
     include("test_mesh.jl")
+    include("test_graph.jl")
+    include("test_main.jl")
     include("test_transformations.jl")
 end

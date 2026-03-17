@@ -1,27 +1,33 @@
 """
+    segment_ground(pc::PointCloud; grid_size, cone_theta_deg, voxel_size, min_cc_size)
+        -> PointCloud
+
+Segment ground points from a point cloud using:
+1. Voxel connected-component filtering
+2. Grid minimum-z filtering
+3. Upward conic filtering
+"""
+function segment_ground(pc::PointCloud;
+                        grid_size::Real=_CFG.segment_ground_grid_size,
+                        cone_theta_deg::Real=_CFG.segment_ground_cone_theta_deg,
+                        voxel_size::Real=_CFG.segment_ground_voxel_size,
+                        min_cc_size::Int=_CFG.segment_ground_min_cc_size)
+    coords = coordinates(pc)
+
+    idx1 = voxel_connected_component_filter_indices(coords, voxel_size, min_cc_size=min_cc_size)
+    idx2_local = grid_zmin_filter_indices(coords[idx1, :], grid_size)
+    idx2 = idx1[idx2_local]
+    idx3_local = upward_conic_filter_indices(coords[idx2, :], cone_theta_deg)
+    idx_final = idx2[idx3_local]
+    return pc[idx_final]
+end
+
+"""
     calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud; xy_resolution::Real, idw_k::Int=8, idw_power::Real=2.0)
         -> Vector{Float64}
 
-Interpolate `ground_points` onto a regular XY lattice using inverse-distance
-weighting (IDW), then compute approximate signed z-direction distance from every
-point in `pc` to the nearest interpolated ground-grid point in XY.
-
-# Arguments
-- `pc`: Full input point cloud (all returns)
-- `ground_points`: Ground-segmented point cloud (e.g. output of `segment_ground`)
-- `xy_resolution`: XY spacing for mesh sampling lattice (must be > 0)
-- `idw_k`: Number of nearest ground points used for IDW interpolation (must be >= 1)
-- `idw_power`: Power parameter for IDW weights `w = 1 / d^idw_power` (must be > 0)
-
-# Returns
-- `aboveground_height::Vector{Float64}`: Approximate signed residual
-    `z_point - z_sampled_ground_nearest_xy`; non-finite query points and points
-    beyond sampled support are `NaN`
-
-# Throws
-- `ArgumentError` if `ground_points` has fewer than 3 points
-- `ArgumentError` if `xy_resolution <= 0`
-- `ArgumentError` if `idw_k < 1` or `idw_power <= 0`
+Interpolate `ground_points` onto an XY lattice using IDW, then compute
+`z_point - z_ground_nearest_xy` for all points in `pc`.
 """
 function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
                                       xy_resolution::Real,
@@ -157,90 +163,31 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     return aboveground_height
 end
 
-@inline function _pipeline_write(path::AbstractString, pc::PointCloud; overwrite::Bool)
-    if isfile(path) && !overwrite
-        println("[run_pipeline] skip existing output (overwrite_outputs=false): $path")
-        return false
-    end
-    write_las(path, pc)
-    println("[run_pipeline] wrote: $path")
-    return true
-end
-
 """
-    run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
+    ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG) -> NamedTuple
 
-Run a config-driven point cloud processing pipeline:
-1. Load pipeline configuration from TOML.
-2. Read input point cloud.
-3. Optionally subsample the cloud.
-4. Segment ground points from the active cloud.
-5. Optionally compute AGH and attach `AGH` attribute.
-6. Save ground cloud and AGH cloud to output directory with configured prefix.
-
-Output files:
-- `{output_prefix}_ground.las`
-- `{output_prefix}_agh.las` (when `enable_agh=true`)
+Run configured ground segmentation and optional AGH computation.
 """
-function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
-    cfg = load_config!(String(config_path))
-
-    input_path = strip(cfg.pipeline_input_path)
-    output_dir = strip(cfg.pipeline_output_dir)
-    output_prefix = strip(cfg.pipeline_output_prefix)
-
-    isempty(input_path) && throw(ArgumentError("pipeline.input_path must be set in config"))
-    isempty(output_dir) && throw(ArgumentError("pipeline.output_dir must be set in config"))
-    isempty(output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
-    isfile(input_path) || throw(ArgumentError("pipeline input file not found: $input_path"))
-
-    cfg.pipeline_subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
-    cfg.pipeline_xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
-    cfg.pipeline_idw_k >= 1 || throw(ArgumentError("pipeline.idw_k must be >= 1"))
-    cfg.pipeline_idw_power > 0 || throw(ArgumentError("pipeline.idw_power must be > 0"))
-
-    mkpath(output_dir)
-
-    pc_input = read_las(input_path)
-    pc_active = cfg.pipeline_enable_subsample ? distance_subsample(pc_input, cfg.pipeline_subsample_res) : pc_input
-
-    ground_points = segment_ground(pc_active)
-
-    ground_path = joinpath(output_dir, "$(output_prefix)_ground.las")
-    ground_written = _pipeline_write(ground_path, ground_points; overwrite=cfg.pipeline_overwrite_outputs)
-
-    agh_path = joinpath(output_dir, "$(output_prefix)_agh.las")
-    agh_written = false
-    agh_count = 0
+function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
+    ground_points = segment_ground(
+        pc;
+        grid_size=cfg.segment_ground_grid_size,
+        cone_theta_deg=cfg.segment_ground_cone_theta_deg,
+        voxel_size=cfg.segment_ground_voxel_size,
+        min_cc_size=cfg.segment_ground_min_cc_size,
+    )
 
     if cfg.pipeline_enable_agh
         agh = calculate_aboveground_height(
-            pc_active,
+            pc,
             ground_points;
             xy_resolution=cfg.pipeline_xy_resolution,
             idw_k=cfg.pipeline_idw_k,
             idw_power=cfg.pipeline_idw_power,
         )
-        agh_count = length(agh)
-        pc_agh = setattribute!(pc_active, :AGH, agh)
-        agh_written = _pipeline_write(agh_path, pc_agh; overwrite=cfg.pipeline_overwrite_outputs)
-    else
-        println("[run_pipeline] AGH stage disabled by config (pipeline.enable_agh=false)")
+        pc_agh = setattribute!(pc, :AGH, agh)
+        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_agh)
     end
 
-    return (
-        input_path=input_path,
-        output_dir=output_dir,
-        output_prefix=output_prefix,
-        used_subsample=cfg.pipeline_enable_subsample,
-        agh_enabled=cfg.pipeline_enable_agh,
-        n_input=npoints(pc_input),
-        n_active=npoints(pc_active),
-        n_ground=npoints(ground_points),
-        n_agh=agh_count,
-        ground_path=ground_path,
-        agh_path=agh_path,
-        ground_written=ground_written,
-        agh_written=agh_written,
-    )
+    return (ground_points=ground_points, aboveground_height=Float64[], agh_cloud=pc)
 end

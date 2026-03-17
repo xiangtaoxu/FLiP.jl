@@ -33,6 +33,19 @@ mutable struct FLiPConfig
     segment_ground_grid_size::Float64
     segment_ground_cone_theta_deg::Float64
 
+    # preprocess
+    preprocess_enable_statistical_filter::Bool
+
+    # tree segmentation
+    tree_nearground_agh_threshold::Float64
+    tree_neighbor_radius::Float64
+    tree_slice_length::Float64
+    tree_min_cc_size::Int
+    tree_max_lcs_iterations::Int
+    tree_nbs_neighbor_distance::Int
+    tree_nbs_min_segment_size::Int
+    tree_nbs_max_iterations::Int
+
     # pipeline runner
     pipeline_input_path::String
     pipeline_output_dir::String
@@ -40,10 +53,13 @@ mutable struct FLiPConfig
     pipeline_subsample_res::Float64
     pipeline_enable_subsample::Bool
     pipeline_enable_agh::Bool
-    pipeline_overwrite_outputs::Bool
     pipeline_xy_resolution::Float64
     pipeline_idw_k::Int
     pipeline_idw_power::Float64
+    pipeline_enable_ground_segmentation::Bool
+    pipeline_enable_tree_segmentation::Bool
+    pipeline_enable_qsm::Bool
+    pipeline_enable_generate_report::Bool
 end
 
 function FLiPConfig(d::Dict)
@@ -52,6 +68,8 @@ function FLiPConfig(d::Dict)
     uc = get(d, "upward_conic_filter",              Dict{String,Any}())
     rn = get(d, "rnn_filter",                       Dict{String,Any}())
     sg = get(d, "segment_ground",                   Dict{String,Any}())
+    pp = get(d, "preprocess",                       Dict{String,Any}())
+    ts = get(d, "tree_segmentation",                Dict{String,Any}())
     pl = get(d, "pipeline",                         Dict{String,Any}())
 
     FLiPConfig(
@@ -65,16 +83,30 @@ function FLiPConfig(d::Dict)
         Float64(get(sg, "grid_size",       0.5)),
         Float64(get(sg, "cone_theta_deg",  60.0)),
 
+        Bool(get(pp, "enable_statistical_filter", false)),
+
+        Float64(get(ts, "nearground_agh_threshold", 0.3)),
+        Float64(get(ts, "neighbor_radius", -1.0)),
+        Float64(get(ts, "slice_length", 0.1)),
+        Int(get(ts, "min_cc_size", 3)),
+        Int(get(ts, "max_lcs_iterations", 5000)),
+        Int(get(ts, "nbs_neighbor_distance", 2)),
+        Int(get(ts, "nbs_min_segment_size", 5)),
+        Int(get(ts, "nbs_max_iterations", 10000)),
+
         String(get(pl, "input_path", "")),
         String(get(pl, "output_dir", "")),
         String(get(pl, "output_prefix", "output")),
         Float64(get(pl, "subsample_res", 0.05)),
         Bool(get(pl, "enable_subsample", false)),
         Bool(get(pl, "enable_agh", true)),
-        Bool(get(pl, "overwrite_outputs", false)),
         Float64(get(pl, "xy_resolution", 0.05)),
         Int(get(pl, "idw_k", 8)),
         Float64(get(pl, "idw_power", 2.0)),
+        Bool(get(pl, "enable_ground_segmentation", true)),
+        Bool(get(pl, "enable_tree_segmentation", true)),
+        Bool(get(pl, "enable_qsm", true)),
+        Bool(get(pl, "enable_generate_report", true)),
     )
 end
 
