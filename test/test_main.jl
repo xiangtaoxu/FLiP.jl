@@ -34,6 +34,7 @@ output_prefix = \"test_\"
 
 subsample_res = 0.1
 enable_subsample = true
+enable_preprocess = true
 enable_agh = true
 
 xy_resolution = 0.5
@@ -104,6 +105,7 @@ output_prefix = \"test_\"
 
 subsample_res = 0.1
 enable_subsample = false
+enable_preprocess = true
 enable_agh = false
 
 xy_resolution = 0.5

@@ -52,6 +52,7 @@ mutable struct FLiPConfig
     pipeline_output_prefix::String
     pipeline_subsample_res::Float64
     pipeline_enable_subsample::Bool
+    pipeline_enable_preprocess::Bool
     pipeline_enable_agh::Bool
     pipeline_xy_resolution::Float64
     pipeline_idw_k::Int
@@ -99,6 +100,7 @@ function FLiPConfig(d::Dict)
         String(get(pl, "output_prefix", "output")),
         Float64(get(pl, "subsample_res", 0.05)),
         Bool(get(pl, "enable_subsample", false)),
+        Bool(get(pl, "enable_preprocess", true)),
         Bool(get(pl, "enable_agh", true)),
         Float64(get(pl, "xy_resolution", 0.05)),
         Int(get(pl, "idw_k", 8)),

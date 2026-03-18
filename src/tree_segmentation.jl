@@ -29,6 +29,45 @@ function _subset_component_labels(graph::SimpleGraph{Int}, subset::Vector{Int}, 
     return connected_component_subset!(cc_workspace, graph, subset, min_cc_size)
 end
 
+"""
+    _expand_nearground_cluster(graph, seed, agh_values, agh_ceiling, mask) -> Vector{Int}
+
+BFS from `seed` over vertices where `mask[v]` is true and
+`float(agh_values[v]) <= agh_ceiling`. Returns all discovered vertices (including
+`seed`) as the connected near-ground cluster.
+"""
+function _expand_nearground_cluster(
+    graph::SimpleGraph{Int},
+    seed::Int,
+    agh_values::AbstractVector{<:Real},
+    agh_ceiling::Float64,
+    mask::BitVector,
+)
+    visited  = falses(nv(graph))
+    cluster  = Int[]
+    queue    = Int[]
+
+    visited[seed] = true
+    push!(cluster, seed)
+    push!(queue, seed)
+
+    qi = 1
+    while qi <= length(queue)
+        v = queue[qi]
+        qi += 1
+        @inbounds for nbr in Graphs.neighbors(graph, v)
+            visited[nbr] && continue
+            mask[nbr]    || continue
+            float(agh_values[nbr]) <= agh_ceiling || continue
+            visited[nbr] = true
+            push!(cluster, nbr)
+            push!(queue, nbr)
+        end
+    end
+
+    return cluster
+end
+
 function _build_proto_graph(points::AbstractMatrix{<:Real},
                             graph::SimpleGraph{Int},
                             subset_vertices::AbstractVector{<:Integer},
@@ -252,15 +291,18 @@ Returns `(nbs_id::Vector{Int32}, node_id::Vector{Int32})`.
 """
 function label_non_branching_segments(
     graph::SimpleGraph{Int},
-    points::AbstractMatrix{<:Real};
+    points::AbstractMatrix{<:Real},
+    agh_values::AbstractVector{<:Real};
     cfg::FLiPConfig = _CFG,
 )
     N = nv(graph)
     size(points, 1) == N || throw(ArgumentError("graph vertex count must match number of points"))
+    length(agh_values) == N || throw(ArgumentError("agh_values length must match graph vertex count"))
 
-    min_segment_size  = cfg.tree_nbs_min_segment_size
-    neighbor_distance = cfg.tree_nbs_neighbor_distance
-    max_iter          = cfg.tree_nbs_max_iterations
+    min_segment_size      = cfg.tree_nbs_min_segment_size
+    neighbor_distance     = cfg.tree_nbs_neighbor_distance
+    max_iter              = cfg.tree_nbs_max_iterations
+    nearground_agh_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
 
     global_nbs_id  = zeros(Int, N)
     global_node_id = zeros(Int, N)
@@ -289,8 +331,17 @@ function label_non_branching_segments(
         z_cursor > N && break
         seed = z_sorted[z_cursor]
 
+        # If the seed AGH is within the near-ground ceiling, expand it to the full
+        # connected cluster of near-ground points before starting the greedy search.
+        start_vertices = if float(agh_values[seed]) <= nearground_agh_ceiling
+            _expand_nearground_cluster(graph, seed, agh_values, nearground_agh_ceiling, unlabeled_mask)
+        else
+            Int[seed]
+        end
+
+
         result = greedy_connected_neighborhood_search(
-            graph, seed, neighbor_distance;
+            graph, start_vertices, neighbor_distance;
             vertex_mask = unlabeled_mask,
             workspace   = gsws,
         )
@@ -360,16 +411,17 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         neighbor_radius=0.0,
     )
 
-    pc_filtered = pc[nearground_idx]
+    pc_filtered     = pc[nearground_idx]
     coords_filtered = coordinates(pc_filtered)
+    agh_filtered    = float.(getattribute(pc_filtered, :AGH))
 
-    neighbor_radius = cfg.tree_neighbor_radius > 0 ? cfg.tree_neighbor_radius : 1.5 * cfg.pipeline_subsample_res
+    neighbor_radius = cfg.tree_neighbor_radius > 0 ? cfg.tree_neighbor_radius : 2.0 * cfg.pipeline_subsample_res
     neighbor_radius > 0 || throw(ArgumentError("tree neighbor radius must be > 0"))
 
     g_res = build_radius_graph(coords_filtered, neighbor_radius)
     graph = g_res.graph
 
-    nbs_res = label_non_branching_segments(graph, coords_filtered; cfg=cfg)
+    nbs_res = label_non_branching_segments(graph, coords_filtered, agh_filtered; cfg=cfg)
 
     pc_output      = setattribute!(pc_filtered, :nbs_id, nbs_res.nbs_id)
     pc_output      = setattribute!(pc_output, :node_id, nbs_res.node_id)

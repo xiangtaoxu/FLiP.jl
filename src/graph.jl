@@ -891,12 +891,13 @@ function label_graph_by_connectivity(
 end
 
 """
-    greedy_connected_neighborhood_search(graph, start_vertex, neighbor_distance;
+    greedy_connected_neighborhood_search(graph, start_vertices, neighbor_distance;
                                          vertex_mask=nothing, workspace=nothing)
         -> NamedTuple{(:vertices, :node_ids, :max_node_id)}
 
-Greedy connectivity expansion starting from `start_vertex`.
+Greedy connectivity expansion starting from one or more seed vertices `start_vertices`.
 
+All vertices in `start_vertices` are treated as node_id 1 (the initial frontier).
 Each iteration performs a BFS of up to `neighbor_distance` hops from the current
 frontier (graph edge distance only — no spatial coordinates required), restricted
 to vertices in `vertex_mask`. The collected neighborhood vertices are checked for
@@ -904,12 +905,13 @@ connectivity, and only the largest connected component is accepted as the new
 frontier. Expansion continues until no new vertices can be reached.
 
 Each accepted frontier wave is assigned a monotonically increasing `node_id`
-(starting from 1 for `start_vertex`). This records the sequential structure of
-the expanded path.
+(starting from 1 for all seed vertices in `start_vertices`). This records the
+sequential structure of the expanded path.
 
 # Arguments
 - `graph`: The graph to search
-- `start_vertex`: Seed vertex for the expansion
+- `start_vertices`: Seed vertices for the expansion (`AbstractVector{<:Integer}`).
+  All must be valid vertex indices within `vertex_mask`. Duplicates are silently ignored.
 - `neighbor_distance`: Maximum number of hops (graph edges) used to expand the frontier
   each iteration
 
@@ -924,21 +926,20 @@ the expanded path.
 - `NamedTuple` with fields:
   - `vertices`: `Vector{Int}` of global vertex indices in the grown region
   - `node_ids`: `Vector{Int}` of per-vertex frontier IDs (same order as `vertices`);
-    `node_id == 1` for `start_vertex`, incrementing by 1 for each accepted frontier wave
+    `node_id == 1` for all seed vertices, incrementing by 1 for each accepted frontier wave
   - `max_node_id`: highest frontier ID assigned (equals number of frontier waves)
 """
 function greedy_connected_neighborhood_search(
     graph::SimpleGraph{Int},
-    start_vertex::Integer,
+    start_vertices::AbstractVector{<:Integer},
     neighbor_distance::Integer;
     vertex_mask::Union{Nothing, AbstractVector{<:Integer}, BitVector}=nothing,
     workspace::Union{Nothing, GreedySearchWorkspace}=nothing,
 )
     neighbor_distance >= 1 || throw(ArgumentError("neighbor_distance must be >= 1"))
+    isempty(start_vertices) && throw(ArgumentError("start_vertices must not be empty"))
 
     n = nv(graph)
-    sv = Int(start_vertex)
-    1 <= sv <= n || throw(ArgumentError("start_vertex is out of range"))
 
     ws = workspace !== nothing ? workspace : GreedySearchWorkspace(n)
     length(ws.mask_allowed) == n || throw(ArgumentError("workspace size must match nv(graph)"))
@@ -957,21 +958,24 @@ function greedy_connected_neighborhood_search(
             ws.mask_allowed[v_i] = true
         end
     end
-    ws.mask_allowed[sv] || throw(ArgumentError("start_vertex must be within vertex_mask"))
 
-    # Initialise per-call state — clean only the seed entry; everything else is
+    # Initialise per-call state — clean only the seed entries; everything else is
     # cleaned at the end of the previous call (or freshly zero-constructed).
-    ws.included[sv]    = true
-    ws.node_id_map[sv] = 1
-    next_node_id       = 1
-
     empty!(ws.vertices_buf)
-    push!(ws.vertices_buf, sv)
-
-    # frontier lives in new_frontier buffer; starts as just [sv]
     frontier = ws.new_frontier
     empty!(frontier)
-    push!(frontier, sv)
+    next_node_id = 1
+
+    @inbounds for sv_raw in start_vertices
+        sv = Int(sv_raw)
+        1 <= sv <= n || throw(ArgumentError("start_vertices contains out-of-range vertex $sv"))
+        ws.mask_allowed[sv] || throw(ArgumentError("start_vertex $sv must be within vertex_mask"))
+        ws.included[sv] && continue   # skip duplicates silently
+        ws.included[sv]    = true
+        ws.node_id_map[sv] = 1
+        push!(ws.vertices_buf, sv)
+        push!(frontier, sv)
+    end
 
     while true
         # --- Load frontier into layer_a, prepare double-buffer layer_b ---
@@ -1021,23 +1025,26 @@ function greedy_connected_neighborhood_search(
         next_node_id += 1
         empty!(frontier)
         @inbounds for (i, v) in enumerate(ws.new_pts)
+            ws.included[v] = true        # always mark — prevents rediscovery in future iterations
+            push!(ws.vertices_buf, v)    # always track — needed for cleanup
             if cc[i] == 1
-                ws.included[v]    = true
                 ws.node_id_map[v] = next_node_id
                 push!(frontier, v)
-                push!(ws.vertices_buf, v)
             end
+            # discarded (cc != 1): node_id_map[v] stays 0 — excluded from output
         end
 
         isempty(frontier) && break
     end
 
-    # Extract results
-    nv_seg   = length(ws.vertices_buf)
-    vertices = copy(ws.vertices_buf)
-    node_ids = Vector{Int}(undef, nv_seg)
-    @inbounds for i in 1:nv_seg
-        node_ids[i] = ws.node_id_map[vertices[i]]
+    # Extract results — filter out discarded vertices (node_id_map == 0)
+    vertices = sizehint!(Int[], length(ws.vertices_buf))
+    node_ids = sizehint!(Int[], length(ws.vertices_buf))
+    @inbounds for v in ws.vertices_buf
+        nid = ws.node_id_map[v]
+        nid == 0 && continue   # discarded (not in largest CC)
+        push!(vertices, v)
+        push!(node_ids, nid)
     end
 
     # Cleanup only touched entries — O(segment size), not O(N)

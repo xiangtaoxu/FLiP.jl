@@ -60,8 +60,17 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     # 1) preprocess
     preprocess_path = _pipeline_output_path(output_dir, output_prefix, "preprocess")
     preprocess_written = false
-    pc_preprocess = preprocess(pc_input; cfg=cfg)
-    preprocess_written = _pipeline_write(preprocess_path, pc_preprocess)
+    pc_preprocess = nothing
+    if cfg.pipeline_enable_preprocess
+        pc_preprocess = preprocess(pc_input; cfg=cfg)
+        preprocess_written = _pipeline_write(preprocess_path, pc_preprocess)
+    else
+        println("[main] preprocess disabled by config")
+        if isfile(preprocess_path)
+            pc_preprocess = _pipeline_load(preprocess_path, "preprocess output")
+            preprocess_written = true
+        end
+    end
 
     # 2) ground segmentation
     ground_points = nothing
@@ -159,7 +168,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
         output_dir=output_dir,
         output_prefix=output_prefix,
         n_input=npoints(pc_input),
-        n_preprocess=npoints(pc_preprocess),
+        n_preprocess=isnothing(pc_preprocess) ? 0 : npoints(pc_preprocess),
         n_ground=isnothing(ground_points) ? 0 : npoints(ground_points),
         tree_components=tree_components,
         preprocess_path=preprocess_path,
