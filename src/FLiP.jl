@@ -43,6 +43,7 @@ using NearestNeighbors
 using PointClouds
 using StaticArrays
 using CoordinateTransformations
+using MultivariateStats
 using Rotations
 
 # Include submodules
@@ -107,6 +108,7 @@ export greedy_connected_neighborhood_search
 export longest_linear_path
 export tree_segmentation
 export label_non_branching_segments
+export label_linear_segments
 export refine_linear_connected_segment, assemble_linear_connected_segment
 
 # Export pipeline functions

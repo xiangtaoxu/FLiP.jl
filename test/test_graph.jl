@@ -321,4 +321,5 @@ import Graphs
 
         @test_throws ArgumentError longest_linear_path(tree, coords, 0)
     end
+
 end

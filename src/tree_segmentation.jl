@@ -271,14 +271,6 @@ function generate_proto_nodes_from_slice_label(points::AbstractMatrix{<:Real},
     return proto_nodes
 end
 
-function refine_linear_connected_segment(args...; kwargs...)
-    return nothing
-end
-
-function assemble_linear_connected_segment(args...; kwargs...)
-    return nothing
-end
-
 """
     label_non_branching_segments(graph, points; cfg) -> NamedTuple
 
@@ -391,6 +383,152 @@ function label_non_branching_segments(
 end
 
 """
+    _write_polyline_obj(path, coords, graph)
+
+Write a skeleton graph as an OBJ polyline file readable by CloudCompare.
+Every edge is written as a separate `l u v` statement (1-indexed vertices).
+"""
+function _write_polyline_obj(path::AbstractString, coords::AbstractMatrix{<:Real}, graph::SimpleGraph{Int})
+    open(path, "w") do io
+        println(io, "# FLiP.jl skeleton graph")
+        n = size(coords, 1)
+        for i in 1:n
+            println(io, "v $(Float64(coords[i, 1])) $(Float64(coords[i, 2])) $(Float64(coords[i, 3]))")
+        end
+        for e in Graphs.edges(graph)
+            println(io, "l $(src(e)) $(dst(e))")
+        end
+    end
+    return nothing
+end
+
+"""
+    create_skeleton_cloud(graph, coords_filtered, node_id; template_pc=nothing)
+        -> NamedTuple{(:skeleton_cloud, :graph_skeleton)}
+
+Build a skeleton point cloud and an MST-pruned skeleton graph from NBS node
+assignments produced by `label_non_branching_segments`.
+
+Each non-zero node label `n` in `node_id` is represented in the skeleton by the
+centroid of all points assigned to that node. The returned `skeleton_cloud` carries
+extra per-point attributes `:node_id` (original node label) and `:n_points` (number
+of raw points contributing to that node centroid).
+
+The skeleton graph has one vertex per node. An edge between nodes A and B is
+inserted for every point-level edge in `graph` that crosses the A/B node boundary.
+Edge weight is `1 / count` where `count` is the total number of such crossing
+point-pair connections (more connections -> lower weight -> preferred in MST).
+Kruskal MST is applied to remove cycles while keeping the strongest connections.
+"""
+function create_skeleton_cloud(
+    graph::SimpleGraph{Int},
+    coords_filtered::AbstractMatrix{<:Real},
+    node_id::AbstractVector{<:Integer};
+    template_pc::Union{Nothing, PointCloud} = nothing,
+)
+    N = nv(graph)
+    size(coords_filtered, 1) == N || throw(ArgumentError("graph vertex count must match coords_filtered rows"))
+    length(node_id) == N          || throw(ArgumentError("node_id length must match graph vertex count"))
+
+    # Find max node id
+    max_node = 0
+    @inbounds for i in 1:N
+        nid = Int(node_id[i])
+        nid > max_node && (max_node = nid)
+    end
+
+    if max_node == 0
+        empty_pc = if isnothing(template_pc)
+            PointClouds.LAS((x=Float64[], y=Float64[], z=Float64[]))
+        else
+            PointClouds.LAS((x=Float64[], y=Float64[], z=Float64[]);
+                            coord_scale=template_pc.coord_scale, coord_offset=template_pc.coord_offset)
+        end
+        return (skeleton_cloud=empty_pc, graph_skeleton=SimpleGraph{Int}(0))
+    end
+
+    # Accumulate per-node coordinate sums and counts
+    node_sum = zeros(Float64, max_node, 3)
+    node_cnt = zeros(Int, max_node)
+    @inbounds for i in 1:N
+        nid = Int(node_id[i])
+        nid > 0 || continue
+        node_sum[nid, 1] += Float64(coords_filtered[i, 1])
+        node_sum[nid, 2] += Float64(coords_filtered[i, 2])
+        node_sum[nid, 3] += Float64(coords_filtered[i, 3])
+        node_cnt[nid] += 1
+    end
+
+    # Keep only nodes with at least one point
+    valid_nodes  = [n for n in 1:max_node if node_cnt[n] > 0]
+    n_nodes      = length(valid_nodes)
+    node_to_skel = zeros(Int, max_node)   # original node label -> skeleton vertex index
+    for (si, n) in enumerate(valid_nodes)
+        node_to_skel[n] = si
+    end
+
+    skel_coords = zeros(Float64, n_nodes, 3)
+    skel_npts   = zeros(Int32, n_nodes)
+    skel_nids   = zeros(Int32, n_nodes)
+    for (si, n) in enumerate(valid_nodes)
+        c = node_cnt[n]
+        skel_coords[si, 1] = node_sum[n, 1] / c
+        skel_coords[si, 2] = node_sum[n, 2] / c
+        skel_coords[si, 3] = node_sum[n, 3] / c
+        skel_npts[si] = Int32(c)
+        skel_nids[si] = Int32(n)
+    end
+
+    # Build skeleton PointCloud
+    pts_nt   = (x=skel_coords[:, 1], y=skel_coords[:, 2], z=skel_coords[:, 3])
+    skel_las = if isnothing(template_pc)
+        PointClouds.LAS(pts_nt)
+    else
+        PointClouds.LAS(pts_nt; coord_scale=template_pc.coord_scale, coord_offset=template_pc.coord_offset)
+    end
+    skel_pc = setattribute!(skel_las, :node_id,  skel_nids)
+    skel_pc = setattribute!(skel_pc,  :n_points, skel_npts)
+
+    # Count point-wise cross-node edge connections
+    edge_counts = Dict{Tuple{Int,Int}, Int}()
+    @inbounds for e in Graphs.edges(graph)
+        u  = src(e); v = dst(e)
+        nA = Int(node_id[u]); nB = Int(node_id[v])
+        (nA > 0 && nB > 0 && nA != nB) || continue
+        siA = node_to_skel[nA]; siB = node_to_skel[nB]
+        (siA > 0 && siB > 0) || continue
+        key = siA < siB ? (siA, siB) : (siB, siA)
+        edge_counts[key] = get(edge_counts, key, 0) + 1
+    end
+
+    # Build initial skeleton graph and run Kruskal MST
+    n_pairs = length(edge_counts)
+    if n_pairs == 0
+        return (skeleton_cloud=skel_pc, graph_skeleton=SimpleGraph{Int}(n_nodes))
+    end
+
+    row_ids    = Vector{Int}(undef, 2 * n_pairs)
+    col_ids    = Vector{Int}(undef, 2 * n_pairs)
+    wt_vals    = Vector{Float64}(undef, 2 * n_pairs)
+    init_graph = SimpleGraph{Int}(n_nodes)
+    for (k, ((u, v), cnt)) in enumerate(edge_counts)
+        add_edge!(init_graph, u, v)
+        w = 1.0 / Float64(cnt)
+        row_ids[2k-1] = u;  col_ids[2k-1] = v;  wt_vals[2k-1] = w
+        row_ids[2k]   = v;  col_ids[2k]   = u;  wt_vals[2k]   = w
+    end
+    wt_matrix = sparse(row_ids, col_ids, wt_vals, n_nodes, n_nodes)
+
+    mst_edges      = kruskal_mst(init_graph, wt_matrix; minimize=true)
+    graph_skeleton = SimpleGraph{Int}(n_nodes)
+    for e in mst_edges
+        add_edge!(graph_skeleton, src(e), dst(e))
+    end
+
+    return (skeleton_cloud=skel_pc, graph_skeleton=graph_skeleton)
+end
+
+"""
     tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG) -> NamedTuple
 
 Run tree segmentation on points with AGH attribute.
@@ -422,10 +560,17 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     graph = g_res.graph
 
     nbs_res = label_non_branching_segments(graph, coords_filtered, agh_filtered; cfg=cfg)
+    skel_res       = create_skeleton_cloud(graph, coords_filtered, nbs_res.node_id; template_pc=pc_filtered)
 
     pc_output      = setattribute!(pc_filtered, :nbs_id, nbs_res.nbs_id)
     pc_output      = setattribute!(pc_output, :node_id, nbs_res.node_id)
-    skeleton_cloud = pc_filtered[1:0]  # placeholder; skeleton extraction not yet implemented
+    skeleton_cloud = skel_res.skeleton_cloud
+
+    if !isempty(cfg.pipeline_output_dir)
+        obj_path = joinpath(expanduser(cfg.pipeline_output_dir), "$(cfg.pipeline_output_prefix)skeleton_graph.obj")
+        _write_polyline_obj(obj_path, coordinates(skeleton_cloud), skel_res.graph_skeleton)
+        println("[tree_segmentation] wrote: $obj_path")
+    end
 
     return (
         filtered_cloud  = pc_filtered,

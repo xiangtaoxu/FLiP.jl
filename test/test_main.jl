@@ -132,6 +132,10 @@ neighbor_radius = 1.0
 slice_length = 0.1
 min_cc_size = 2
 max_lcs_iterations = 10
+nbs_neighbor_distance = 2
+nbs_min_segment_size = 2
+nbs_max_iterations = 100
+ls_angle_threshold_deg = 60.0
 """)
         end
 
