@@ -315,6 +315,9 @@ function label_non_branching_segments(
     z_cursor         = 1
     next_id          = 1
     next_global_node = 1
+    n_labeled_total  = count(!, unlabeled_mask)  # already labeled (discarded small CCs)
+    last_pct_report  = 0
+    t_nbs_start      = time()
 
     while next_id - 1 < max_iter
         while z_cursor <= N && !unlabeled_mask[z_sorted[z_cursor]]
@@ -356,6 +359,13 @@ function label_non_branching_segments(
             end
             next_global_node += result.max_node_id
             next_id          += 1
+        end
+
+        n_labeled_total += n_labeled
+        pct = round(Int, 100.0 * n_labeled_total / N)
+        if pct >= last_pct_report + 5
+            last_pct_report = pct - (pct % 5)
+            @info "NBS labeling progress" pct=last_pct_report nbs_count=next_id-1 elapsed_s=round(time()-t_nbs_start, digits=1)
         end
     end
 

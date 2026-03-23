@@ -1024,6 +1024,16 @@ function greedy_connected_neighborhood_search(
         cc = connected_component_subset!(ws.cc_ws, graph, ws.new_pts)
         next_node_id += 1
         empty!(frontier)
+
+        # Retrospective branch refinement: when multiple CCs detected, reassign
+        # ambiguous upstream vertices that likely belong to the discarded branch.
+        if maximum(cc) > 1
+            cc_chosen_verts = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] == 1]
+            cc_other_verts  = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] > 1]
+            _refine_branching(graph, ws, cc_chosen_verts, cc_other_verts,
+                              next_node_id, neighbor_distance)
+        end
+
         @inbounds for (i, v) in enumerate(ws.new_pts)
             ws.included[v] = true        # always mark — prevents rediscovery in future iterations
             push!(ws.vertices_buf, v)    # always track — needed for cleanup
@@ -1054,6 +1064,326 @@ function greedy_connected_neighborhood_search(
     end
 
     return (vertices=vertices, node_ids=node_ids, max_node_id=next_node_id)
+end
+
+"""
+Lightweight BFS workspace with touched-vertex cleanup for subset-restricted
+multi-source BFS. Vectors are sized to `nv(graph)` but only touched entries
+are reset between calls — O(|touched|) cleanup, not O(N).
+"""
+mutable struct _BFSWorkspace
+    allowed::BitVector       # subset membership
+    visited::BitVector       # BFS visited flag
+    distances::Vector{Int}   # hop distances; -1 = unreached
+    queue::Vector{Int}       # BFS queue (reused across calls)
+    touched::Vector{Int}     # vertices touched this call (for cleanup)
+end
+
+function _BFSWorkspace(n::Int)
+    ws = _BFSWorkspace(falses(n), falses(n), fill(-1, n),
+                       sizehint!(Int[], 256), sizehint!(Int[], 256))
+    return ws
+end
+
+
+"""
+    _cc_diameter_hops(graph, cc_vertices, bfs_ws) -> Int
+
+Approximate the diameter of `cc_vertices` in hop count using double-BFS:
+BFS from an arbitrary vertex to find the farthest, then BFS from the farthest.
+Uses `_bfs_run_and_read!` / `_bfs_cleanup!` to read distances before resetting.
+"""
+function _cc_diameter_hops(graph::SimpleGraph{Int},
+                                cc_vertices::AbstractVector{<:Integer},
+                                bfs_ws::_BFSWorkspace)
+    # --- First pass: BFS from arbitrary vertex ---
+    empty!(bfs_ws.queue)
+    empty!(bfs_ws.touched)
+    @inbounds for v in cc_vertices
+        bfs_ws.allowed[v] = true
+    end
+    start = Int(cc_vertices[1])
+    bfs_ws.visited[start] = true
+    bfs_ws.distances[start] = 0
+    push!(bfs_ws.queue, start)
+    push!(bfs_ws.touched, start)
+
+    head = 1
+    @inbounds while head <= length(bfs_ws.queue)
+        u = bfs_ws.queue[head]
+        head += 1
+        du = bfs_ws.distances[u]
+        for nbr in Graphs.neighbors(graph, u)
+            bfs_ws.allowed[nbr] || continue
+            bfs_ws.visited[nbr] && continue
+            bfs_ws.visited[nbr] = true
+            bfs_ws.distances[nbr] = du + 1
+            push!(bfs_ws.queue, nbr)
+            push!(bfs_ws.touched, nbr)
+        end
+    end
+
+    # Find farthest vertex
+    farthest = start
+    max_d = 0
+    @inbounds for v in bfs_ws.touched
+        d = bfs_ws.distances[v]
+        if d > max_d
+            max_d = d
+            farthest = v
+        end
+    end
+
+    # Cleanup first pass
+    @inbounds for v in bfs_ws.touched
+        bfs_ws.visited[v] = false
+        bfs_ws.distances[v] = -1
+    end
+    @inbounds for v in cc_vertices
+        bfs_ws.allowed[v] = false
+    end
+
+    # --- Second pass: BFS from farthest ---
+    empty!(bfs_ws.queue)
+    empty!(bfs_ws.touched)
+    @inbounds for v in cc_vertices
+        bfs_ws.allowed[v] = true
+    end
+    bfs_ws.visited[farthest] = true
+    bfs_ws.distances[farthest] = 0
+    push!(bfs_ws.queue, farthest)
+    push!(bfs_ws.touched, farthest)
+
+    head = 1
+    @inbounds while head <= length(bfs_ws.queue)
+        u = bfs_ws.queue[head]
+        head += 1
+        du = bfs_ws.distances[u]
+        for nbr in Graphs.neighbors(graph, u)
+            bfs_ws.allowed[nbr] || continue
+            bfs_ws.visited[nbr] && continue
+            bfs_ws.visited[nbr] = true
+            bfs_ws.distances[nbr] = du + 1
+            push!(bfs_ws.queue, nbr)
+            push!(bfs_ws.touched, nbr)
+        end
+    end
+
+    # Read diameter
+    diam = 0
+    @inbounds for v in bfs_ws.touched
+        d = bfs_ws.distances[v]
+        d > diam && (diam = d)
+    end
+
+    # Cleanup second pass
+    @inbounds for v in bfs_ws.touched
+        bfs_ws.visited[v] = false
+        bfs_ws.distances[v] = -1
+    end
+    @inbounds for v in cc_vertices
+        bfs_ws.allowed[v] = false
+    end
+
+    return diam
+end
+
+"""
+    _refine_branching(graph, ws, cc_chosen, cc_other, next_node_id, neighbor_distance) -> Int
+
+Retrospectively reassign ambiguous vertices near a branch point using geodesic
+distance tiebreaking with pure upstream anchors.
+
+When a branching is detected (multiple CCs in frontier), vertices from recent
+waves may belong to the discarded branch. This function identifies the ambiguous
+zone (adaptive, based on CC diameter), computes hop distances to both CCs and to
+pure upstream anchors via multi-source BFS, then zeroes `node_id_map` for vertices
+that are closer to the discarded CC.
+
+Returns the number of reassigned vertices.
+
+Modifies `ws.node_id_map` in-place (sets reassigned vertices to 0).
+Does NOT modify `ws.included` — reassigned vertices remain marked to prevent
+re-exploration.
+"""
+function _refine_branching(graph::SimpleGraph{Int},
+                           ws::GreedySearchWorkspace,
+                           cc_chosen::Vector{Int},
+                           cc_other::Vector{Int},
+                           next_node_id::Int,
+                           neighbor_distance::Int)
+    # Early exit: need at least 4 waves (2 pure + 1 ambiguous + current frontier)
+    next_node_id < 4 && return 0
+
+    # --- Determine ambiguous zone size from CC diameter ---
+    bfs_ws = _BFSWorkspace(nv(graph))
+    diameter = _cc_diameter_hops(graph, cc_chosen, bfs_ws)
+    n_ambiguous_waves = max(1, diameter ÷ neighbor_distance)
+    n_pure_waves = 2
+
+    # Wave IDs: seed=1, first expansion=2, ..., last accepted=next_node_id-1
+    # (next_node_id is the current frontier wave being assigned to cc_chosen)
+    last_accepted = next_node_id - 1
+    first_ambiguous_node = last_accepted - n_ambiguous_waves + 1
+
+    if first_ambiguous_node < 2
+        first_pure_node = 1
+        first_ambiguous_node = min(3, last_accepted)
+    else
+        first_pure_node = first_ambiguous_node - n_pure_waves
+        if first_pure_node < 1
+            first_pure_node = 1
+        end
+    end
+
+    # --- Collect vertex sets from workspace ---
+    pure_upstream = Int[]
+    ambiguous     = Int[]
+    @inbounds for v in ws.vertices_buf
+        nid = ws.node_id_map[v]
+        nid == 0 && continue
+        if nid >= first_pure_node && nid < first_ambiguous_node
+            push!(pure_upstream, v)
+        elseif nid >= first_ambiguous_node && nid <= last_accepted
+            push!(ambiguous, v)
+        end
+    end
+
+    isempty(pure_upstream) && return 0
+    isempty(ambiguous)     && return 0
+
+    # --- Multi-source BFS from each group ---
+    # We need to read distances before cleanup, so we inline the BFS calls
+    # and copy distances for ambiguous vertices between passes.
+    all_subset = vcat(pure_upstream, ambiguous, cc_chosen, cc_other)
+    N_amb = length(ambiguous)
+
+    # BFS from cc_chosen → read distances for ambiguous vertices
+    _bfs_run_and_read!(bfs_ws, graph, all_subset, cc_chosen)
+    dc = Vector{Int}(undef, N_amb)
+    @inbounds for (i, v) in enumerate(ambiguous)
+        dc[i] = bfs_ws.distances[v]
+    end
+    _bfs_cleanup!(bfs_ws, all_subset)
+
+    # BFS from cc_other → read distances for ambiguous vertices
+    _bfs_run_and_read!(bfs_ws, graph, all_subset, cc_other)
+    du = Vector{Int}(undef, N_amb)
+    @inbounds for (i, v) in enumerate(ambiguous)
+        du[i] = bfs_ws.distances[v]
+    end
+    _bfs_cleanup!(bfs_ws, all_subset)
+
+    # BFS from pure_upstream → read distances for ambiguous vertices
+    _bfs_run_and_read!(bfs_ws, graph, all_subset, pure_upstream)
+    d_up = Vector{Int}(undef, N_amb)
+    @inbounds for (i, v) in enumerate(ambiguous)
+        d_up[i] = bfs_ws.distances[v]
+    end
+    _bfs_cleanup!(bfs_ws, all_subset)
+
+    # --- Adaptive threshold: median upstream distance for ambiguous vertices ---
+    n_finite = 0
+    sum_up = 0
+    finite_dists = Int[]
+    @inbounds for i in 1:N_amb
+        d_up[i] >= 0 || continue
+        push!(finite_dists, d_up[i])
+    end
+    upstream_threshold = isempty(finite_dists) ? typemax(Int) : _median_int(finite_dists)
+
+    # --- Reassign ambiguous vertices ---
+    n_reassigned = 0
+    @inbounds for i in 1:N_amb
+        dci = dc[i]
+        dui = du[i]
+        # Unreachable from chosen but reachable from other → reassign
+        if dci < 0 && dui >= 0
+            ws.node_id_map[ambiguous[i]] = 0
+            n_reassigned += 1
+            continue
+        end
+        # Unreachable from other or both unreachable → keep
+        (dci < 0 || dui < 0) && continue
+        # Closer to chosen → keep
+        dci <= dui && continue
+
+        # Closer to other branch — check if in ambiguous ratio zone
+        if dui > 0
+            ratio = dci / dui
+            if ratio > 0.8 && ratio < 1.2
+                # Tiebreaker: upstream connectivity
+                if d_up[i] >= 0 && d_up[i] <= upstream_threshold
+                    continue   # well-connected to upstream → keep on main branch
+                end
+            end
+        end
+
+        ws.node_id_map[ambiguous[i]] = 0
+        n_reassigned += 1
+    end
+
+    return n_reassigned
+end
+
+# Run BFS without cleanup (caller reads distances then calls _bfs_cleanup!)
+function _bfs_run_and_read!(bfs_ws::_BFSWorkspace,
+                            graph::SimpleGraph{Int},
+                            subset::AbstractVector{<:Integer},
+                            sources::AbstractVector{<:Integer})
+    empty!(bfs_ws.queue)
+    empty!(bfs_ws.touched)
+    @inbounds for v in subset
+        bfs_ws.allowed[v] = true
+    end
+    @inbounds for s in sources
+        sv = Int(s)
+        if !bfs_ws.visited[sv]
+            bfs_ws.visited[sv] = true
+            bfs_ws.distances[sv] = 0
+            push!(bfs_ws.queue, sv)
+            push!(bfs_ws.touched, sv)
+        end
+    end
+    head = 1
+    @inbounds while head <= length(bfs_ws.queue)
+        u = bfs_ws.queue[head]
+        head += 1
+        du = bfs_ws.distances[u]
+        for nbr in Graphs.neighbors(graph, u)
+            bfs_ws.allowed[nbr] || continue
+            bfs_ws.visited[nbr] && continue
+            bfs_ws.visited[nbr] = true
+            bfs_ws.distances[nbr] = du + 1
+            push!(bfs_ws.queue, nbr)
+            push!(bfs_ws.touched, nbr)
+        end
+    end
+    return nothing
+end
+
+# Reset workspace after reading distances
+function _bfs_cleanup!(bfs_ws::_BFSWorkspace, subset::AbstractVector{<:Integer})
+    @inbounds for v in bfs_ws.touched
+        bfs_ws.visited[v] = false
+        bfs_ws.distances[v] = -1
+        bfs_ws.allowed[v] = false
+    end
+    @inbounds for v in subset
+        bfs_ws.allowed[v] = false
+    end
+    return nothing
+end
+
+# Integer median without Float64 conversion
+function _median_int(v::Vector{Int})
+    sort!(v)
+    n = length(v)
+    if isodd(n)
+        return v[(n + 1) ÷ 2]
+    else
+        return (v[n ÷ 2] + v[n ÷ 2 + 1]) ÷ 2
+    end
 end
 
 function _validate_graph_points(points::AbstractMatrix{<:Real})
