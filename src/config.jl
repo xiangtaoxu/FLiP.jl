@@ -45,7 +45,7 @@ mutable struct FLiPConfig
     tree_nbs_neighbor_distance::Int
     tree_nbs_min_segment_size::Int
     tree_nbs_max_iterations::Int
-    tree_ls_angle_threshold_deg::Float64
+    tree_linearity_angle_deg::Float64
 
     # pipeline runner
     pipeline_input_path::String
@@ -95,7 +95,7 @@ function FLiPConfig(d::Dict)
         Int(get(ts, "nbs_neighbor_distance", 2)),
         Int(get(ts, "nbs_min_segment_size", 5)),
         Int(get(ts, "nbs_max_iterations", 10000)),
-        Float64(get(ts, "ls_angle_threshold_deg", 60.0)),
+        Float64(get(ts, "linearity_angle_deg", 80.0)),
 
         String(get(pl, "input_path", "")),
         String(get(pl, "output_dir", "")),

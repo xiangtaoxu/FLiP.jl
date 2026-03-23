@@ -290,6 +290,16 @@ mutable struct GreedySearchWorkspace
     new_frontier::Vector{Int}    # accepted next frontier after CC check
     vertices_buf::Vector{Int}    # accumulates all accepted vertices
     cc_ws::ConnectedComponentSubsetWorkspace
+    # Incremental per-node centroid accumulators (indexed by node_id, push!-grown)
+    node_sum_x::Vector{Float64}
+    node_sum_y::Vector{Float64}
+    node_sum_z::Vector{Float64}
+    node_count::Vector{Int}
+    # Per-CC scratch buffers for _find_best_frontier (reused each iteration)
+    frontier_cc_cx::Vector{Float64}
+    frontier_cc_cy::Vector{Float64}
+    frontier_cc_cz::Vector{Float64}
+    frontier_cc_count::Vector{Int}
 end
 
 function GreedySearchWorkspace(n_vertices::Integer)
@@ -303,6 +313,14 @@ function GreedySearchWorkspace(n_vertices::Integer)
         sizehint!(Int[], 256), sizehint!(Int[], 64),
         sizehint!(Int[], 256),
         ConnectedComponentSubsetWorkspace(n),
+        sizehint!(Float64[], 64),
+        sizehint!(Float64[], 64),
+        sizehint!(Float64[], 64),
+        sizehint!(Int[], 64),
+        sizehint!(Float64[], 8),
+        sizehint!(Float64[], 8),
+        sizehint!(Float64[], 8),
+        sizehint!(Int[], 8),
     )
 end
 
@@ -788,111 +806,10 @@ function longest_linear_path(graph::SimpleGraph{Int}, points::AbstractMatrix{<:R
 end
 
 """
-    label_graph_by_connectivity(graph, points, vertex_mask, start_vertex, distance;
-                                workspace=nothing) -> BitVector
-
-Label a non-branching segment (NBS) by growing outward from `start_vertex` in
-iterative frontier rounds, stopping when the frontier splits into multiple connected
-components (indicating a branch point).
-
-# Arguments
-- `graph`: Full graph; edges are used for the connectivity check on each frontier round
-- `points`: N×3 matrix of XYZ coordinates (one row per graph vertex)
-- `vertex_mask`: Vector of global vertex IDs eligible for labeling
-- `start_vertex`: Seed vertex; must be present in `vertex_mask`
-- `distance`: Spatial radius for frontier expansion (Euclidean KDTree query)
-
-# Keyword Arguments
-- `workspace`: Optional pre-allocated `ConnectedComponentSubsetWorkspace(nv(graph))`;
-  reuse across repeated calls to avoid allocation overhead
-
-# Returns
-- `BitVector` of length `nv(graph)`, `true` at each vertex belonging to the NBS
-
-# Algorithm
-Each iteration queries all `vertex_mask` vertices within `distance` of the current
-labeled set via a KDTree to form the new frontier. If the frontier is connected under
-`graph` edges, it is accepted and becomes the active frontier for the next round.
-If it splits into multiple components, expansion stops and the frontier is **not**
-labeled — the branch point is excluded from the NBS.
-"""
-function label_graph_by_connectivity(
-    graph::SimpleGraph{Int},
-    points::AbstractMatrix{<:Real},
-    vertex_mask::AbstractVector{<:Integer},
-    start_vertex::Integer,
-    distance::Real;
-    workspace::Union{Nothing, ConnectedComponentSubsetWorkspace}=nothing,
-)
-    _validate_graph_points(points)
-    n = nv(graph)
-    size(points, 1) == n || throw(ArgumentError("graph vertex count must match number of points"))
-    distance > 0 || throw(ArgumentError("distance must be > 0"))
-
-    # O(1) membership lookup for vertex_mask
-    mask_allowed = falses(n)
-    @inbounds for v in vertex_mask
-        v_i = Int(v)
-        1 <= v_i <= n || throw(ArgumentError("vertex_mask contains out-of-range vertex $v_i"))
-        mask_allowed[v_i] = true
-    end
-
-    sv = Int(start_vertex)
-    mask_allowed[sv] || throw(ArgumentError("start_vertex must be within vertex_mask"))
-
-    ws = workspace !== nothing ? workspace : ConnectedComponentSubsetWorkspace(n)
-    length(ws.allowed) == n || throw(ArgumentError("workspace size must match nv(graph)"))
-
-    # KDTree over all N vertices for spatial frontier expansion
-    tree = _graph_kdtree(points)
-    search_radius = float(distance)
-
-    labeled      = falses(n)
-    labeled[sv]  = true
-    frontier     = Int[sv]
-    in_frontier  = falses(n)   # dedup tracker; reset after each round
-
-    while true
-        # --- Expand: collect mask vertices within distance of current labeled set ---
-        new_pts = Int[]
-        @inbounds for v in frontier
-            pt = vec(@view points[v, :])
-            for nbr in inrange(tree, pt, search_radius)
-                nbr_i = Int(nbr)
-                mask_allowed[nbr_i] || continue
-                labeled[nbr_i]      && continue
-                in_frontier[nbr_i]  && continue
-                in_frontier[nbr_i]  = true
-                push!(new_pts, nbr_i)
-            end
-        end
-
-        # Reset dedup flags for next round
-        @inbounds for v in new_pts
-            in_frontier[v] = false
-        end
-
-        isempty(new_pts) && break
-
-        # --- Connectivity check: is the new frontier one connected component? ---
-        # connected_component_subset! traverses only edges between new_pts vertices;
-        # paths through already-labeled vertices are blocked by workspace.allowed.
-        cc = connected_component_subset!(ws, graph, new_pts)
-        maximum(cc) > 1 && break   # branch detected — do not label new_pts
-
-        # --- Accept frontier ---
-        @inbounds for v in new_pts
-            labeled[v] = true
-        end
-        frontier = new_pts
-    end
-
-    return labeled
-end
-
-"""
     greedy_connected_neighborhood_search(graph, start_vertices, neighbor_distance;
-                                         vertex_mask=nothing, workspace=nothing)
+                                         vertex_mask=nothing, workspace=nothing,
+                                         points=nothing, linearity_angle_deg=80.0,
+                                         min_frontier_cc_size=1)
         -> NamedTuple{(:vertices, :node_ids, :max_node_id)}
 
 Greedy connectivity expansion starting from one or more seed vertices `start_vertices`.
@@ -921,6 +838,15 @@ sequential structure of the expanded path.
   or `nothing` (all vertices eligible).
 - `workspace`: Optional pre-allocated `GreedySearchWorkspace(nv(graph))` for zero
   per-call allocation. Strongly recommended when calling repeatedly.
+- `points`: Optional N×3 coordinate matrix. When provided, enables angular
+  filtering of frontier connected components against the NBS growth direction.
+  Default: `nothing` (no angular filtering).
+- `linearity_angle_deg`: Maximum angular deviation (degrees) between a CC's
+  growth direction and the NBS principal direction. CCs exceeding this threshold
+  are excluded from the frontier. Only active when `points` is provided.
+  Default: `80.0`.
+- `min_frontier_cc_size`: Minimum number of points a frontier connected component
+  must contain to be considered. Smaller CCs are discarded. Default: `1`.
 
 # Returns
 - `NamedTuple` with fields:
@@ -935,11 +861,17 @@ function greedy_connected_neighborhood_search(
     neighbor_distance::Integer;
     vertex_mask::Union{Nothing, AbstractVector{<:Integer}, BitVector}=nothing,
     workspace::Union{Nothing, GreedySearchWorkspace}=nothing,
+    points::Union{Nothing, AbstractMatrix{<:Real}}=nothing,
+    linearity_angle_deg::Float64=80.0,
+    min_frontier_cc_size::Int=1,
 )
     neighbor_distance >= 1 || throw(ArgumentError("neighbor_distance must be >= 1"))
     isempty(start_vertices) && throw(ArgumentError("start_vertices must not be empty"))
 
     n = nv(graph)
+    if points !== nothing
+        size(points, 1) == n || throw(ArgumentError("points row count must match nv(graph)"))
+    end
 
     ws = workspace !== nothing ? workspace : GreedySearchWorkspace(n)
     length(ws.mask_allowed) == n || throw(ArgumentError("workspace size must match nv(graph)"))
@@ -962,6 +894,10 @@ function greedy_connected_neighborhood_search(
     # Initialise per-call state — clean only the seed entries; everything else is
     # cleaned at the end of the previous call (or freshly zero-constructed).
     empty!(ws.vertices_buf)
+    empty!(ws.node_sum_x)
+    empty!(ws.node_sum_y)
+    empty!(ws.node_sum_z)
+    empty!(ws.node_count)
     frontier = ws.new_frontier
     empty!(frontier)
     next_node_id = 1
@@ -975,6 +911,20 @@ function greedy_connected_neighborhood_search(
         ws.node_id_map[sv] = 1
         push!(ws.vertices_buf, sv)
         push!(frontier, sv)
+    end
+
+    # Accumulate centroids for start vertices (node_id = 1)
+    if points !== nothing
+        push!(ws.node_sum_x, 0.0)
+        push!(ws.node_sum_y, 0.0)
+        push!(ws.node_sum_z, 0.0)
+        push!(ws.node_count, 0)
+        @inbounds for v in ws.vertices_buf
+            ws.node_sum_x[1] += Float64(points[v, 1])
+            ws.node_sum_y[1] += Float64(points[v, 2])
+            ws.node_sum_z[1] += Float64(points[v, 3])
+            ws.node_count[1] += 1
+        end
     end
 
     while true
@@ -1025,23 +975,43 @@ function greedy_connected_neighborhood_search(
         next_node_id += 1
         empty!(frontier)
 
-        # Retrospective branch refinement: when multiple CCs detected, reassign
-        # ambiguous upstream vertices that likely belong to the discarded branch.
-        if maximum(cc) > 1
-            cc_chosen_verts = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] == 1]
-            cc_other_verts  = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] > 1]
+        # Extend centroid cache for the new node_id
+        if points !== nothing
+            push!(ws.node_sum_x, 0.0)
+            push!(ws.node_sum_y, 0.0)
+            push!(ws.node_sum_z, 0.0)
+            push!(ws.node_count, 0)
+        end
+
+        max_cc_original = maximum(cc)
+
+        # Find best frontier CC: size filter + linearity rejection + quality metric
+        best_cc = _find_best_frontier(cc, ws, points, next_node_id,
+                                       min_frontier_cc_size, linearity_angle_deg)
+
+        # Retrospective branch refinement: triggered by pre-filter CC count,
+        # uses post-filter best_cc as cc_chosen.
+        if max_cc_original > 1 && best_cc > 0
+            cc_chosen_verts = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] == best_cc]
+            cc_other_verts  = Int[ws.new_pts[i] for i in eachindex(ws.new_pts) if cc[i] != best_cc]
             _refine_branching(graph, ws, cc_chosen_verts, cc_other_verts,
-                              next_node_id, neighbor_distance)
+                              next_node_id, neighbor_distance; points=points)
         end
 
         @inbounds for (i, v) in enumerate(ws.new_pts)
             ws.included[v] = true        # always mark — prevents rediscovery in future iterations
             push!(ws.vertices_buf, v)    # always track — needed for cleanup
-            if cc[i] == 1
+            if cc[i] == best_cc && best_cc > 0
                 ws.node_id_map[v] = next_node_id
                 push!(frontier, v)
+                # Accumulate centroid for the new node
+                if points !== nothing
+                    ws.node_sum_x[next_node_id] += Float64(points[v, 1])
+                    ws.node_sum_y[next_node_id] += Float64(points[v, 2])
+                    ws.node_sum_z[next_node_id] += Float64(points[v, 3])
+                    ws.node_count[next_node_id] += 1
+                end
             end
-            # discarded (cc != 1): node_id_map[v] stays 0 — excluded from output
         end
 
         isempty(frontier) && break
@@ -1064,6 +1034,228 @@ function greedy_connected_neighborhood_search(
     end
 
     return (vertices=vertices, node_ids=node_ids, max_node_id=next_node_id)
+end
+
+"""
+    _compute_nbs_direction(ws, next_node_id; min_nodes=3)
+        -> Union{Nothing, NTuple{3,Float64}}
+
+Compute the principal growth direction of the NBS by PCA on cached node
+centroids. Reads per-node coordinate sums from `ws.node_sum_x/y/z` and
+`ws.node_count` (populated incrementally in the main loop). Builds a 3×3
+covariance matrix and uses `eigen(Symmetric(...))` instead of full SVD.
+
+Returns the first principal component as a 3-tuple oriented from earliest
+to latest node, or `nothing` if fewer than `min_nodes` valid centroids exist.
+"""
+function _compute_nbs_direction(
+    ws::GreedySearchWorkspace,
+    next_node_id::Int;
+    min_nodes::Int=3,
+)
+    n_nodes = next_node_id - 1
+    n_nodes < min_nodes && return nothing
+
+    # Compute mean centroid from cached sums
+    valid_count = 0
+    mean_x = 0.0; mean_y = 0.0; mean_z = 0.0
+    @inbounds for nid in 1:n_nodes
+        ws.node_count[nid] > 0 || continue
+        valid_count += 1
+        inv_c = 1.0 / ws.node_count[nid]
+        mean_x += ws.node_sum_x[nid] * inv_c
+        mean_y += ws.node_sum_y[nid] * inv_c
+        mean_z += ws.node_sum_z[nid] * inv_c
+    end
+    valid_count < min_nodes && return nothing
+    inv_n = 1.0 / valid_count
+    mean_x *= inv_n; mean_y *= inv_n; mean_z *= inv_n
+
+    # Build 3×3 covariance matrix directly (O(n_nodes), not O(|vertices_buf|))
+    c11 = 0.0; c12 = 0.0; c13 = 0.0
+    c22 = 0.0; c23 = 0.0; c33 = 0.0
+    @inbounds for nid in 1:n_nodes
+        ws.node_count[nid] > 0 || continue
+        inv_c = 1.0 / ws.node_count[nid]
+        dx = ws.node_sum_x[nid] * inv_c - mean_x
+        dy = ws.node_sum_y[nid] * inv_c - mean_y
+        dz = ws.node_sum_z[nid] * inv_c - mean_z
+        c11 += dx * dx; c12 += dx * dy; c13 += dx * dz
+        c22 += dy * dy; c23 += dy * dz
+        c33 += dz * dz
+    end
+
+    # eigen on Symmetric 3×3 — eigenvalues in ascending order
+    C = Symmetric([c11 c12 c13; c12 c22 c23; c13 c23 c33])
+    F = eigen(C)
+    # Largest eigenvalue is last; its eigenvector is PC1
+    dvec = (F.vectors[1, 3], F.vectors[2, 3], F.vectors[3, 3])
+
+    # Orient: project first and last valid centroids onto PC1;
+    # flip if last centroid's projection is smaller (direction should point
+    # from earliest to latest node).
+    first_nid = 0
+    last_nid  = 0
+    @inbounds for nid in 1:n_nodes
+        ws.node_count[nid] > 0 || continue
+        if first_nid == 0; first_nid = nid; end
+        last_nid = nid
+    end
+    inv_f = 1.0 / ws.node_count[first_nid]
+    inv_l = 1.0 / ws.node_count[last_nid]
+    proj_first = (ws.node_sum_x[first_nid] * inv_f - mean_x) * dvec[1] +
+                 (ws.node_sum_y[first_nid] * inv_f - mean_y) * dvec[2] +
+                 (ws.node_sum_z[first_nid] * inv_f - mean_z) * dvec[3]
+    proj_last  = (ws.node_sum_x[last_nid] * inv_l - mean_x) * dvec[1] +
+                 (ws.node_sum_y[last_nid] * inv_l - mean_y) * dvec[2] +
+                 (ws.node_sum_z[last_nid] * inv_l - mean_z) * dvec[3]
+    if proj_last < proj_first
+        dvec = (-dvec[1], -dvec[2], -dvec[3])
+    end
+
+    return dvec
+end
+
+"""
+    _find_best_frontier(cc, ws, points, next_node_id, min_cc_size,
+                        linearity_angle_deg) -> Int
+
+Select the best frontier connected component from `cc`, mutating `cc` in-place
+to zero out all non-chosen labels. Internally computes the NBS growth direction
+via `_compute_nbs_direction` when enough nodes are available.
+
+1. **Size filter**: CCs with fewer than `min_cc_size` points are discarded.
+2. **Quality selection** (when direction is available, i.e. ≥ 3 prior nodes):
+   reject CCs whose growth direction deviates more than `linearity_angle_deg`
+   from the NBS principal direction, then pick the CC with the highest quality
+   metric `cc_count × cos_angle`. Returns `0` if all CCs are rejected.
+3. **Early-stage fallback** (when direction is unavailable or `points` is
+   `nothing`): pick the largest surviving CC (smallest nonzero label).
+
+Returns the chosen CC label (`0` if no CCs survive filtering).
+"""
+function _find_best_frontier(
+    cc::Vector{Int},
+    ws::GreedySearchWorkspace,
+    points::Union{Nothing, AbstractMatrix{<:Real}},
+    next_node_id::Int,
+    min_cc_size::Int,
+    linearity_angle_deg::Float64,
+)::Int
+    n_cc = maximum(cc; init=0)
+    n_cc < 1 && return 0
+
+    # --- Per-CC point count and centroid (reuse workspace buffers) ---
+    resize!(ws.frontier_cc_cx, n_cc)
+    resize!(ws.frontier_cc_cy, n_cc)
+    resize!(ws.frontier_cc_cz, n_cc)
+    resize!(ws.frontier_cc_count, n_cc)
+    fill!(ws.frontier_cc_cx, 0.0)
+    fill!(ws.frontier_cc_cy, 0.0)
+    fill!(ws.frontier_cc_cz, 0.0)
+    fill!(ws.frontier_cc_count, 0)
+    cc_cx = ws.frontier_cc_cx
+    cc_cy = ws.frontier_cc_cy
+    cc_cz = ws.frontier_cc_cz
+    cc_count = ws.frontier_cc_count
+    if points !== nothing
+        @inbounds for (i, v) in enumerate(ws.new_pts)
+            label = cc[i]
+            label >= 1 || continue
+            cc_count[label] += 1
+            cc_cx[label] += Float64(points[v, 1])
+            cc_cy[label] += Float64(points[v, 2])
+            cc_cz[label] += Float64(points[v, 3])
+        end
+    else
+        @inbounds for (i, _) in enumerate(ws.new_pts)
+            label = cc[i]
+            label >= 1 || continue
+            cc_count[label] += 1
+        end
+    end
+
+    # --- Size filter: zero out small CCs ---
+    size_reject = UInt64(0)
+    @inbounds for c in 1:min(n_cc, 64)
+        if cc_count[c] < min_cc_size
+            size_reject |= UInt64(1) << (c - 1)
+        end
+    end
+    if size_reject != UInt64(0)
+        @inbounds for i in eachindex(cc)
+            c = cc[i]
+            if c > 0 && c <= 64 && (size_reject >> (c - 1)) & UInt64(1) == UInt64(1)
+                cc[i] = 0
+            end
+        end
+    end
+
+    # --- Largest remaining CC (smallest nonzero label = largest by convention) ---
+    largest_cc = 0
+    @inbounds for c in 1:n_cc
+        if cc_count[c] >= min_cc_size
+            largest_cc = c
+            break
+        end
+    end
+    largest_cc == 0 && return 0
+
+    # --- Compute NBS direction (needs ≥ 3 prior nodes and points) ---
+    nbs_dvec = nothing
+    if points !== nothing && next_node_id > 3
+        nbs_dvec = _compute_nbs_direction(ws, next_node_id)
+    end
+
+    # No direction available (early iterations or no points): return largest CC
+    if nbs_dvec === nothing
+        return largest_cc
+    end
+
+    # --- Previous node centroid from cache (O(1)) ---
+    prev_nid = next_node_id - 1
+    if prev_nid < 1 || prev_nid > length(ws.node_count) || ws.node_count[prev_nid] <= 0
+        return largest_cc
+    end
+    inv_pc = 1.0 / ws.node_count[prev_nid]
+    prev_cx = ws.node_sum_x[prev_nid] * inv_pc
+    prev_cy = ws.node_sum_y[prev_nid] * inv_pc
+    prev_cz = ws.node_sum_z[prev_nid] * inv_pc
+
+    # --- Find best CC by quality metric: cc_count × cos_angle ---
+    cos_threshold = cosd(linearity_angle_deg)
+    best_cc = 0
+    best_quality = -Inf
+    @inbounds for c in 1:min(n_cc, 64)
+        cc_count[c] >= min_cc_size || continue
+        inv_c = 1.0 / cc_count[c]
+        dx = cc_cx[c] * inv_c - prev_cx
+        dy = cc_cy[c] * inv_c - prev_cy
+        dz = cc_cz[c] * inv_c - prev_cz
+        norm_d = sqrt(dx * dx + dy * dy + dz * dz)
+        norm_d < 1e-12 && continue
+        inv_norm = 1.0 / norm_d
+        cos_angle = (dx * nbs_dvec[1] + dy * nbs_dvec[2] + dz * nbs_dvec[3]) * inv_norm
+        cos_angle < cos_threshold && continue   # linearity angle rejection
+        quality = cc_count[c] * cos_angle
+        if quality > best_quality
+            best_quality = quality
+            best_cc = c
+        end
+    end
+
+    # All CCs rejected by linearity filter → return 0 (terminates NBS growth)
+    best_cc == 0 && return 0
+
+    # Zero out non-best CC labels
+    @inbounds for i in eachindex(cc)
+        c = cc[i]
+        if c != best_cc
+            cc[i] = 0
+        end
+    end
+
+    return best_cc
 end
 
 """
@@ -1189,7 +1381,7 @@ function _cc_diameter_hops(graph::SimpleGraph{Int},
 end
 
 """
-    _refine_branching(graph, ws, cc_chosen, cc_other, next_node_id, neighbor_distance) -> Int
+    _refine_branching(graph, ws, cc_chosen, cc_other, next_node_id, neighbor_distance; points=nothing) -> Int
 
 Retrospectively reassign ambiguous vertices near a branch point using geodesic
 distance tiebreaking with pure upstream anchors.
@@ -1211,7 +1403,8 @@ function _refine_branching(graph::SimpleGraph{Int},
                            cc_chosen::Vector{Int},
                            cc_other::Vector{Int},
                            next_node_id::Int,
-                           neighbor_distance::Int)
+                           neighbor_distance::Int;
+                           points::Union{Nothing, AbstractMatrix{<:Real}}=nothing)
     # Early exit: need at least 4 waves (2 pure + 1 ambiguous + current frontier)
     next_node_id < 4 && return 0
 
@@ -1297,30 +1490,41 @@ function _refine_branching(graph::SimpleGraph{Int},
     @inbounds for i in 1:N_amb
         dci = dc[i]
         dui = du[i]
+        reassign = false
         # Unreachable from chosen but reachable from other → reassign
         if dci < 0 && dui >= 0
-            ws.node_id_map[ambiguous[i]] = 0
-            n_reassigned += 1
-            continue
-        end
-        # Unreachable from other or both unreachable → keep
-        (dci < 0 || dui < 0) && continue
-        # Closer to chosen → keep
-        dci <= dui && continue
-
-        # Closer to other branch — check if in ambiguous ratio zone
-        if dui > 0
-            ratio = dci / dui
-            if ratio > 0.8 && ratio < 1.2
-                # Tiebreaker: upstream connectivity
-                if d_up[i] >= 0 && d_up[i] <= upstream_threshold
-                    continue   # well-connected to upstream → keep on main branch
+            reassign = true
+        elseif dci < 0 || dui < 0
+            # Unreachable from other or both unreachable → keep
+        elseif dci <= dui
+            # Closer to chosen → keep
+        else
+            # Closer to other branch — check if in ambiguous ratio zone
+            reassign = true
+            if dui > 0
+                ratio = dci / dui
+                if ratio > 0.8 && ratio < 1.2
+                    # Tiebreaker: upstream connectivity
+                    if d_up[i] >= 0 && d_up[i] <= upstream_threshold
+                        reassign = false   # well-connected to upstream → keep
+                    end
                 end
             end
         end
 
-        ws.node_id_map[ambiguous[i]] = 0
-        n_reassigned += 1
+        if reassign
+            v = ambiguous[i]
+            old_nid = ws.node_id_map[v]
+            ws.node_id_map[v] = 0
+            # Update centroid cache: subtract this vertex's contribution
+            if points !== nothing && old_nid >= 1 && old_nid <= length(ws.node_count)
+                ws.node_sum_x[old_nid] -= Float64(points[v, 1])
+                ws.node_sum_y[old_nid] -= Float64(points[v, 2])
+                ws.node_sum_z[old_nid] -= Float64(points[v, 3])
+                ws.node_count[old_nid] -= 1
+            end
+            n_reassigned += 1
+        end
     end
 
     return n_reassigned

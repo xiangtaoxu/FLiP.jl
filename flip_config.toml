@@ -40,7 +40,7 @@ max_lcs_iterations = 5000      # Maximum iterative LCS extraction rounds per com
 nbs_neighbor_distance = 2      # Hop distance for greedy NBS search
 nbs_min_segment_size = 5       # Minimum points per NBS segment
 nbs_max_iterations = 10000     # Maximum NBS iterations
-ls_angle_threshold_deg = 60.0  # Max deviation (degrees) for linear segment continuity
+linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
 
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation

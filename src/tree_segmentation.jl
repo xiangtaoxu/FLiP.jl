@@ -1,53 +1,28 @@
-function _las_from_coords(template_pc::PointCloud, coords::AbstractMatrix{<:Real})
-    size(coords, 2) == 3 || throw(ArgumentError("coords must be N×3"))
-    points_nt = (
-        x=Float64.(coords[:, 1]),
-        y=Float64.(coords[:, 2]),
-        z=Float64.(coords[:, 3]),
-    )
-    return PointClouds.LAS(points_nt; coord_scale=template_pc.coord_scale, coord_offset=template_pc.coord_offset)
-end
-
-@inline function _argmax_z_in_subset(points::AbstractMatrix{<:Real}, subset::AbstractVector{<:Integer})
-    isempty(subset) && throw(ArgumentError("subset must be non-empty"))
-    best_idx = Int(subset[1])
-    best_z = float(points[best_idx, 3])
-    @inbounds for i in 2:length(subset)
-        v = Int(subset[i])
-        vz = float(points[v, 3])
-        if vz > best_z
-            best_z = vz
-            best_idx = v
-        end
-    end
-    return best_idx
-end
-
-function _subset_component_labels(graph::SimpleGraph{Int}, subset::Vector{Int}, min_cc_size::Integer,
-                                  cc_workspace::ConnectedComponentSubsetWorkspace)
-    isempty(subset) && return Int[]
-    return connected_component_subset!(cc_workspace, graph, subset, min_cc_size)
-end
-
 """
-    _expand_nearground_cluster(graph, seed, agh_values, agh_ceiling, mask) -> Vector{Int}
+    _expand_nearground_cluster(graph, seed, agh_values, agh_ceiling, mask;
+                               visited=nothing) -> Vector{Int}
 
 BFS from `seed` over vertices where `mask[v]` is true and
 `float(agh_values[v]) <= agh_ceiling`. Returns all discovered vertices (including
 `seed`) as the connected near-ground cluster.
+
+Pass a pre-allocated `visited::BitVector` of length `nv(graph)` to avoid O(N)
+allocation per call. The BitVector is reset to `false` for all touched vertices
+before returning.
 """
 function _expand_nearground_cluster(
     graph::SimpleGraph{Int},
     seed::Int,
     agh_values::AbstractVector{<:Real},
     agh_ceiling::Float64,
-    mask::BitVector,
+    mask::BitVector;
+    visited::Union{Nothing, BitVector}=nothing,
 )
-    visited  = falses(nv(graph))
-    cluster  = Int[]
-    queue    = Int[]
+    vis = visited !== nothing ? visited : falses(nv(graph))
+    cluster = Int[]
+    queue   = Int[]
 
-    visited[seed] = true
+    vis[seed] = true
     push!(cluster, seed)
     push!(queue, seed)
 
@@ -56,106 +31,23 @@ function _expand_nearground_cluster(
         v = queue[qi]
         qi += 1
         @inbounds for nbr in Graphs.neighbors(graph, v)
-            visited[nbr] && continue
-            mask[nbr]    || continue
+            vis[nbr] && continue
+            mask[nbr] || continue
             float(agh_values[nbr]) <= agh_ceiling || continue
-            visited[nbr] = true
+            vis[nbr] = true
             push!(cluster, nbr)
             push!(queue, nbr)
         end
     end
 
-    return cluster
-end
-
-function _build_proto_graph(points::AbstractMatrix{<:Real},
-                            graph::SimpleGraph{Int},
-                            subset_vertices::AbstractVector{<:Integer},
-                            subset_mask::BitVector,
-                            proto_labels_global::AbstractVector{<:Integer})
-    present_labels = Set{Int}()
-    @inbounds for v in subset_vertices
-        lbl = Int(proto_labels_global[Int(v)])
-        lbl > 0 && push!(present_labels, lbl)
-    end
-
-    q_labels = sort!(collect(present_labels))
-    nq = length(q_labels)
-    nq == 0 && return (graph=SimpleGraph{Int}(0), points=zeros(Float64, 0, 3), labels=Int[], edge_vectors=Dict{Tuple{Int, Int}, NTuple{3, Float64}}())
-
-    label_to_vertex = Dict{Int, Int}(lbl => i for (i, lbl) in enumerate(q_labels))
-    q_points = zeros(Float64, nq, 3)
-    counts = zeros(Int, nq)
-
-    @inbounds for v_any in subset_vertices
-        v = Int(v_any)
-        lbl = Int(proto_labels_global[v])
-        lbl > 0 || continue
-        qv = label_to_vertex[lbl]
-        q_points[qv, 1] += float(points[v, 1])
-        q_points[qv, 2] += float(points[v, 2])
-        q_points[qv, 3] += float(points[v, 3])
-        counts[qv] += 1
-    end
-
-    @inbounds for qv in 1:nq
-        q_points[qv, 1] /= counts[qv]
-        q_points[qv, 2] /= counts[qv]
-        q_points[qv, 3] /= counts[qv]
-    end
-
-    q_graph = SimpleGraph(nq)
-    pair_vectors = Dict{Tuple{Int, Int}, Vector{NTuple{3, Float64}}}()
-
-    @inbounds for u_any in subset_vertices
-        u = Int(u_any)
-        subset_mask[u] || continue
-        lu = Int(proto_labels_global[u])
-        lu > 0 || continue
-
-        qu = label_to_vertex[lu]
-        for v in Graphs.neighbors(graph, u)
-            u < v || continue
-            subset_mask[v] || continue
-
-            lv = Int(proto_labels_global[v])
-            lv > 0 || continue
-            lu == lv && continue
-
-            qv = label_to_vertex[lv]
-            add_edge!(q_graph, qu, qv)
-
-            if qu < qv
-                key = (qu, qv)
-                vec = (
-                    float(points[v, 1]) - float(points[u, 1]),
-                    float(points[v, 2]) - float(points[u, 2]),
-                    float(points[v, 3]) - float(points[u, 3]),
-                )
-                push!(get!(pair_vectors, key, NTuple{3, Float64}[]), vec)
-            else
-                key = (qv, qu)
-                vec = (
-                    float(points[u, 1]) - float(points[v, 1]),
-                    float(points[u, 2]) - float(points[v, 2]),
-                    float(points[u, 3]) - float(points[v, 3]),
-                )
-                push!(get!(pair_vectors, key, NTuple{3, Float64}[]), vec)
-            end
+    # Reset touched entries so the BitVector is clean for reuse
+    if visited !== nothing
+        @inbounds for v in cluster
+            vis[v] = false
         end
     end
 
-    edge_vectors = Dict{Tuple{Int, Int}, NTuple{3, Float64}}()
-    for (key, vecs) in pair_vectors
-        ux = median(first.(vecs))
-        uy = median((v -> v[2]).(vecs))
-        uz = median(last.(vecs))
-        med = (Float64(ux), Float64(uy), Float64(uz))
-        edge_vectors[key] = med
-        edge_vectors[(key[2], key[1])] = (-med[1], -med[2], -med[3])
-    end
-
-    return (graph=q_graph, points=q_points, labels=q_labels, edge_vectors=edge_vectors)
+    return cluster
 end
 
 """
@@ -226,7 +118,7 @@ function generate_proto_nodes_from_slice_label(points::AbstractMatrix{<:Real},
 
     next_temp_label = 1
     if !isempty(odd_indices)
-        odd_components = _subset_component_labels(graph, odd_indices, min_cc_size, local_cc_workspace)
+        odd_components = connected_component_subset!(local_cc_workspace, graph, odd_indices, min_cc_size)
         @inbounds for (local_idx, point_idx) in enumerate(odd_indices)
             temp_labels[point_idx] = odd_components[local_idx]
         end
@@ -235,7 +127,7 @@ function generate_proto_nodes_from_slice_label(points::AbstractMatrix{<:Real},
     end
 
     if !isempty(even_indices)
-        even_components = _subset_component_labels(graph, even_indices, min_cc_size, local_cc_workspace)
+        even_components = connected_component_subset!(local_cc_workspace, graph, even_indices, min_cc_size)
         @inbounds for (local_idx, point_idx) in enumerate(even_indices)
             component_label = even_components[local_idx]
             component_label > 0 || continue
@@ -310,6 +202,9 @@ function label_non_branching_segments(
         end
     end
 
+    # Reusable BitVector for _expand_nearground_cluster (avoids O(N) alloc per seed)
+    expand_visited = falses(N)
+
     # Pre-sort by ascending z for O(1) amortised seed selection.
     z_sorted = sortperm(view(points, :, 3); rev=false)
     z_cursor         = 1
@@ -329,7 +224,8 @@ function label_non_branching_segments(
         # If the seed AGH is within the near-ground ceiling, expand it to the full
         # connected cluster of near-ground points before starting the greedy search.
         start_vertices = if float(agh_values[seed]) <= nearground_agh_ceiling
-            _expand_nearground_cluster(graph, seed, agh_values, nearground_agh_ceiling, unlabeled_mask)
+            _expand_nearground_cluster(graph, seed, agh_values, nearground_agh_ceiling, unlabeled_mask;
+                                       visited=expand_visited)
         else
             Int[seed]
         end
@@ -337,8 +233,11 @@ function label_non_branching_segments(
 
         result = greedy_connected_neighborhood_search(
             graph, start_vertices, neighbor_distance;
-            vertex_mask = unlabeled_mask,
-            workspace   = gsws,
+            vertex_mask          = unlabeled_mask,
+            workspace            = gsws,
+            points               = points,
+            linearity_angle_deg  = Float64(cfg.tree_linearity_angle_deg),
+            min_frontier_cc_size = Int(cfg.tree_min_cc_size),
         )
         labeled_idx = result.vertices
         node_ids    = result.node_ids

@@ -103,13 +103,10 @@ export shortest_path_distances
 export shortest_path_subset!
 export slice_by_shortest_path
 export generate_proto_nodes_from_slice_label
-export label_graph_by_connectivity
 export greedy_connected_neighborhood_search
 export longest_linear_path
 export tree_segmentation
 export label_non_branching_segments
-export label_linear_segments
-export refine_linear_connected_segment, assemble_linear_connected_segment
 
 # Export pipeline functions
 export preprocess
