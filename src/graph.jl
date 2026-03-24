@@ -1020,11 +1020,15 @@ function greedy_connected_neighborhood_search(
     # Extract results — filter out discarded vertices (node_id_map == 0)
     vertices = sizehint!(Int[], length(ws.vertices_buf))
     node_ids = sizehint!(Int[], length(ws.vertices_buf))
+    rejected = sizehint!(Int[], 64)
     @inbounds for v in ws.vertices_buf
         nid = ws.node_id_map[v]
-        nid == 0 && continue   # discarded (not in largest CC)
-        push!(vertices, v)
-        push!(node_ids, nid)
+        if nid == 0
+            push!(rejected, v)   # unchosen frontier CC vertex
+        else
+            push!(vertices, v)
+            push!(node_ids, nid)
+        end
     end
 
     # Cleanup only touched entries — O(segment size), not O(N)
@@ -1033,7 +1037,8 @@ function greedy_connected_neighborhood_search(
         ws.node_id_map[v] = 0
     end
 
-    return (vertices=vertices, node_ids=node_ids, max_node_id=next_node_id)
+    return (vertices=vertices, node_ids=node_ids, max_node_id=next_node_id,
+            rejected_frontier=rejected)
 end
 
 """

@@ -1,53 +1,94 @@
 """
-    _expand_nearground_cluster(graph, seed, agh_values, agh_ceiling, mask;
-                               visited=nothing) -> Vector{Int}
+    _labels_to_sorted_clusters(subset, labels) -> Vector{Vector{Int}}
 
-BFS from `seed` over vertices where `mask[v]` is true and
-`float(agh_values[v]) <= agh_ceiling`. Returns all discovered vertices (including
-`seed`) as the connected near-ground cluster.
-
-Pass a pre-allocated `visited::BitVector` of length `nv(graph)` to avoid O(N)
-allocation per call. The BitVector is reset to `false` for all touched vertices
-before returning.
+Convert per-element CC labels (from `connected_component_subset!`) into a list of
+vertex-index vectors sorted by descending component size. Labels are already ranked
+(1 = largest) by `connected_component_subset!`, so `clusters[1]` is the largest.
+Vertices with label 0 (below `min_cc_size`) are dropped.
 """
-function _expand_nearground_cluster(
-    graph::SimpleGraph{Int},
-    seed::Int,
+function _labels_to_sorted_clusters(subset::AbstractVector{Int}, labels::Vector{Int})
+    max_label = maximum(labels; init=0)
+    max_label == 0 && return Vector{Vector{Int}}()
+    clusters = [Int[] for _ in 1:max_label]
+    @inbounds for (i, v) in enumerate(subset)
+        lab = labels[i]
+        lab > 0 && push!(clusters[lab], v)
+    end
+    return filter!(!isempty, clusters)
+end
+
+"""
+    _find_seed_clusters(points, agh_values, nearground_agh_ceiling, unlabeled_mask,
+                        graph, cc_workspace;
+                        is_first_iteration, z_sorted, z_cursor,
+                        frontier_buf, candidate_buf) -> Vector{Vector{Int}}
+
+Find seed clusters for `label_non_branching_segments`. Returns a list of vertex-index
+vectors sorted by descending cluster size (first iteration) or ascending z (subsequent).
+
+**First iteration**: collects all unlabeled vertices with AGH ≤ `nearground_agh_ceiling`,
+splits them into connected components via `connected_component_subset!`, and returns
+them ranked largest-first.
+
+**Subsequent iterations**: draws seeds from `frontier_buf` — rejected frontier CCs
+accumulated from prior `greedy_connected_neighborhood_search` calls. Filters out
+already-labeled vertices, sorts the remainder by ascending z, and returns each as a
+single-point seed cluster. When `frontier_buf` is exhausted, falls back to the next
+lowest-z unlabeled point via `z_cursor` (O(1) amortised). Returns an empty vector when
+no unlabeled points remain (signals termination).
+"""
+function _find_seed_clusters(
+    points::AbstractMatrix{<:Real},
     agh_values::AbstractVector{<:Real},
-    agh_ceiling::Float64,
-    mask::BitVector;
-    visited::Union{Nothing, BitVector}=nothing,
+    nearground_agh_ceiling::Float64,
+    unlabeled_mask::BitVector,
+    graph::SimpleGraph{Int},
+    cc_workspace::ConnectedComponentSubsetWorkspace;
+    is_first_iteration::Bool,
+    z_sorted::Vector{Int},
+    z_cursor::Ref{Int},
+    frontier_buf::Vector{Int},
+    candidate_buf::Vector{Int},
 )
-    vis = visited !== nothing ? visited : falses(nv(graph))
-    cluster = Int[]
-    queue   = Int[]
+    empty!(candidate_buf)
 
-    vis[seed] = true
-    push!(cluster, seed)
-    push!(queue, seed)
+    if is_first_iteration
+        # Collect all unlabeled near-ground vertices
+        @inbounds for v in eachindex(unlabeled_mask)
+            unlabeled_mask[v] || continue
+            float(agh_values[v]) <= nearground_agh_ceiling || continue
+            push!(candidate_buf, v)
+        end
+        if !isempty(candidate_buf)
+            labels = connected_component_subset!(cc_workspace, graph, candidate_buf)
+            return _labels_to_sorted_clusters(candidate_buf, labels)
+        end
+    else
+        # Draw seeds from the rejected-frontier buffer.
+        # Filter out vertices that have been labeled since they were added.
+        @inbounds for v in frontier_buf
+            unlabeled_mask[v] && push!(candidate_buf, v)
+        end
+        empty!(frontier_buf)
 
-    qi = 1
-    while qi <= length(queue)
-        v = queue[qi]
-        qi += 1
-        @inbounds for nbr in Graphs.neighbors(graph, v)
-            vis[nbr] && continue
-            mask[nbr] || continue
-            float(agh_values[nbr]) <= agh_ceiling || continue
-            vis[nbr] = true
-            push!(cluster, nbr)
-            push!(queue, nbr)
+        if !isempty(candidate_buf)
+            # Sort by ascending z so growth proceeds upward from branch points
+            sort!(candidate_buf; by = v -> @inbounds(points[v, 3]))
+            return Vector{Int}[Int[v] for v in candidate_buf]
         end
     end
 
-    # Reset touched entries so the BitVector is clean for reuse
-    if visited !== nothing
-        @inbounds for v in cluster
-            vis[v] = false
+    # Fallback: advance z_cursor to next unlabeled point (O(1) amortised)
+    while z_cursor[] <= length(z_sorted)
+        v = z_sorted[z_cursor[]]
+        z_cursor[] += 1
+        if unlabeled_mask[v]
+            return Vector{Int}[Int[v]]
         end
     end
 
-    return cluster
+    # No unlabeled points remain — signal termination
+    return Vector{Vector{Int}}()
 end
 
 """
@@ -202,12 +243,14 @@ function label_non_branching_segments(
         end
     end
 
-    # Reusable BitVector for _expand_nearground_cluster (avoids O(N) alloc per seed)
-    expand_visited = falses(N)
+    # Pre-allocated buffers for _find_seed_clusters (reused across iterations)
+    seed_candidate_buf = sizehint!(Int[], 1024)
+    frontier_buf       = sizehint!(Int[], 1024)  # rejected frontier CCs from greedy searches
 
-    # Pre-sort by ascending z for O(1) amortised seed selection.
+    # Pre-sort by ascending z for fallback seed selection.
     z_sorted = sortperm(view(points, :, 3); rev=false)
-    z_cursor         = 1
+    z_cursor = Ref(1)
+
     next_id          = 1
     next_global_node = 1
     n_labeled_total  = count(!, unlabeled_mask)  # already labeled (discarded small CCs)
@@ -215,52 +258,65 @@ function label_non_branching_segments(
     t_nbs_start      = time()
 
     while next_id - 1 < max_iter
-        while z_cursor <= N && !unlabeled_mask[z_sorted[z_cursor]]
-            z_cursor += 1
-        end
-        z_cursor > N && break
-        seed = z_sorted[z_cursor]
-
-        # If the seed AGH is within the near-ground ceiling, expand it to the full
-        # connected cluster of near-ground points before starting the greedy search.
-        start_vertices = if float(agh_values[seed]) <= nearground_agh_ceiling
-            _expand_nearground_cluster(graph, seed, agh_values, nearground_agh_ceiling, unlabeled_mask;
-                                       visited=expand_visited)
-        else
-            Int[seed]
-        end
-
-
-        result = greedy_connected_neighborhood_search(
-            graph, start_vertices, neighbor_distance;
-            vertex_mask          = unlabeled_mask,
-            workspace            = gsws,
-            points               = points,
-            linearity_angle_deg  = Float64(cfg.tree_linearity_angle_deg),
-            min_frontier_cc_size = Int(cfg.tree_min_cc_size),
+        seed_clusters = _find_seed_clusters(
+            points, agh_values, nearground_agh_ceiling,
+            unlabeled_mask, graph,
+            gsws.cc_ws;
+            is_first_iteration = (next_id == 1),
+            z_sorted       = z_sorted,
+            z_cursor       = z_cursor,
+            frontier_buf   = frontier_buf,
+            candidate_buf  = seed_candidate_buf,
         )
-        labeled_idx = result.vertices
-        node_ids    = result.node_ids
-        n_labeled   = length(labeled_idx)
+        isempty(seed_clusters) && break  # no unlabeled points remain
 
-        if n_labeled < min_segment_size
-            @inbounds for v in labeled_idx
-                global_nbs_id[v]  = -1
-                unlabeled_mask[v] = false
+        for start_vertices in seed_clusters
+            # Skip if any point was already claimed by an earlier search this round
+            any_claimed = false
+            @inbounds for v in start_vertices
+                if !unlabeled_mask[v]
+                    any_claimed = true
+                    break
+                end
             end
-        else
-            offset = next_global_node - 1
-            @inbounds for i in 1:n_labeled
-                v = labeled_idx[i]
-                global_nbs_id[v]  = next_id
-                global_node_id[v] = node_ids[i] + offset
-                unlabeled_mask[v] = false
+            any_claimed && continue
+
+            result = greedy_connected_neighborhood_search(
+                graph, start_vertices, neighbor_distance;
+                vertex_mask          = unlabeled_mask,
+                workspace            = gsws,
+                points               = points,
+                linearity_angle_deg  = Float64(cfg.tree_linearity_angle_deg),
+                min_frontier_cc_size = Int(cfg.tree_min_cc_size),
+            )
+            labeled_idx = result.vertices
+            node_ids    = result.node_ids
+            n_labeled   = length(labeled_idx)
+
+            # Collect rejected frontier CCs as seeds for future iterations
+            append!(frontier_buf, result.rejected_frontier)
+
+            if n_labeled < min_segment_size
+                @inbounds for v in labeled_idx
+                    global_nbs_id[v]  = -1
+                    unlabeled_mask[v] = false
+                end
+            else
+                offset = next_global_node - 1
+                @inbounds for i in 1:n_labeled
+                    v = labeled_idx[i]
+                    global_nbs_id[v]  = next_id
+                    global_node_id[v] = node_ids[i] + offset
+                    unlabeled_mask[v] = false
+                end
+                next_global_node += result.max_node_id
+                next_id          += 1
             end
-            next_global_node += result.max_node_id
-            next_id          += 1
+
+            n_labeled_total += n_labeled
+            next_id - 1 >= max_iter && break
         end
 
-        n_labeled_total += n_labeled
         pct = round(Int, 100.0 * n_labeled_total / N)
         if pct >= last_pct_report + 5
             last_pct_report = pct - (pct % 5)
