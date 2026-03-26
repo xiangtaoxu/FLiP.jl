@@ -46,6 +46,8 @@ mutable struct FLiPConfig
     tree_nbs_min_segment_size::Int
     tree_nbs_max_iterations::Int
     tree_linearity_angle_deg::Float64
+    tree_assembly_merge_threshold::Float64
+    tree_assembly_occlusion_tolerance::Float64
 
     # pipeline runner
     pipeline_input_path::String
@@ -96,6 +98,8 @@ function FLiPConfig(d::Dict)
         Int(get(ts, "nbs_min_segment_size", 5)),
         Int(get(ts, "nbs_max_iterations", 10000)),
         Float64(get(ts, "linearity_angle_deg", 80.0)),
+        Float64(get(ts, "assembly_merge_threshold", 0.5)),
+        Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
 
         String(get(pl, "input_path", "")),
         String(get(pl, "output_dir", "")),

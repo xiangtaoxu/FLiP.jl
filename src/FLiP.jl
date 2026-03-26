@@ -107,6 +107,8 @@ export greedy_connected_neighborhood_search
 export longest_linear_path
 export tree_segmentation
 export label_non_branching_segments
+export create_skeleton_cloud
+export assemble_segments
 
 # Export pipeline functions
 export preprocess

@@ -41,6 +41,8 @@ nbs_neighbor_distance = 2      # Hop distance for greedy NBS search
 nbs_min_segment_size = 5       # Minimum points per NBS segment
 nbs_max_iterations = 10000     # Maximum NBS iterations
 linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
+assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
+assembly_occlusion_tolerance = 0.1  # Max distance (m) to search for nearby assigned points when rescuing orphan NBS
 
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation

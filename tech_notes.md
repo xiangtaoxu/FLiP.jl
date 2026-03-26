@@ -26,6 +26,10 @@
 
 * Step 1 is facilitated by a highly efficient and customized graph trasversal and labeling algorithm
 
+Add _refine_branching in step 1 to correct the branching node after deciding which branch to proceed in frontier expansion. [add figures]
+
+* [thought] refine prepare_seed to be used in each iteration?
+
 -> Current status
 
 * refine LCS along their major axis
