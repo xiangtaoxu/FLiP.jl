@@ -32,6 +32,8 @@ mutable struct FLiPConfig
     segment_ground_min_cc_size::Int
     segment_ground_grid_size::Float64
     segment_ground_cone_theta_deg::Float64
+    ground_polygon_buffer::Float64
+    pipeline_enable_ground_crop::Bool
 
     # preprocess
     preprocess_enable_statistical_filter::Bool
@@ -40,14 +42,17 @@ mutable struct FLiPConfig
     tree_nearground_agh_threshold::Float64
     tree_neighbor_radius::Float64
     tree_slice_length::Float64
-    tree_min_cc_size::Int
+    tree_frontier_min_cc_size::Int
     tree_max_lcs_iterations::Int
     tree_nbs_neighbor_distance::Int
-    tree_nbs_min_segment_size::Int
+    tree_min_nbs_size::Int
     tree_nbs_max_iterations::Int
     tree_linearity_angle_deg::Float64
     tree_assembly_merge_threshold::Float64
     tree_assembly_occlusion_tolerance::Float64
+
+    # coordinate precision
+    coordinate_precision::DataType
 
     # pipeline runner
     pipeline_input_path::String
@@ -89,20 +94,26 @@ function FLiPConfig(d::Dict)
         Int(get(sg, "min_cc_size",         50)),
         Float64(get(sg, "grid_size",       0.5)),
         Float64(get(sg, "cone_theta_deg",  60.0)),
+        Float64(get(sg, "polygon_buffer",  5.0)),
+        Bool(get(sg, "enable_ground_crop", true)),
 
         Bool(get(pp, "enable_statistical_filter", false)),
 
         Float64(get(ts, "nearground_agh_threshold", 0.3)),
         Float64(get(ts, "neighbor_radius", -1.0)),
         Float64(get(ts, "slice_length", 0.1)),
-        Int(get(ts, "min_cc_size", 3)),
+        Int(get(ts, "frontier_min_cc_size", 3)),
         Int(get(ts, "max_lcs_iterations", 5000)),
         Int(get(ts, "nbs_neighbor_distance", 2)),
-        Int(get(ts, "nbs_min_segment_size", 5)),
+        Int(get(ts, "min_nbs_size", 5)),
         Int(get(ts, "nbs_max_iterations", 10000)),
         Float64(get(ts, "linearity_angle_deg", 80.0)),
         Float64(get(ts, "assembly_merge_threshold", 0.5)),
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
+
+        let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
+            prec_str == "float64" ? Float64 : Float32
+        end,
 
         String(get(pl, "input_path", "")),
         String(get(pl, "input_prefix", "")),
@@ -154,3 +165,10 @@ end
 const _CFG = FLiPConfig(
     isfile(_DEFAULT_CONFIG_PATH) ? TOML.parsefile(_DEFAULT_CONFIG_PATH) : Dict{String,Any}()
 )
+
+"""
+    coord_type(cfg::FLiPConfig=_CFG) -> DataType
+
+Return the configured coordinate precision type (`Float32` or `Float64`).
+"""
+coord_type(cfg::FLiPConfig=_CFG) = cfg.coordinate_precision

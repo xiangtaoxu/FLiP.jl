@@ -50,11 +50,11 @@ function discover_input_files(; cfg::FLiPConfig=_CFG)
 end
 
 """
-    _build_pointcloud_from_coords(coords::Matrix{Float64}, attrs::Dict{Symbol,Vector}) -> PointCloud
+    _build_pointcloud_from_coords(coords::AbstractMatrix{<:AbstractFloat}, attrs::Dict{Symbol,Vector}) -> PointCloud
 
 Construct a PointCloud from raw coordinates and attribute vectors.
 """
-function _build_pointcloud_from_coords(coords::Matrix{Float64}, attrs::Dict{Symbol,Vector})
+function _build_pointcloud_from_coords(coords::AbstractMatrix{<:AbstractFloat}, attrs::Dict{Symbol,Vector})
     return PointCloudData(coords, attrs)
 end
 
@@ -74,7 +74,8 @@ function preprocess(; cfg::FLiPConfig=_CFG)
     mkpath(output_dir)
 
     n_files = length(input_files)
-    all_coords = Vector{Matrix{Float64}}(undef, n_files)
+    T = coord_type(cfg)
+    all_coords = Vector{Matrix{T}}(undef, n_files)
     all_attrs  = Vector{Dict{Symbol,Vector}}(undef, n_files)
 
     for (i, fpath) in enumerate(input_files)
@@ -84,7 +85,7 @@ function preprocess(; cfg::FLiPConfig=_CFG)
         if ext == ".e57" && cfg.pipeline_enable_preprocess && cfg.pipeline_enable_subsample
             # For large E57 files: subsample on raw coords before building PointCloud
             # to avoid peak memory from full-size LAS construction
-            coords, attrs = _read_e57_to_raw(fpath)
+            coords, attrs = _read_e57_to_raw(fpath; precision=T)
             n_raw = size(coords, 1)
             println("[preprocess]   raw points: $n_raw, subsampling at $(cfg.pipeline_subsample_res)m...")
             keep = distance_subsample_indices(coords, cfg.pipeline_subsample_res)

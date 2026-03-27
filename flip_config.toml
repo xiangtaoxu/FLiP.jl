@@ -9,6 +9,7 @@ input_format = "las"       # Input file format: "las", "laz", or "e57"
 output_dir = ""            # Output directory path
 output_prefix = "output"   # Prefix for written files
 output_format = "las"      # Output file format: "las" or "e57"
+coordinate_precision = "Float32"  # Coordinate precision: "Float32" or "Float64"
 
 subsample_res = 0.05        # Minimum distance (m) for optional subsampling
 
@@ -33,15 +34,17 @@ voxel_size     = 0.5  # Voxel size (m) for connected-component pre-filter
 min_cc_size    = 50   # Minimum component size for connected-component pre-filter
 grid_size      = 0.5  # XY grid cell size (m) for grid z-min filter
 cone_theta_deg = 60.0 # Upward-cone half-angle (degrees)
+polygon_buffer = 5.0  # Buffer distance (m) for ground convex hull cropping
+enable_ground_crop = true # Crop point cloud to buffered ground polygon before AGH
 
 [tree_segmentation]
 nearground_agh_threshold = 0.3 # Keep points with AGH > threshold before tree segmentation
 neighbor_radius = -1.0         # If <= 0, defaults to 1.5 * pipeline.subsample_res
 slice_length = 0.1             # Slice length (m) along shortest-path distance
-min_cc_size = 3                # Minimum component size retained in tree graph labeling
+frontier_min_cc_size = 3       # Minimum frontier CC size during NBS greedy expansion
 max_lcs_iterations = 5000      # Maximum iterative LCS extraction rounds per component
 nbs_neighbor_distance = 2      # Hop distance for greedy NBS search
-nbs_min_segment_size = 5       # Minimum points per NBS segment
+min_nbs_size = 5               # Minimum points per NBS segment (also min CC size for tree graph)
 nbs_max_iterations = 10000     # Maximum NBS iterations
 linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
 assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)

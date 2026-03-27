@@ -194,4 +194,94 @@
         @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_k=0)
         @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_power=0.0)
     end
+
+    @testset "Convex hull 2D" begin
+        # Square points
+        pts = [0.0 0.0; 1.0 0.0; 1.0 1.0; 0.0 1.0; 0.5 0.5]
+        hull = convex_hull_2d(pts)
+        @test size(hull, 2) == 2
+        @test size(hull, 1) == 4  # interior point excluded
+
+        # Works with N×3 input
+        pts3d = [pts[:, 1] pts[:, 2] zeros(5)]
+        hull3d = convex_hull_2d(pts3d)
+        @test size(hull3d, 1) == 4
+
+        # Too few points
+        @test_throws ArgumentError convex_hull_2d(rand(2, 2))
+    end
+
+    @testset "Buffer polygon" begin
+        # Unit square CCW
+        poly = [0.0 0.0; 1.0 0.0; 1.0 1.0; 0.0 1.0]
+        buffered = buffer_polygon(poly, 1.0)
+        @test size(buffered) == size(poly)
+
+        # Buffered polygon should be strictly larger in all directions
+        @test minimum(buffered[:, 1]) < minimum(poly[:, 1])
+        @test maximum(buffered[:, 1]) > maximum(poly[:, 1])
+        @test minimum(buffered[:, 2]) < minimum(poly[:, 2])
+        @test maximum(buffered[:, 2]) > maximum(poly[:, 2])
+
+        # Error cases
+        @test_throws ArgumentError buffer_polygon(poly, -1.0)
+        @test_throws ArgumentError buffer_polygon(rand(2, 2), 1.0)
+    end
+
+    @testset "XY polygon filter" begin
+        # Square polygon [0,1] × [0,1]
+        poly = [0.0 0.0; 1.0 0.0; 1.0 1.0; 0.0 1.0]
+
+        # Points: inside, outside, and borderline
+        pts = [0.5 0.5 0.0;   # inside
+               2.0 2.0 0.0;   # outside
+               0.5 0.5 10.0;  # inside (z irrelevant)
+               -1.0 0.5 0.0]  # outside
+        idx = XY_polygon_filter_indices(pts, poly)
+        @test 1 in idx
+        @test 3 in idx
+        @test !(2 in idx)
+        @test !(4 in idx)
+
+        # PointCloud wrapper
+        pc = make_test_pointcloud(pts)
+        pc_filtered = XY_polygon_filter(pc, poly)
+        @test npoints(pc_filtered) == 2
+
+        # Empty input
+        @test isempty(XY_polygon_filter_indices(zeros(0, 3), poly))
+
+        # Error cases
+        @test_throws ArgumentError XY_polygon_filter_indices(rand(5, 1), poly)
+        @test_throws ArgumentError XY_polygon_filter_indices(rand(5, 3), rand(2, 2))
+    end
+
+    @testset "Polygon area" begin
+        # Unit square
+        poly = [0.0 0.0; 1.0 0.0; 1.0 1.0; 0.0 1.0]
+        @test polygon_area(poly) ≈ 1.0
+        # Triangle
+        tri = [0.0 0.0; 4.0 0.0; 0.0 3.0]
+        @test polygon_area(tri) ≈ 6.0
+        @test_throws ArgumentError polygon_area(rand(2, 2))
+    end
+
+    @testset "crop_by_ground_polygon" begin
+        # Ground points in a small square region
+        n_gnd = 200
+        gnd_coords = hcat(rand(n_gnd) .* 10.0, rand(n_gnd) .* 10.0, zeros(n_gnd))
+        ground = make_test_pointcloud(gnd_coords)
+
+        # Full cloud: ground region + far-away outlier points
+        outlier_coords = [50.0 50.0 5.0; 60.0 60.0 3.0; -40.0 -40.0 2.0]
+        all_coords = vcat(gnd_coords, outlier_coords)
+        pc = make_test_pointcloud(all_coords)
+
+        result = crop_by_ground_polygon(pc, ground; buffer=2.0)
+        @test npoints(result.pc_cropped) < npoints(pc)
+        @test npoints(result.pc_cropped) >= n_gnd
+        @test result.ground_area > 0.0
+        # Buffered [0,10]×[0,10] should be roughly (10+4)×(10+4) = 196 m²
+        @test result.ground_area > 100.0
+    end
 end

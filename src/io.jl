@@ -79,14 +79,16 @@ const _LASPY_TO_FLIP = Dict{String,Symbol}(v[1] => k for (k, v) in _LAS_STD_FIEL
 # ── LAS/LAZ (via laspy) ───────────────────────────────────────────
 
 """
-    read_las(path::AbstractString) -> PointCloud
+    read_las(path::AbstractString; precision::DataType=coord_type()) -> PointCloud
 
 Read a LAS or LAZ file and return a `PointCloud` object.
+Coordinate precision is controlled by `precision` (default from config).
 """
-function read_las(path::AbstractString)
+function read_las(path::AbstractString; precision::DataType=coord_type())
     isfile(path) || error("LAS/LAZ file not found: $path")
     _ensure_laspy()
 
+    T = precision
     las = _laspy.read(path)
 
     # Coordinates
@@ -94,7 +96,7 @@ function read_las(path::AbstractString)
     y = _numpy_to_jl(las.y, Float64)
     z = _numpy_to_jl(las.z, Float64)
     n = length(x)
-    coords = Matrix{Float64}(undef, n, 3)
+    coords = Matrix{T}(undef, n, 3)
     @inbounds for i in 1:n
         coords[i, 1] = x[i]
         coords[i, 2] = y[i]
@@ -191,7 +193,8 @@ const write_laz = write_las
 # ── E57 (via pye57) ───────────────────────────────────────────────
 
 """Read a single scan from an open pye57.E57 object. Returns (coords, attrs)."""
-function _read_e57_scan(e57_obj, scan_index::Int)
+function _read_e57_scan(e57_obj, scan_index::Int; precision::DataType=coord_type())
+    T = precision
     data = e57_obj.read_scan(scan_index, ignore_missing_fields=true)
 
     # Coordinates (always present)
@@ -199,7 +202,7 @@ function _read_e57_scan(e57_obj, scan_index::Int)
     y = _numpy_to_jl(data["cartesianY"], Float64)
     z = _numpy_to_jl(data["cartesianZ"], Float64)
     n = length(x)
-    coords = Matrix{Float64}(undef, n, 3)
+    coords = Matrix{T}(undef, n, 3)
     @inbounds for i in 1:n
         coords[i, 1] = x[i]
         coords[i, 2] = y[i]
@@ -253,28 +256,29 @@ function _merge_scan_attrs(all_attrs::Vector{Dict{Symbol,Vector}})
 end
 
 """
-    _read_e57_to_raw(path::AbstractString; scan_index::Int=-1) -> (Matrix{Float64}, Dict{Symbol,Vector})
+    _read_e57_to_raw(path::AbstractString; scan_index::Int=-1, precision::DataType=coord_type()) -> (Matrix, Dict{Symbol,Vector})
 
 Read an E57 file and return raw (coords, attrs) without constructing a PointCloud.
 Useful for subsampling before building the PointCloud object.
 """
-function _read_e57_to_raw(path::AbstractString; scan_index::Int=-1)
+function _read_e57_to_raw(path::AbstractString; scan_index::Int=-1, precision::DataType=coord_type())
     isfile(path) || error("E57 file not found: $path")
     _ensure_pye57()
 
+    T = precision
     e57_obj = _pye57.E57(path)
     try
         n_scans = pyconvert(Int, e57_obj.scan_count)
 
         if scan_index >= 0
             scan_index < n_scans || error("scan_index $scan_index out of range (file has $n_scans scans)")
-            return _read_e57_scan(e57_obj, scan_index)
+            return _read_e57_scan(e57_obj, scan_index; precision=T)
         else
             n_scans > 0 || error("E57 file contains no 3D scans: $path")
-            all_coords = Vector{Matrix{Float64}}(undef, n_scans)
+            all_coords = Vector{Matrix{T}}(undef, n_scans)
             all_attrs  = Vector{Dict{Symbol,Vector}}(undef, n_scans)
             for si in 0:(n_scans - 1)
-                all_coords[si + 1], all_attrs[si + 1] = _read_e57_scan(e57_obj, si)
+                all_coords[si + 1], all_attrs[si + 1] = _read_e57_scan(e57_obj, si; precision=T)
             end
             coords = vcat(all_coords...)
             attrs  = _merge_scan_attrs(all_attrs)
@@ -303,8 +307,8 @@ pc = read_e57("scan.e57")
 coords = coordinates(pc)
 ```
 """
-function read_e57(path::AbstractString; scan_index::Int=-1)
-    coords, attrs = _read_e57_to_raw(path; scan_index=scan_index)
+function read_e57(path::AbstractString; scan_index::Int=-1, precision::DataType=coord_type())
+    coords, attrs = _read_e57_to_raw(path; scan_index=scan_index, precision=precision)
     return PointCloudData(coords, attrs)
 end
 
@@ -364,12 +368,12 @@ end
 Read a point cloud file, dispatching by file extension.
 Supported: `.las`, `.laz`, `.e57`.
 """
-function read_pc(path::AbstractString)
+function read_pc(path::AbstractString; precision::DataType=coord_type())
     ext = lowercase(splitext(path)[2])
     if ext in (".las", ".laz")
-        return read_las(path)
+        return read_las(path; precision=precision)
     elseif ext == ".e57"
-        return read_e57(path)
+        return read_e57(path; precision=precision)
     else
         error("Unsupported point cloud format: $ext (supported: .las, .laz, .e57)")
     end
@@ -389,5 +393,136 @@ function write_pc(path::AbstractString, pc::PointCloud)
         return write_e57(path, pc)
     else
         error("Unsupported point cloud write format: $ext (supported: .las, .laz, .e57)")
+    end
+end
+
+# ── Metadata-only reads ───────────────────────────────────────────
+
+"""
+    read_las_metadata(path::AbstractString) -> PointCloudMetadata
+
+Read LAS/LAZ file metadata (header only) without loading point data.
+"""
+function read_las_metadata(path::AbstractString)
+    isfile(path) || error("LAS/LAZ file not found: $path")
+    _ensure_laspy()
+
+    ext = uppercase(splitext(path)[2][2:end])  # "LAS" or "LAZ"
+
+    reader = _laspy.open(path)
+    try
+        hdr = reader.header
+
+        point_count = pyconvert(Int, hdr.point_count)
+        version     = pyconvert(String, pystr(hdr.version))
+        pf          = pyconvert(Int, hdr.point_format.id)
+        scales      = Float64[pyconvert(Float64, s) for s in hdr.scales]
+        offsets     = Float64[pyconvert(Float64, o) for o in hdr.offsets]
+        mins        = Float64[pyconvert(Float64, v) for v in hdr.mins]
+        maxs        = Float64[pyconvert(Float64, v) for v in hdr.maxs]
+
+        return PointCloudMetadata(
+            path, ext, point_count,
+            mins, maxs,
+            1, 0,
+            version, pf,
+            scales, offsets,
+            Float64[],
+            Matrix{Float64}(I, 3, 3),
+            Dict{String,Any}(),
+        )
+    finally
+        reader.close()
+    end
+end
+
+const read_laz_metadata = read_las_metadata
+
+"""Read metadata for a single E57 scan from an open pye57.E57 object."""
+function _read_e57_scan_metadata(e57_obj, path::AbstractString, scan_index::Int, n_scans::Int)
+    _ensure_np()
+    hdr = e57_obj.get_header(scan_index)
+
+    point_count = pyconvert(Int, hdr.point_count)
+
+    # Bounds (attribute access on ScanHeader)
+    bounds_min = Float64[]
+    bounds_max = Float64[]
+    for (lo_attr, hi_attr) in [("xMinimum","xMaximum"), ("yMinimum","yMaximum"), ("zMinimum","zMaximum")]
+        lo_ok = pyconvert(Bool, pybuiltins.hasattr(hdr, lo_attr))
+        hi_ok = pyconvert(Bool, pybuiltins.hasattr(hdr, hi_attr))
+        if lo_ok && hi_ok
+            push!(bounds_min, pyconvert(Float64, pygetattr(hdr, lo_attr)))
+            push!(bounds_max, pyconvert(Float64, pygetattr(hdr, hi_attr)))
+        else
+            push!(bounds_min, NaN)
+            push!(bounds_max, NaN)
+        end
+    end
+
+    # Translation (numpy array of length 3)
+    translation = _numpy_to_jl(hdr.translation, Float64)
+
+    # Rotation (use rotation_matrix which returns 3×3 numpy array directly)
+    rot_np = hdr.rotation_matrix
+    rotation = Matrix{Float64}(undef, 3, 3)
+    for j in 0:2, i in 0:2
+        rotation[i+1, j+1] = pyconvert(Float64, rot_np[i][j])
+    end
+
+    return PointCloudMetadata(
+        path, "E57", point_count,
+        bounds_min, bounds_max,
+        n_scans, scan_index,
+        "", -1,
+        Float64[], Float64[],
+        translation, rotation,
+        Dict{String,Any}(),
+    )
+end
+
+"""
+    read_e57_metadata(path::AbstractString; scan_index::Int=-1)
+
+Read E57 file metadata without loading point data.
+
+Returns a single `PointCloudMetadata` when `scan_index ≥ 0`, or a
+`Vector{PointCloudMetadata}` (one per scan) when `scan_index = -1`.
+"""
+function read_e57_metadata(path::AbstractString; scan_index::Int=-1)
+    isfile(path) || error("E57 file not found: $path")
+    _ensure_pye57()
+
+    e57_obj = _pye57.E57(path)
+    try
+        n_scans = pyconvert(Int, e57_obj.scan_count)
+
+        if scan_index >= 0
+            scan_index < n_scans || error("scan_index $scan_index out of range (file has $n_scans scans)")
+            return _read_e57_scan_metadata(e57_obj, path, scan_index, n_scans)
+        else
+            n_scans > 0 || error("E57 file contains no 3D scans: $path")
+            return [_read_e57_scan_metadata(e57_obj, path, si, n_scans) for si in 0:(n_scans - 1)]
+        end
+    finally
+    end
+end
+
+"""
+    read_pc_metadata(path::AbstractString; scan_index::Int=-1)
+
+Read point cloud file metadata without loading point data, dispatching by
+file extension. Supported: `.las`, `.laz`, `.e57`.
+
+The `scan_index` keyword is used only for E57 files and ignored for LAS/LAZ.
+"""
+function read_pc_metadata(path::AbstractString; scan_index::Int=-1)
+    ext = lowercase(splitext(path)[2])
+    if ext in (".las", ".laz")
+        return read_las_metadata(path)
+    elseif ext == ".e57"
+        return read_e57_metadata(path; scan_index=scan_index)
+    else
+        error("Unsupported point cloud format: $ext (supported: .las, .laz, .e57)")
     end
 end

@@ -209,7 +209,7 @@ end
 
 Segment every vertex of `graph` into non-branching segments (NBS) using
 `greedy_connected_neighborhood_search`. Connected components smaller than
-`cfg.tree_nbs_min_segment_size` are discarded upfront (label 0). Valid
+`cfg.tree_min_nbs_size` are discarded upfront (label 0). Valid
 segments are relabeled by descending size (largest segment → label 1).
 
 Returns `(nbs_id::Vector{Int32}, node_id::Vector{Int32})`.
@@ -224,7 +224,7 @@ function label_non_branching_segments(
     size(points, 1) == N || throw(ArgumentError("graph vertex count must match number of points"))
     length(agh_values) == N || throw(ArgumentError("agh_values length must match graph vertex count"))
 
-    min_segment_size      = cfg.tree_nbs_min_segment_size
+    min_segment_size      = cfg.tree_min_nbs_size
     neighbor_distance     = cfg.tree_nbs_neighbor_distance
     max_iter              = cfg.tree_nbs_max_iterations
     nearground_agh_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
@@ -287,7 +287,7 @@ function label_non_branching_segments(
                 workspace            = gsws,
                 points               = points,
                 linearity_angle_deg  = Float64(cfg.tree_linearity_angle_deg),
-                min_frontier_cc_size = Int(cfg.tree_min_cc_size),
+                min_frontier_cc_size = Int(cfg.tree_frontier_min_cc_size),
             )
             labeled_idx = result.vertices
             node_ids    = result.node_ids
@@ -844,7 +844,7 @@ function process_orphan_segments(
     orphan_to_tree_nbs = Dict{Int, Dict{Int32, Int}}()
 
     if !isempty(assigned_idx)
-        assigned_3xM = Matrix{Float64}(undef, 3, length(assigned_idx))
+        assigned_3xM = Matrix{eltype(coords)}(undef, 3, length(assigned_idx))
         @inbounds for (j, i) in enumerate(assigned_idx)
             assigned_3xM[1, j] = coords[i, 1]
             assigned_3xM[2, j] = coords[i, 2]
@@ -992,10 +992,11 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     neighbor_radius > 0 || throw(ArgumentError("tree neighbor radius must be > 0"))
 
     # ── Discover connected components via lightweight union-find (no graph) ──
-    cc_labels = connected_component_labels(coords_filtered, neighbor_radius, cfg.tree_min_cc_size)
+    cc_labels = connected_component_labels(coords_filtered, neighbor_radius, cfg.tree_min_nbs_size)
+    # each cluster needs to at least have enough points to form a valid NBS, otherwise it's not worth processing
     unique_ccs = sort(unique(filter(>(0), cc_labels)))
     n_components = length(unique_ccs)
-    println("[tree_segmentation] $(N) filtered points → $(n_components) connected components (min_cc=$(cfg.tree_min_cc_size))")
+    println("[tree_segmentation] $(N) filtered points → $(n_components) connected components (min_cc=$(cfg.tree_min_nbs_size))")
 
     if n_components == 0
         return empty_result
@@ -1007,7 +1008,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     global_tree_id     = zeros(Int32, N)
     global_tree_nbs_id = zeros(Int32, N)
 
-    all_skel_coords = Matrix{Float64}[]
+    all_skel_coords = Matrix{eltype(coords_filtered)}[]
     all_skel_attrs  = Dict{Symbol,Vector}[]
     all_skel_edges  = Tuple{Int,Int}[]
     skel_vertex_offset = 0
@@ -1020,11 +1021,6 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         cc_indices = findall(==(cc_id), cc_labels)
         cc_n = length(cc_indices)
 
-        # Skip small components — their global IDs stay 0
-        if cc_n < cfg.tree_min_cc_size
-            println("[tree_segmentation]   component $(ci)/$(n_components): $(cc_n) points (skipped, < min_cc=$(cfg.tree_min_cc_size))")
-            continue
-        end
         println("[tree_segmentation]   component $(ci)/$(n_components): $(cc_n) points")
 
         cc_coords = coords_filtered[cc_indices, :]
@@ -1108,6 +1104,25 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
 
     # ── Orphan NBS rescue (cross-component, uses occlusion tolerance) ────
     process_orphan_segments(coords_filtered, global_nbs_id, global_tree_id, global_tree_nbs_id; cfg=cfg)
+
+    # ── Reorder tree_id by descending point count ──────────────────────────
+    tree_counts = Dict{Int32, Int}()
+    @inbounds for tid in global_tree_id
+        tid > 0 || continue
+        tree_counts[tid] = get(tree_counts, tid, 0) + 1
+    end
+    if !isempty(tree_counts)
+        sorted_tids = sort!(collect(keys(tree_counts)); by=t -> -tree_counts[t])
+        old_to_new = Dict{Int32, Int32}()
+        for (new_id, old_id) in enumerate(sorted_tids)
+            old_to_new[old_id] = Int32(new_id)
+        end
+        @inbounds for i in eachindex(global_tree_id)
+            tid = global_tree_id[i]
+            global_tree_id[i] = tid > 0 ? old_to_new[tid] : Int32(0)
+        end
+        tree_offset = Int32(length(sorted_tids))
+    end
 
     # ── Build output point cloud ─────────────────────────────────────────
     pc_output = setattribute!(pc_filtered, :nbs_id, global_nbs_id)

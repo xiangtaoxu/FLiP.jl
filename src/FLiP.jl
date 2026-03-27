@@ -73,12 +73,14 @@ export bounds, center
 export read_las, read_laz, write_las, write_laz
 export read_e57, write_e57
 export read_pc, write_pc
+export PointCloudMetadata
+export read_las_metadata, read_laz_metadata, read_e57_metadata, read_pc_metadata
 
 # Export subsampling functions
 export distance_subsample, distance_subsample_indices
 
 # Export config
-export FLiPConfig, load_config!
+export FLiPConfig, load_config!, coord_type
 
 # Export filtering functions
 export statistical_filter, statistical_filter_indices
@@ -86,6 +88,9 @@ export grid_zmin_filter_indices, upward_conic_filter_indices
 export voxel_connected_component_filter_indices
 export rnn_filter, rnn_filter_indices
 export segment_ground
+export XY_polygon_filter_indices, XY_polygon_filter
+export convex_hull_2d, buffer_polygon, polygon_area
+export crop_by_ground_polygon
 export ground_segmentation
 
 # Export mesh functions

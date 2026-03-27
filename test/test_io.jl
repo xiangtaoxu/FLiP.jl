@@ -47,6 +47,37 @@
         end
     end
     
+    @testset "LAS/LAZ Metadata" begin
+        coords = rand(Float64, 200, 3) .* 100.0
+        pc = make_test_pointcloud(coords)
+
+        output_path = joinpath(test_dir, "test_meta.las")
+        write_las(output_path, pc)
+
+        meta = read_las_metadata(output_path)
+        @test meta isa PointCloudMetadata
+        @test meta.format == "LAS"
+        @test meta.point_count == 200
+        @test length(meta.bounds_min) == 3
+        @test length(meta.bounds_max) == 3
+        @test all(meta.bounds_min .<= meta.bounds_max)
+        @test meta.version != ""
+        @test meta.point_format >= 0
+        @test length(meta.scales) == 3
+        @test length(meta.offsets) == 3
+        @test isempty(meta.translation)
+        @test meta.rotation ≈ Matrix{Float64}(I, 3, 3)
+        @test meta.scan_count == 1
+
+        # Dispatcher
+        meta2 = read_pc_metadata(output_path)
+        @test meta2 isa PointCloudMetadata
+        @test meta2.point_count == 200
+
+        # File not found
+        @test_throws ErrorException read_las_metadata("__nonexistent__.las")
+    end
+
     # Cleanup
     rm(test_dir, recursive=true)
 end

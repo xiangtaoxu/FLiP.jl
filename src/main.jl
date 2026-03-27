@@ -44,7 +44,7 @@ function _pipeline_load(output_dir::AbstractString, output_prefix::AbstractStrin
     sort!(candidates, by=f -> parse(Int, match(re_idx, basename(f)).captures[1]))
 
     println("[main] resume: loading $(length(candidates)) $(stem) files from $output_dir")
-    all_coords = Vector{Matrix{Float64}}(undef, length(candidates))
+    all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(candidates))
     all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(candidates))
     for (i, fpath) in enumerate(candidates)
         println("[main] resume: loading $fpath")

@@ -71,6 +71,33 @@
         @test c ≈ [0.25, 0.25, 0.25]
     end
 
+    @testset "Float32 coordinates" begin
+        coords32 = rand(Float32, 50, 3)
+        pc32 = make_test_pointcloud(coords32; attrs=Dict(:intensity => rand(UInt16, 50)))
+        @test eltype(FLiP.coordinates(pc32)) == Float32
+        @test npoints(pc32) == 50
+
+        # Subsetting preserves Float32
+        pc32_sub = pc32[1:10]
+        @test eltype(FLiP.coordinates(pc32_sub)) == Float32
+        @test npoints(pc32_sub) == 10
+
+        # addattribute preserves Float32
+        pc32b = addattribute(pc32, :label, ones(Int32, 50))
+        @test eltype(FLiP.coordinates(pc32b)) == Float32
+
+        # _replace_coordinates preserves Float32
+        new_c = rand(Float32, 50, 3)
+        pc32c = FLiP._replace_coordinates(pc32, new_c)
+        @test eltype(FLiP.coordinates(pc32c)) == Float32
+
+        # bounds and center work with Float32
+        bbox = bounds(pc32)
+        @test length(bbox) == 6
+        c = center(pc32)
+        @test length(c) == 3
+    end
+
     @testset "PointCloud display" begin
         coords = rand(Float64, 100, 3)
         pc = make_test_pointcloud(coords; attrs=Dict(:test_attr => rand(Float64, 100)))

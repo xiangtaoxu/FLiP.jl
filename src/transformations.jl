@@ -21,7 +21,7 @@ pc_translated = translate(pc, 100.0, 200.0, 0.0)
 ```
 """
 function translate(pc::PointCloud, dx::Real, dy::Real, dz::Real)
-    T = Float64
+    T = eltype(coordinates(pc))
     new_coords = copy(coordinates(pc))
     new_coords[:, 1] .+= T(dx)
     new_coords[:, 2] .+= T(dy)
@@ -71,7 +71,7 @@ pc_scaled = scale(pc, 2.0)  # Double the size
 ```
 """
 function scale(pc::PointCloud, factor::Real)
-    T = Float64
+    T = eltype(coordinates(pc))
     factor > 0 || throw(ArgumentError("scale factor must be > 0"))
 
     new_coords = coordinates(pc) .* T(factor)
@@ -97,7 +97,7 @@ pc_scaled = scale(pc, 2.0, 2.0, 1.0)  # Double XY, keep Z
 ```
 """
 function scale(pc::PointCloud, sx::Real, sy::Real, sz::Real)
-    T = Float64
+    T = eltype(coordinates(pc))
     sx > 0 && sy > 0 && sz > 0 || throw(ArgumentError("scale factors must be > 0"))
 
     new_coords = copy(coordinates(pc))
@@ -187,11 +187,11 @@ end
 Internal function to apply a rotation to all points.
 """
 function _apply_rotation(pc::PointCloud, R::Rotation)
-    T = Float64
+    T = eltype(coordinates(pc))
     n = length(pc)
     new_coords = Matrix{T}(undef, n, 3)
     coords = coordinates(pc)
-    
+
     # Apply rotation to each point
     @inbounds for i in 1:n
         p = SVector{3,T}(coords[i, 1], coords[i, 2], coords[i, 3])
@@ -249,11 +249,11 @@ pc_transformed = transform(pc, tfm)
 ```
 """
 function transform(pc::PointCloud, tfm)
-    T = Float64
+    T = eltype(coordinates(pc))
     n = length(pc)
     new_coords = Matrix{T}(undef, n, 3)
     coords = coordinates(pc)
-    
+
     # Apply transformation to each point
     @inbounds for i in 1:n
         p = SVector{3,T}(coords[i, 1], coords[i, 2], coords[i, 3])

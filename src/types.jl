@@ -8,17 +8,18 @@ for minimal memory overhead and O(1) attribute operations.
 # ── Point cloud struct ─────────────────────────────────────────────
 
 """
-    PointCloudData
+    PointCloudData{T<:AbstractFloat}
 
-Lightweight point cloud container storing coordinates as an N×3 Float64 matrix
-and attributes as a `Dict{Symbol,Vector}`.
+Lightweight point cloud container storing coordinates as an N×3 matrix
+and attributes as a `Dict{Symbol,Vector}`. Parametrized by coordinate
+precision `T` (typically `Float32` or `Float64`).
 
 # Fields
-- `coords::Matrix{Float64}` — N×3 matrix of XYZ coordinates
+- `coords::Matrix{T}` — N×3 matrix of XYZ coordinates
 - `attrs::Dict{Symbol,Vector}` — named attribute vectors (e.g., `:intensity`, `:classification`)
 """
-mutable struct PointCloudData
-    coords::Matrix{Float64}       # N×3
+mutable struct PointCloudData{T<:AbstractFloat}
+    coords::Matrix{T}            # N×3
     attrs::Dict{Symbol,Vector}
 end
 
@@ -52,7 +53,7 @@ npoints(pc::PointCloud) = size(pc.coords, 1)
 
 Base.length(pc::PointCloud) = npoints(pc)
 
-"""Return coordinates as an N×3 Float64 matrix."""
+"""Return coordinates as an N×3 matrix (element type matches coordinate precision)."""
 coordinates(pc::PointCloud) = pc.coords
 
 """Return a copy of all scalar attributes."""
@@ -98,7 +99,8 @@ function _replace_coordinates(pc::PointCloud, new_coords::AbstractMatrix{<:Real}
     n = size(new_coords, 1)
     n == npoints(pc) || throw(ArgumentError("new_coords row count must match number of points"))
     size(new_coords, 2) == 3 || throw(ArgumentError("new_coords must be N×3"))
-    return PointCloudData(Float64.(new_coords), copy(pc.attrs))
+    T = eltype(pc.coords)
+    return PointCloudData(T.(new_coords), copy(pc.attrs))
 end
 
 # ── Summary functions ──────────────────────────────────────────────
@@ -125,4 +127,65 @@ function Base.show(io::IO, ::MIME"text/plain", pc::PointCloudData)
     println(io, "  Points: $(npoints(pc))")
     attr_names = sort(collect(keys(pc.attrs)), by=string)
     print(io, "  Attributes: $(join(attr_names, ", "))")
+end
+
+# ── Point cloud metadata struct ───────────────────────────────────
+
+"""
+    PointCloudMetadata
+
+Lightweight container for point cloud file metadata, read without loading
+point data. Covers both LAS/LAZ and E57 formats.
+
+# Fields
+- `path::String` — file path
+- `format::String` — `"LAS"`, `"LAZ"`, or `"E57"`
+- `point_count::Int` — number of points
+- `bounds_min::Vector{Float64}` — `[xmin, ymin, zmin]`
+- `bounds_max::Vector{Float64}` — `[xmax, ymax, zmax]`
+- `scan_count::Int` — 1 for LAS/LAZ, N for E57
+- `scan_index::Int` — 0-based scan index, -1 when representing all scans
+- `version::String` — LAS version string, `""` for E57
+- `point_format::Int` — LAS point format ID, -1 for E57
+- `scales::Vector{Float64}` — LAS `[sx, sy, sz]`, empty for E57
+- `offsets::Vector{Float64}` — LAS `[ox, oy, oz]`, empty for E57
+- `translation::Vector{Float64}` — E57 per-scan `[tx, ty, tz]`, empty for LAS
+- `rotation::Matrix{Float64}` — E57 per-scan 3×3 rotation, identity for LAS
+- `extra::Dict{String,Any}` — format-specific extras
+"""
+mutable struct PointCloudMetadata
+    path::String
+    format::String
+    point_count::Int
+    bounds_min::Vector{Float64}
+    bounds_max::Vector{Float64}
+    scan_count::Int
+    scan_index::Int
+    version::String
+    point_format::Int
+    scales::Vector{Float64}
+    offsets::Vector{Float64}
+    translation::Vector{Float64}
+    rotation::Matrix{Float64}
+    extra::Dict{String,Any}
+end
+
+function Base.show(io::IO, m::PointCloudMetadata)
+    print(io, "PointCloudMetadata($(m.format), $(m.point_count) points)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", m::PointCloudMetadata)
+    println(io, "PointCloudMetadata")
+    println(io, "  Path: $(m.path)")
+    println(io, "  Format: $(m.format)")
+    println(io, "  Points: $(m.point_count)")
+    println(io, "  Bounds: $(m.bounds_min) — $(m.bounds_max)")
+    if m.format == "E57"
+        println(io, "  Scan: $(m.scan_index) of $(m.scan_count)")
+        if !isempty(m.translation)
+            print(io, "  Translation: $(m.translation)")
+        end
+    else
+        print(io, "  Version: $(m.version), Point Format: $(m.point_format)")
+    end
 end

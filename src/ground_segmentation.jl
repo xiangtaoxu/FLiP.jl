@@ -164,9 +164,60 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
 end
 
 """
+    crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
+        buffer::Real=_CFG.ground_polygon_buffer,
+        k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
+        n_sigma::Real=_CFG.statistical_filter_n_sigma) -> (pc_cropped, ground_area)
+
+Crop a point cloud to the buffered 2D convex hull of ground points.
+
+First applies `statistical_filter` to the ground points to remove outliers,
+then computes the convex hull in the XY plane, expands it by `buffer` meters,
+and returns only the points inside the buffered polygon.
+
+# Arguments
+- `pc`: Point cloud to crop
+- `ground_points`: Ground points used to define the cropping polygon
+- `buffer`: Outward buffer distance in meters (default: 5.0)
+- `k_neighbors`: K for statistical filter on ground points (default from config)
+- `n_sigma`: Sigma threshold for statistical filter (default from config)
+
+# Returns
+- `NamedTuple` with:
+  - `pc_cropped::PointCloud`: Cropped point cloud
+  - `ground_area::Float64`: Area of the buffered polygon in m²
+"""
+function crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
+                                buffer::Real=_CFG.ground_polygon_buffer,
+                                k_neighbors::Int=_CFG.statistical_filter_k_neighbors,
+                                n_sigma::Real=_CFG.statistical_filter_n_sigma)
+    # Clean ground points before computing hull
+    gnd_clean = statistical_filter(ground_points, k_neighbors, n_sigma)
+    if npoints(gnd_clean) < 3
+        return (pc_cropped=pc, ground_area=0.0)
+    end
+
+    # Compute buffered convex hull
+    hull = convex_hull_2d(coordinates(gnd_clean))
+    hull_buffered = buffer_polygon(hull, buffer)
+    area = polygon_area(hull_buffered)
+
+    # Crop
+    pc_cropped = XY_polygon_filter(pc, hull_buffered)
+    return (pc_cropped=pc_cropped, ground_area=area)
+end
+
+"""
     ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG) -> NamedTuple
 
-Run configured ground segmentation and optional AGH computation.
+Run configured ground segmentation, optional ground polygon cropping,
+and optional AGH computation.
+
+Returns a `NamedTuple` with fields:
+- `ground_points`: segmented ground `PointCloud`
+- `aboveground_height`: `Vector{Float64}` (empty if AGH disabled)
+- `agh_cloud`: `PointCloud` with `:AGH` attribute (or uncropped `pc` if both crop and AGH disabled)
+- `ground_area`: area of the buffered ground polygon in m² (0.0 if cropping disabled)
 """
 function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     ground_points = segment_ground(
@@ -177,17 +228,30 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
         min_cc_size=cfg.segment_ground_min_cc_size,
     )
 
+    ground_area = 0.0
+    pc_use = pc
+
+    if cfg.pipeline_enable_ground_crop
+        crop_res = crop_by_ground_polygon(pc, ground_points;
+            buffer=cfg.ground_polygon_buffer,
+            k_neighbors=cfg.statistical_filter_k_neighbors,
+            n_sigma=cfg.statistical_filter_n_sigma)
+        pc_use = crop_res.pc_cropped
+        ground_area = crop_res.ground_area
+        @info "Ground polygon crop: $(npoints(pc)) → $(npoints(pc_use)) points, ground area = $(round(ground_area; digits=2)) m²"
+    end
+
     if cfg.pipeline_enable_agh
         agh = calculate_aboveground_height(
-            pc,
+            pc_use,
             ground_points;
             xy_resolution=cfg.pipeline_xy_resolution,
             idw_k=cfg.pipeline_idw_k,
             idw_power=cfg.pipeline_idw_power,
         )
-        pc_agh = setattribute!(pc, :AGH, agh)
-        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_agh)
+        pc_agh = setattribute!(pc_use, :AGH, agh)
+        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_agh, ground_area=ground_area)
     end
 
-    return (ground_points=ground_points, aboveground_height=Float64[], agh_cloud=pc)
+    return (ground_points=ground_points, aboveground_height=Float64[], agh_cloud=pc_use, ground_area=ground_area)
 end

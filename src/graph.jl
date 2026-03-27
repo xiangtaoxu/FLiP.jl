@@ -1604,7 +1604,8 @@ function _validate_graph_points(points::AbstractMatrix{<:Real})
 end
 
 function _graph_kdtree(points::AbstractMatrix{<:Real})
-    return KDTree(Matrix{Float64}(transpose(points)))
+    T = eltype(points)
+    return KDTree(Matrix{T}(transpose(points)))
 end
 
 @inline function _edge_distance(points::AbstractMatrix{<:Real}, i::Int, j::Int)

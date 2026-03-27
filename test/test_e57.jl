@@ -71,6 +71,43 @@
         @test_throws ErrorException read_e57("__nonexistent_file__.e57")
     end
 
+    @testset "E57 Metadata" begin
+        n = 100
+        coords = randn(n, 3) .* 5.0
+        pc = make_test_pointcloud(coords)
+
+        tmp = mktempdir()
+        e57_path = joinpath(tmp, "test_meta.e57")
+        write_e57(e57_path, pc)
+
+        # Single scan metadata
+        meta = read_e57_metadata(e57_path; scan_index=0)
+        @test meta isa PointCloudMetadata
+        @test meta.format == "E57"
+        @test meta.point_count == n
+        @test meta.scan_count == 1
+        @test meta.scan_index == 0
+        @test meta.point_format == -1
+
+        # All scans (returns vector)
+        metas = read_e57_metadata(e57_path)
+        @test metas isa Vector{PointCloudMetadata}
+        @test length(metas) == 1
+        @test metas[1].point_count == n
+
+        # Dispatcher
+        metas2 = read_pc_metadata(e57_path)
+        @test metas2 isa Vector{PointCloudMetadata}
+
+        # Out-of-range scan index
+        @test_throws ErrorException read_e57_metadata(e57_path; scan_index=99)
+
+        # File not found
+        @test_throws ErrorException read_e57_metadata("__nonexistent__.e57")
+
+        rm(tmp; recursive=true, force=true)
+    end
+
     @testset "Internal: _merge_scan_attrs" begin
         a1 = Dict{Symbol,Vector}(:color_red => UInt16[1, 2], :color_green => UInt16[10, 20])
         a2 = Dict{Symbol,Vector}(:color_red => UInt16[3, 4], :color_green => UInt16[30, 40])

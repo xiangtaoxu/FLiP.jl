@@ -11,7 +11,8 @@ function make_test_pointcloud(coords::AbstractMatrix{<:Real}; attrs=Dict{Symbol,
         length(vals) == n || throw(ArgumentError("attribute :$name has wrong length"))
         pc_attrs[name] = vals
     end
-    return FLiP.PointCloudData(Float64.(coords), pc_attrs)
+    T = eltype(coords) <: AbstractFloat ? eltype(coords) : Float64
+    return FLiP.PointCloudData(T.(coords), pc_attrs)
 end
 
 @testset "FLiP.jl" begin
