@@ -1,31 +1,17 @@
 using Test
 using FLiP
 using LinearAlgebra
-import PointClouds
 
 function make_test_pointcloud(coords::AbstractMatrix{<:Real}; attrs=Dict{Symbol,Any}())
     size(coords, 2) == 3 || throw(ArgumentError("coords must be N×3"))
     n = size(coords, 1)
-
-    points_nt = (
-        x = Float64.(coords[:, 1]),
-        y = Float64.(coords[:, 2]),
-        z = Float64.(coords[:, 3]),
-    )
-    pc = PointClouds.LAS(
-        PointClouds.IO.PointRecord0,
-        points_nt;
-        coord_scale=(1e-6, 1e-6, 1e-6),
-        coord_offset=(0.0, 0.0, 0.0),
-    )
-
+    pc_attrs = Dict{Symbol,Vector}()
     for (name, vals_any) in attrs
         vals = collect(vals_any)
         length(vals) == n || throw(ArgumentError("attribute :$name has wrong length"))
-        pc = addattribute(pc, name, vals)
+        pc_attrs[name] = vals
     end
-
-    return pc
+    return FLiP.PointCloudData(Float64.(coords), pc_attrs)
 end
 
 @testset "FLiP.jl" begin
@@ -37,4 +23,5 @@ end
     include("test_graph.jl")
     include("test_main.jl")
     include("test_transformations.jl")
+    include("test_e57.jl")
 end

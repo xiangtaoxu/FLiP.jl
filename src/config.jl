@@ -51,8 +51,11 @@ mutable struct FLiPConfig
 
     # pipeline runner
     pipeline_input_path::String
+    pipeline_input_prefix::String
+    pipeline_input_format::String
     pipeline_output_dir::String
     pipeline_output_prefix::String
+    pipeline_output_format::String
     pipeline_subsample_res::Float64
     pipeline_enable_subsample::Bool
     pipeline_enable_preprocess::Bool
@@ -102,8 +105,11 @@ function FLiPConfig(d::Dict)
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
 
         String(get(pl, "input_path", "")),
+        String(get(pl, "input_prefix", "")),
+        String(get(pl, "input_format", "las")),
         String(get(pl, "output_dir", "")),
         String(get(pl, "output_prefix", "output")),
+        String(get(pl, "output_format", "las")),
         Float64(get(pl, "subsample_res", 0.05)),
         Bool(get(pl, "enable_subsample", false)),
         Bool(get(pl, "enable_preprocess", true)),

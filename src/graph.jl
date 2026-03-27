@@ -77,9 +77,12 @@ function build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real)
 
     tree = _graph_kdtree(points)
     search_radius = float(radius)
-    rows = Int[]
-    cols = Int[]
-    vals = Float64[]
+
+    # Estimate edge count for pre-allocation (assume ~10 neighbors per point)
+    edge_estimate = 10 * n
+    rows = Int[];    sizehint!(rows, 2 * edge_estimate)
+    cols = Int[];    sizehint!(cols, 2 * edge_estimate)
+    vals = Float64[];sizehint!(vals, 2 * edge_estimate)
 
     @inbounds for i in 1:n
         neighbors_i = inrange(tree, vec(@view points[i, :]), search_radius)

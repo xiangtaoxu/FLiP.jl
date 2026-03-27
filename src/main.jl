@@ -1,17 +1,74 @@
-@inline function _pipeline_output_path(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString)
-    return joinpath(output_dir, "$(output_prefix)$(stem).las")
+@inline function _pipeline_output_path(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString; fmt::AbstractString="las")
+    return joinpath(output_dir, "$(output_prefix)$(stem).$(fmt)")
 end
 
 @inline function _pipeline_write(path::AbstractString, pc::PointCloud)
-    write_las(path, pc)
+    write_pc(path, pc)
     println("[main] wrote: $path")
     return true
 end
 
+"""Load a single pipeline output file."""
 @inline function _pipeline_load(path::AbstractString, label::AbstractString)
     isfile(path) || throw(ArgumentError("$label not found: $path"))
     println("[main] resume: loading $(path)")
-    return read_las(path)
+    return read_pc(path)
+end
+
+"""
+Load pipeline output that may be a single file or multiple `_S{i}` files.
+
+Tries `{prefix}{stem}.{fmt}` first; if not found, discovers
+`{prefix}{stem}_S{i}.{fmt}` files, loads each, and merges into one cloud.
+Returns `nothing` if no matching files exist.
+"""
+function _pipeline_load(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString, fmt::AbstractString)
+    # Try single-file first
+    single_path = joinpath(output_dir, "$(output_prefix)$(stem).$(fmt)")
+    if isfile(single_path)
+        println("[main] resume: loading $single_path")
+        return read_pc(single_path)
+    end
+
+    # Try multi-file _S{i} pattern
+    file_prefix = "$(output_prefix)$(stem)_S"
+    ext = "." * fmt
+    re_idx = Regex("_S(\\d+)\\." * replace(fmt, r"([.+*?^${}()|[\]\\])" => s"\\\1") * "\$", "i")
+    candidates = filter(readdir(output_dir; join=true)) do f
+        bn = basename(f)
+        startswith(bn, file_prefix) && endswith(lowercase(bn), ext)
+    end
+    isempty(candidates) && return nothing
+
+    # Sort by scan index
+    sort!(candidates, by=f -> parse(Int, match(re_idx, basename(f)).captures[1]))
+
+    println("[main] resume: loading $(length(candidates)) $(stem) files from $output_dir")
+    all_coords = Vector{Matrix{Float64}}(undef, length(candidates))
+    all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(candidates))
+    for (i, fpath) in enumerate(candidates)
+        println("[main] resume: loading $fpath")
+        pc = read_pc(fpath)
+        all_coords[i] = coordinates(pc)
+        all_attrs[i]  = _all_attributes(pc)
+    end
+
+    if length(candidates) == 1
+        return _build_pointcloud_from_coords(all_coords[1], all_attrs[1])
+    end
+
+    # Merge
+    common_keys = Set(keys(all_attrs[1]))
+    for a in all_attrs[2:end]
+        intersect!(common_keys, keys(a))
+    end
+    merged_attrs = Dict{Symbol,Vector}()
+    for k in common_keys
+        merged_attrs[k] = vcat([a[k] for a in all_attrs]...)
+    end
+    merged_coords = vcat(all_coords...)
+    println("[main] resume: merged $(length(candidates)) scans → $(size(merged_coords, 1)) points")
+    return _build_pointcloud_from_coords(merged_coords, merged_attrs)
 end
 
 @inline function _pipeline_require(data, path::AbstractString, data_label::AbstractString, consumer_label::AbstractString)
@@ -46,28 +103,36 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     isempty(input_path) && throw(ArgumentError("pipeline.input_path must be set in config"))
     isempty(output_dir) && throw(ArgumentError("pipeline.output_dir must be set in config"))
     isempty(output_prefix) && throw(ArgumentError("pipeline.output_prefix must be set in config"))
-    isfile(input_path) || throw(ArgumentError("pipeline input file not found: $input_path"))
+    (isfile(input_path) || isdir(input_path)) || throw(ArgumentError("pipeline input path not found: $input_path"))
 
     cfg.pipeline_subsample_res > 0 || throw(ArgumentError("pipeline.subsample_res must be > 0"))
     cfg.pipeline_xy_resolution > 0 || throw(ArgumentError("pipeline.xy_resolution must be > 0"))
     cfg.pipeline_idw_k >= 1 || throw(ArgumentError("pipeline.idw_k must be >= 1"))
     cfg.pipeline_idw_power > 0 || throw(ArgumentError("pipeline.idw_power must be > 0"))
 
+    output_fmt = lowercase(cfg.pipeline_output_format)
     mkpath(output_dir)
 
-    pc_input = read_las(input_path)
+    # Update expanded paths back into config for preprocess
+    cfg.pipeline_input_path = input_path
+    cfg.pipeline_output_dir = output_dir
 
-    # 1) preprocess
-    preprocess_path = _pipeline_output_path(output_dir, output_prefix, "preprocess")
+    # 1) preprocess (reads input files, preprocesses each, writes individual outputs)
+    preprocess_path = _pipeline_output_path(output_dir, output_prefix, "preprocess"; fmt=output_fmt)
     preprocess_written = false
     pc_preprocess = nothing
     if cfg.pipeline_enable_preprocess
-        pc_preprocess = preprocess(pc_input; cfg=cfg)
-        preprocess_written = _pipeline_write(preprocess_path, pc_preprocess)
+        pc_preprocess = preprocess(; cfg=cfg)
+        preprocess_written = true
     else
         println("[main] preprocess disabled by config")
-        if isfile(preprocess_path)
-            pc_preprocess = _pipeline_load(preprocess_path, "preprocess output")
+        # Try to load from existing preprocess output (single or multi-file)
+        pc_preprocess = _pipeline_load(output_dir, output_prefix, "preprocess", output_fmt)
+        if !isnothing(pc_preprocess)
+            preprocess_written = true
+        else
+            # No preprocess output found — read input files directly without preprocessing
+            pc_preprocess = preprocess(; cfg=cfg)
             preprocess_written = true
         end
     end
@@ -75,8 +140,8 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     # 2) ground segmentation
     ground_points = nothing
     pc_agh = nothing
-    ground_path = _pipeline_output_path(output_dir, output_prefix, "ground")
-    agh_path = _pipeline_output_path(output_dir, output_prefix, "agh")
+    ground_path = _pipeline_output_path(output_dir, output_prefix, "ground"; fmt=output_fmt)
+    agh_path = _pipeline_output_path(output_dir, output_prefix, "agh"; fmt=output_fmt)
     ground_written = false
     agh_written = false
 
@@ -102,8 +167,8 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     end
 
     # 3) tree segmentation
-    tree_path = _pipeline_output_path(output_dir, output_prefix, "tree")
-    tree_skeleton_path = _pipeline_output_path(output_dir, output_prefix, "skeleton")
+    tree_path = _pipeline_output_path(output_dir, output_prefix, "tree"; fmt=output_fmt)
+    tree_skeleton_path = _pipeline_output_path(output_dir, output_prefix, "skeleton"; fmt=output_fmt)
     tree_written = false
     tree_skeleton_written = false
     tree_components = 0
@@ -111,6 +176,11 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     tree_res = nothing
     if cfg.pipeline_enable_tree_segmentation
         tree_input = _pipeline_require(pc_agh, agh_path, "AGH output", "tree segmentation")
+        # Release upstream data to free memory before heavy graph processing
+        pc_preprocess = nothing
+        ground_points = nothing
+        pc_agh = nothing
+        GC.gc()
         tree_res = tree_segmentation(tree_input; cfg=cfg)
         tree_components = tree_res.n_components
         tree_written = _pipeline_write(tree_path, tree_res.pc_output)
@@ -167,7 +237,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
         input_path=input_path,
         output_dir=output_dir,
         output_prefix=output_prefix,
-        n_input=npoints(pc_input),
+        n_preprocess_input=isnothing(pc_preprocess) ? 0 : npoints(pc_preprocess),
         n_preprocess=isnothing(pc_preprocess) ? 0 : npoints(pc_preprocess),
         n_ground=isnothing(ground_points) ? 0 : npoints(ground_points),
         tree_components=tree_components,

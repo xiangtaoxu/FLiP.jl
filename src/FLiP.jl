@@ -40,7 +40,6 @@ using Statistics
 using DelaunayTriangulation
 using Graphs
 using NearestNeighbors
-using PointClouds
 using StaticArrays
 using CoordinateTransformations
 using MultivariateStats
@@ -72,6 +71,8 @@ export bounds, center
 
 # Export I/O functions
 export read_las, read_laz, write_las, write_laz
+export read_e57, write_e57
+export read_pc, write_pc
 
 # Export subsampling functions
 export distance_subsample, distance_subsample_indices
@@ -111,7 +112,7 @@ export create_skeleton_cloud
 export assemble_segments
 
 # Export pipeline functions
-export preprocess
+export preprocess, discover_input_files
 export calculate_aboveground_height
 export qsm
 export generate_report

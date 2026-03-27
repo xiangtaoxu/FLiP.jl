@@ -3,9 +3,12 @@
 # Reload at runtime with: FLiP.load_config!("path/to/this/file")
 
 [pipeline]
-input_path = ""            # Input LAS/LAZ file path
+input_path = ""            # Input file path (single file) or directory (multiple files)
+input_prefix = ""          # Filename prefix filter when input_path is a directory (empty = all files)
+input_format = "las"       # Input file format: "las", "laz", or "e57"
 output_dir = ""            # Output directory path
 output_prefix = "output"   # Prefix for written files
+output_format = "las"      # Output file format: "las" or "e57"
 
 subsample_res = 0.05        # Minimum distance (m) for optional subsampling
 
