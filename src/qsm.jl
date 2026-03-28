@@ -3,9 +3,8 @@ Quantitative Structural Modeling (QSM) for FLiP.jl.
 
 Converts tree-segmented point clouds into geometric measurements (circumference,
 cross-sectional area, volume, surface area) per branch node and per tree.
-Two estimation methods are computed in parallel:
-- Method A (IDW): unroll → IDW gap-fill → integrate
-- Method B (Spline): Taubin circle fit → periodic cubic spline → integrate arc length
+Uses 2D periodic surface smoothing (periodic in phi, non-periodic in z) for
+cross-section estimation.
 """
 
 using LinearAlgebra: Symmetric, eigen, dot, norm, cross, normalize
@@ -40,16 +39,10 @@ mutable struct QSMNode
     direction_x::Float64
     direction_y::Float64
     direction_z::Float64
-    # Method A (IDW)
-    cross_area_idw::Float64
-    circumference_idw::Float64
-    radius_area_idw::Float64
-    radius_circ_idw::Float64
-    # Method B (Spline)
-    cross_area_spl::Float64
-    circumference_spl::Float64
-    radius_area_spl::Float64
-    radius_circ_spl::Float64
+    cross_area::Float64
+    circumference::Float64
+    radius_area::Float64
+    radius_circ::Float64
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -417,114 +410,7 @@ function _unroll_points(coords::AbstractMatrix{<:Real}, indices::Vector{Int},
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 5A: IDW Method
-# ═══════════════════════════════════════════════════════════════════════════════
-
-"""
-    _method_idw_slice(rho_slice, phi_slice, cfg)
-        -> (cross_area, circumference, completeness)
-
-Estimate cross-sectional area and circumference for one slice using the
-IDW grid method.
-"""
-function _method_idw_slice(rho_slice::AbstractVector{Float64},
-                           phi_slice::AbstractVector{Float64},
-                           cfg::FLiPConfig, rho_median::Float64)
-    n = length(rho_slice)
-    if n == 0
-        return (0.0, 0.0, 0.0)
-    end
-
-    surface_res = cfg.qsm_surface_res_scalar * cfg.pipeline_subsample_res
-    phi_bin_num = clamp(ceil(Int, 2π * rho_median / surface_res), cfg.qsm_phi_bin_min, cfg.qsm_phi_bin_max)
-    dtheta = 2π / phi_bin_num
-
-    # Bin points by phi
-    rho_grid = fill(NaN, phi_bin_num)
-    rho_count = zeros(Int, phi_bin_num)
-
-    @inbounds for j in 1:n
-        # Map phi ∈ [-π, π] to bin ∈ [1, phi_bin_num]
-        bin = clamp(floor(Int, (phi_slice[j] + π) / dtheta) + 1, 1, phi_bin_num)
-        if isnan(rho_grid[bin]) || rho_slice[j] < rho_grid[bin]
-            rho_grid[bin] = rho_slice[j]  # min rho per bin
-        end
-        rho_count[bin] += 1
-    end
-
-    # IQR outlier removal
-    valid_rho = filter(isfinite, rho_grid)
-    if length(valid_rho) >= 4
-        q1 = quantile(valid_rho, 0.25)
-        q3 = quantile(valid_rho, 0.75)
-        iqr = q3 - q1
-        threshold = q3 + cfg.qsm_outlier_iqr * iqr
-        @inbounds for b in 1:phi_bin_num
-            if isfinite(rho_grid[b]) && rho_grid[b] > threshold
-                rho_grid[b] = NaN
-            end
-        end
-    end
-
-    # IDW gap-filling with periodic wrapping
-    nan_bins = findall(isnan, rho_grid)
-    valid_bins = findall(isfinite, rho_grid)
-
-    if !isempty(nan_bins) && length(valid_bins) >= cfg.qsm_idw_k
-        # Build 1D KDTree on valid bins (with periodic copies)
-        n_valid = length(valid_bins)
-        # Create periodic copies: original + shifted by ±phi_bin_num
-        kd_coords = Matrix{Float64}(undef, 1, 3 * n_valid)
-        kd_rho = Vector{Float64}(undef, 3 * n_valid)
-        @inbounds for (idx, b) in enumerate(valid_bins)
-            kd_coords[1, idx] = Float64(b)
-            kd_coords[1, n_valid + idx] = Float64(b - phi_bin_num)
-            kd_coords[1, 2 * n_valid + idx] = Float64(b + phi_bin_num)
-            kd_rho[idx] = rho_grid[b]
-            kd_rho[n_valid + idx] = rho_grid[b]
-            kd_rho[2 * n_valid + idx] = rho_grid[b]
-        end
-        kd_tree = KDTree(kd_coords)
-        k_use = min(cfg.qsm_idw_k, 3 * n_valid)
-
-        for b in nan_bins
-            query = reshape([Float64(b)], 1, 1)
-            nbr_idx, nbr_dist = knn(kd_tree, query[:, 1], k_use, true)
-            nbr_dist[1] > cfg.qsm_idw_max_dist && continue
-
-            wsum = 0.0; rwsum = 0.0
-            for k in eachindex(nbr_idx)
-                d = max(nbr_dist[k], 1e-10)
-                w = 1.0 / (d * d)
-                wsum += w
-                rwsum += w * kd_rho[nbr_idx[k]]
-            end
-            if wsum > 0
-                rho_grid[b] = rwsum / wsum
-            end
-        end
-    end
-
-    # Integrate
-    valid_after = findall(isfinite, rho_grid)
-    completeness = length(valid_after) / phi_bin_num
-    completeness > 0 || return (0.0, 0.0, 0.0)
-
-    cross_area = 0.0
-    circumference = 0.0
-    @inbounds for b in valid_after
-        r = rho_grid[b]
-        cross_area += 0.5 * dtheta * r^2
-        circumference += dtheta * r
-    end
-    cross_area /= completeness
-    circumference /= completeness
-
-    return (cross_area, circumference, completeness)
-end
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Step 5B: Periodic Cubic Spline Method
+# Step 5: Periodic Cubic Spline Method
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
@@ -622,6 +508,206 @@ function _fit_periodic_smoothing_spline(phi_data::AbstractVector{Float64},
     return (rho_smooth, drho)
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 5B: 2D Periodic Surface Smoothing (replaces per-slice 1D spline)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
+        -> Matrix{Float64}  # (phi_bin_num, n_slices)
+
+Bin all NBS points into a 2D grid of mean rho values.
+Empty cells are NaN.
+"""
+function _build_rho_surface(rho::Vector{Float64}, phi::Vector{Float64},
+                            pt_slice_ids::Vector{Int}, n_slices::Int,
+                            phi_bin_num::Int)
+    dphi = 2π / phi_bin_num
+    bin_sum = zeros(phi_bin_num, n_slices)
+    bin_count = zeros(Int, phi_bin_num, n_slices)
+
+    @inbounds for j in eachindex(rho)
+        b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
+        s = pt_slice_ids[j]
+        bin_sum[b, s] += rho[j]
+        bin_count[b, s] += 1
+    end
+
+    surface = fill(NaN, phi_bin_num, n_slices)
+    @inbounds for s in 1:n_slices, b in 1:phi_bin_num
+        if bin_count[b, s] > 0
+            surface[b, s] = bin_sum[b, s] / bin_count[b, s]
+        end
+    end
+    return surface
+end
+
+"""
+    _fill_gaps_2d!(surface)
+
+Fill NaN cells in the 2D surface via nearest-neighbor interpolation.
+Phi direction (axis 1) wraps periodically; z direction (axis 2) clamps.
+"""
+function _fill_gaps_2d!(surface::Matrix{Float64})
+    nphi, nz = size(surface)
+    max_search = max(nphi ÷ 2, nz)
+
+    @inbounds for s in 1:nz, b in 1:nphi
+        isnan(surface[b, s]) || continue
+
+        # Search 4 cardinal directions for nearest non-NaN neighbor
+        wsum = 0.0
+        rsum = 0.0
+
+        # phi+ direction (periodic)
+        for offset in 1:max_search
+            bp = mod1(b + offset, nphi)
+            if isfinite(surface[bp, s])
+                w = 1.0 / offset
+                wsum += w
+                rsum += w * surface[bp, s]
+                break
+            end
+        end
+        # phi- direction (periodic)
+        for offset in 1:max_search
+            bm = mod1(b - offset, nphi)
+            if isfinite(surface[bm, s])
+                w = 1.0 / offset
+                wsum += w
+                rsum += w * surface[bm, s]
+                break
+            end
+        end
+        # z+ direction (clamped)
+        for offset in 1:(nz - s)
+            if isfinite(surface[b, s + offset])
+                w = 1.0 / offset
+                wsum += w
+                rsum += w * surface[b, s + offset]
+                break
+            end
+        end
+        # z- direction (clamped)
+        for offset in 1:(s - 1)
+            if isfinite(surface[b, s - offset])
+                w = 1.0 / offset
+                wsum += w
+                rsum += w * surface[b, s - offset]
+                break
+            end
+        end
+
+        if wsum > 0
+            surface[b, s] = rsum / wsum
+        end
+    end
+end
+
+"""
+    _smooth_surface_2d!(surface, s_phi, s_z, n_passes=1)
+
+Separable 3-point stencil smoothing of the rho surface.
+Periodic in phi (axis 1), Neumann boundary in z (axis 2).
+"""
+function _smooth_surface_2d!(surface::Matrix{Float64},
+                              s_phi::Float64, s_z::Float64,
+                              n_passes::Int=1)
+    nphi, nz = size(surface)
+    buf = similar(surface)
+
+    for _ in 1:n_passes
+        # Phi pass (periodic)
+        w_center_phi = 1.0 - s_phi
+        w_side_phi = s_phi / 2.0
+        @inbounds for s in 1:nz, b in 1:nphi
+            bm = mod1(b - 1, nphi)
+            bp = mod1(b + 1, nphi)
+            buf[b, s] = w_center_phi * surface[b, s] +
+                         w_side_phi * (surface[bm, s] + surface[bp, s])
+        end
+
+        # Z pass (Neumann boundary)
+        if nz == 1
+            copyto!(surface, buf)
+        else
+            w_center_z = 1.0 - s_z
+            w_side_z = s_z / 2.0
+            @inbounds for s in 1:nz, b in 1:nphi
+                if s == 1
+                    surface[b, s] = (1.0 - s_z) * buf[b, s] + s_z * buf[b, 2]
+                elseif s == nz
+                    surface[b, s] = (1.0 - s_z) * buf[b, s] + s_z * buf[b, nz - 1]
+                else
+                    surface[b, s] = w_center_z * buf[b, s] +
+                                     w_side_z * (buf[b, s - 1] + buf[b, s + 1])
+                end
+            end
+        end
+    end
+end
+
+"""
+    _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
+        -> Vector{NamedTuple{(:cross_area, :circumference, :completeness)}}
+
+Compute cross-sectional area and circumference for all slices of an NBS
+using 2D surface smoothing (periodic in phi, non-periodic in z).
+Returns a vector indexed by slice (1:n_slices); slices with no data
+have zeros.
+"""
+function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
+                           pt_slice_ids::Vector{Int}, n_slices::Int,
+                           cfg::FLiPConfig, rho_median_global::Float64)
+    T = NamedTuple{(:cross_area, :circumference, :completeness), Tuple{Float64, Float64, Float64}}
+    results = Vector{T}(undef, n_slices)
+    fill!(results, (cross_area=0.0, circumference=0.0, completeness=0.0))
+
+    surface_res = cfg.qsm_surface_res_scalar * cfg.pipeline_subsample_res
+    phi_bin_num = clamp(ceil(Int, 2π * rho_median_global / surface_res),
+                        cfg.qsm_phi_bin_min, cfg.qsm_phi_bin_max)
+    dphi = 2π / phi_bin_num
+
+    # Build 2D surface
+    surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
+
+    # Compute completeness per slice before gap-filling
+    completeness = Vector{Float64}(undef, n_slices)
+    @inbounds for s in 1:n_slices
+        n_filled = count(b -> isfinite(surface[b, s]), 1:phi_bin_num)
+        completeness[s] = n_filled / phi_bin_num
+    end
+
+    # Fill gaps and smooth
+    _fill_gaps_2d!(surface)
+    _smooth_surface_2d!(surface, 0.5, cfg.qsm_spl_z_smoothing)
+
+    # Extract per-slice metrics
+    @inbounds for s in 1:n_slices
+        completeness[s] <= 0 && continue
+
+        # Central differences for derivative (periodic)
+        circ = 0.0
+        area = 0.0
+        for b in 1:phi_bin_num
+            r = surface[b, s]
+            isfinite(r) || continue
+            bm = mod1(b - 1, phi_bin_num)
+            bp = mod1(b + 1, phi_bin_num)
+            dr = (surface[bp, s] - surface[bm, s]) / (2.0 * dphi)
+            circ += sqrt(r^2 + dr^2) * dphi
+            area += 0.5 * r^2 * dphi
+        end
+        results[s] = (cross_area=area, circumference=circ, completeness=completeness[s])
+    end
+
+    return results
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Legacy 1D spline method (kept for reference / single-slice fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 """
     _method_spline_slice(rho_slice, phi_slice, cfg)
         -> (cross_area, circumference, completeness)
@@ -716,15 +802,15 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     n_slices = size(centers, 1)
     rho_median_global = length(rho) > 0 ? median(rho) : 0.01
 
+    # Method B: 2D spline surface for all slices at once
+    spl_results = _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
+
     # Process each slice
     slice_nodes = QSMNode[]
     for s in 1:n_slices
         local_js = findall(==(s), pt_slice_ids)
         n_pts = length(local_js)
         n_pts < cfg.qsm_min_node_size && continue
-
-        rho_s = rho[local_js]
-        phi_s = phi[local_js]
 
         # Mean AGH for this slice
         mean_agh = 0.0
@@ -733,16 +819,10 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         end
         mean_agh /= n_pts
 
-        rho_med = length(rho_s) > 0 ? median(rho_s) : rho_median_global
-
-        # Method A: IDW
-        ca_idw, circ_idw, comp_idw = _method_idw_slice(rho_s, phi_s, cfg, rho_med)
-
-        # Method B: Spline
-        ca_spl, circ_spl, comp_spl = _method_spline_slice(rho_s, phi_s, cfg)
-
-        # Use maximum completeness from either method
-        completeness = max(comp_idw, comp_spl)
+        # 2D spline (pre-computed)
+        ca = spl_results[s].cross_area
+        circ = spl_results[s].circumference
+        completeness = spl_results[s].completeness
         completeness < cfg.qsm_completeness_threshold && continue
 
         node = QSMNode(
@@ -750,10 +830,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
             mean_agh, slice_res, completeness, n_pts,
             centers[s, 1], centers[s, 2], centers[s, 3],
             info.direction[1], info.direction[2], info.direction[3],
-            ca_idw, circ_idw,
-            sqrt(max(0.0, ca_idw / π)), circ_idw / (2π),
-            ca_spl, circ_spl,
-            sqrt(max(0.0, ca_spl / π)), circ_spl / (2π),
+            ca, circ,
+            sqrt(max(0.0, ca / π)), circ / (2π),
         )
         push!(slice_nodes, node)
         next_node_id += 1
@@ -815,10 +893,8 @@ function _build_node_table(nodes::Vector{QSMNode})
     end
 
     n = length(nodes)
-    vol_idw = zeros(n)
-    sa_idw = zeros(n)
-    vol_spl = zeros(n)
-    sa_spl = zeros(n)
+    vol = zeros(n)
+    sa = zeros(n)
 
     for (_, idxs) in nbs_groups
         sort!(idxs; by=i -> nodes[i].agh)
@@ -827,51 +903,32 @@ function _build_node_table(nodes::Vector{QSMNode})
             nd = nodes[idxs[k]]
             h = nd.height
             if nn == 1 || k == 1 || k == nn
-                # Endpoints: use cylinder
-                r_idw = nd.radius_area_idw
-                r_spl = nd.radius_area_spl
+                r1 = nd.radius_area
                 if k == 1 && nn > 1
-                    r2_idw = nodes[idxs[k+1]].radius_area_idw
-                    r2_spl = nodes[idxs[k+1]].radius_area_spl
-                    vol_idw[idxs[k]], sa_idw[idxs[k]] = _frustum_metrics(r_idw, r2_idw, h)
-                    vol_spl[idxs[k]], sa_spl[idxs[k]] = _frustum_metrics(r_spl, r2_spl, h)
+                    r2 = nodes[idxs[k+1]].radius_area
+                    vol[idxs[k]], sa[idxs[k]] = _frustum_metrics(r1, r2, h)
                 elseif k == nn && nn > 1
-                    r0_idw = nodes[idxs[k-1]].radius_area_idw
-                    r0_spl = nodes[idxs[k-1]].radius_area_spl
-                    vol_idw[idxs[k]], sa_idw[idxs[k]] = _frustum_metrics(r0_idw, r_idw, h)
-                    vol_spl[idxs[k]], sa_spl[idxs[k]] = _frustum_metrics(r0_spl, r_spl, h)
+                    r0 = nodes[idxs[k-1]].radius_area
+                    vol[idxs[k]], sa[idxs[k]] = _frustum_metrics(r0, r1, h)
                 else
-                    vol_idw[idxs[k]], sa_idw[idxs[k]] = _frustum_metrics(r_idw, r_idw, h)
-                    vol_spl[idxs[k]], sa_spl[idxs[k]] = _frustum_metrics(r_spl, r_spl, h)
+                    vol[idxs[k]], sa[idxs[k]] = _frustum_metrics(r1, r1, h)
                 end
             else
-                # Interior: average with neighbors
-                r0_idw = nodes[idxs[k-1]].radius_area_idw
-                r1_idw = nd.radius_area_idw
-                r2_idw = nodes[idxs[k+1]].radius_area_idw
-                ra_idw = (r0_idw + r1_idw) / 2
-                rb_idw = (r1_idw + r2_idw) / 2
-                vol_idw[idxs[k]], sa_idw[idxs[k]] = _frustum_metrics(ra_idw, rb_idw, h)
-
-                r0_spl = nodes[idxs[k-1]].radius_area_spl
-                r1_spl = nd.radius_area_spl
-                r2_spl = nodes[idxs[k+1]].radius_area_spl
-                ra_spl = (r0_spl + r1_spl) / 2
-                rb_spl = (r1_spl + r2_spl) / 2
-                vol_spl[idxs[k]], sa_spl[idxs[k]] = _frustum_metrics(ra_spl, rb_spl, h)
+                r0 = nodes[idxs[k-1]].radius_area
+                r1 = nd.radius_area
+                r2 = nodes[idxs[k+1]].radius_area
+                ra = (r0 + r1) / 2
+                rb = (r1 + r2) / 2
+                vol[idxs[k]], sa[idxs[k]] = _frustum_metrics(ra, rb, h)
             end
         end
     end
 
     headers = [
         "qsm_node_id", "nbs_id", "tree_id", "agh",
-        "cross_area_idw", "cross_area_spl",
-        "circumference_idw", "circumference_spl",
-        "radius_area_idw", "radius_area_spl",
-        "radius_circ_idw", "radius_circ_spl",
-        "height",
-        "volume_idw", "volume_spl",
-        "surface_area_idw", "surface_area_spl",
+        "cross_area", "circumference",
+        "radius_area", "radius_circ",
+        "height", "volume", "surface_area",
         "completeness", "n_points",
         "center_x", "center_y", "center_z",
         "direction_x", "direction_y", "direction_z",
@@ -882,13 +939,9 @@ function _build_node_table(nodes::Vector{QSMNode})
         nd = nodes[i]
         table[i, :] = Any[
             nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.agh,
-            nd.cross_area_idw, nd.cross_area_spl,
-            nd.circumference_idw, nd.circumference_spl,
-            nd.radius_area_idw, nd.radius_area_spl,
-            nd.radius_circ_idw, nd.radius_circ_spl,
-            nd.height,
-            vol_idw[i], vol_spl[i],
-            sa_idw[i], sa_spl[i],
+            nd.cross_area, nd.circumference,
+            nd.radius_area, nd.radius_circ,
+            nd.height, vol[i], sa[i],
             nd.completeness, nd.n_points,
             nd.center_x, nd.center_y, nd.center_z,
             nd.direction_x, nd.direction_y, nd.direction_z,
@@ -908,10 +961,8 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
     isempty(nodes) && return (Matrix{Any}(undef, 0, 0), String[])
 
     # Column indices
-    col_vol_idw = findfirst(==("volume_idw"), headers)
-    col_vol_spl = findfirst(==("volume_spl"), headers)
-    col_sa_idw = findfirst(==("surface_area_idw"), headers)
-    col_sa_spl = findfirst(==("surface_area_spl"), headers)
+    col_vol = findfirst(==("volume"), headers)
+    col_sa = findfirst(==("surface_area"), headers)
 
     # Group by tree_id
     tree_groups = Dict{Int32, Vector{Int}}()
@@ -927,11 +978,8 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
 
     tree_headers = [
         "tree_id",
-        "volume_idw", "volume_spl",
-        "surface_area_idw", "surface_area_spl",
-        "height",
-        "dbh_area_idw", "dbh_area_spl",
-        "dbh_circ_idw", "dbh_circ_spl",
+        "volume", "surface_area", "height",
+        "dbh_area", "dbh_circ",
         "n_points", "n_nodes",
         "x", "y",
     ]
@@ -941,11 +989,8 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
     for (ti, tid) in enumerate(tree_ids)
         idxs = tree_groups[tid]
 
-        # Sums
-        total_vol_idw = sum(i -> Float64(node_table[i, col_vol_idw]), idxs)
-        total_vol_spl = sum(i -> Float64(node_table[i, col_vol_spl]), idxs)
-        total_sa_idw = sum(i -> Float64(node_table[i, col_sa_idw]), idxs)
-        total_sa_spl = sum(i -> Float64(node_table[i, col_sa_spl]), idxs)
+        total_vol = sum(i -> Float64(node_table[i, col_vol]), idxs)
+        total_sa = sum(i -> Float64(node_table[i, col_sa]), idxs)
         total_pts = sum(i -> nodes[i].n_points, idxs)
         max_agh = maximum(i -> nodes[i].agh, idxs)
 
@@ -959,22 +1004,17 @@ function _build_tree_table(nodes::Vector{QSMNode}, node_table::Matrix{Any},
                 best_bh_idx = i
             end
         end
-        dbh_a_idw = 2.0 * nodes[best_bh_idx].radius_area_idw
-        dbh_a_spl = 2.0 * nodes[best_bh_idx].radius_area_spl
-        dbh_c_idw = 2.0 * nodes[best_bh_idx].radius_circ_idw
-        dbh_c_spl = 2.0 * nodes[best_bh_idx].radius_circ_spl
+        dbh_a = 2.0 * nodes[best_bh_idx].radius_area
+        dbh_c = 2.0 * nodes[best_bh_idx].radius_circ
 
-        # Location at breast height
         loc_x = nodes[best_bh_idx].center_x
         loc_y = nodes[best_bh_idx].center_y
 
         tree_table[ti, :] = Any[
             tid,
-            total_vol_idw, total_vol_spl,
-            total_sa_idw, total_sa_spl,
+            total_vol, total_sa,
             max_agh,
-            dbh_a_idw, dbh_a_spl,
-            dbh_c_idw, dbh_c_spl,
+            dbh_a, dbh_c,
             total_pts, length(idxs),
             loc_x, loc_y,
         ]

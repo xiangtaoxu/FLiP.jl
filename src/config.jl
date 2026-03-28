@@ -58,11 +58,10 @@ mutable struct FLiPConfig
     qsm_phi_bin_min::Int
     qsm_phi_bin_max::Int
     qsm_surface_res_scalar::Float64
-    qsm_idw_k::Int
-    qsm_idw_max_dist::Int
     qsm_outlier_iqr::Float64
     qsm_completeness_threshold::Float64
     qsm_breast_height::Float64
+    qsm_spl_z_smoothing::Float64
 
     # coordinate precision
     coordinate_precision::DataType
@@ -131,11 +130,10 @@ function FLiPConfig(d::Dict)
         Int(get(qm, "phi_bin_min", 36)),
         Int(get(qm, "phi_bin_max", 360)),
         Float64(get(qm, "surface_res_scalar", 0.5)),
-        Int(get(qm, "idw_k", 3)),
-        Int(get(qm, "idw_max_dist", 2)),
         Float64(get(qm, "outlier_iqr", 1.5)),
         Float64(get(qm, "completeness_threshold", 0.25)),
         Float64(get(qm, "breast_height", 1.3)),
+        Float64(get(qm, "spl_z_smoothing", 0.3)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

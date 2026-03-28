@@ -1,5 +1,6 @@
 
 [pip.deps]
-pye57 = ""
 laspy = ""
 lazrs = ""
+pye57 = ""
+[deps]

@@ -57,11 +57,10 @@ min_node_size = 5               # Minimum points per slice to keep
 phi_bin_min = 36                # Minimum angular bins for rho-phi grid
 phi_bin_max = 360               # Maximum angular bins for rho-phi grid
 surface_res_scalar = 0.5        # Multiplier on subsample_res for surface resolution
-idw_k = 3                       # k-neighbors for IDW gap filling
-idw_max_dist = 2                # Max bin-distance for IDW extrapolation
 outlier_iqr = 1.5               # IQR multiplier for rho outlier removal
 completeness_threshold = 0.25   # Minimum fraction of phi-bins filled to accept node
 breast_height = 1.3             # Reference height (m) for DBH calculation
+spl_z_smoothing = 0.3           # Cross-slice smoothing weight for spline method (0=disabled, 1=max)
 
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation

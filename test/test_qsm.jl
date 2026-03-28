@@ -108,11 +108,10 @@
             lines = readlines(result.node_csv_path)
             @test length(lines) > 1  # header + at least one data row
             headers = split(lines[1], ",")
-            r_area_idw_col = findfirst(==("radius_area_idw"), headers)
-            r_area_spl_col = findfirst(==("radius_area_spl"), headers)
-            if !isnothing(r_area_idw_col) && length(lines) > 1
+            r_area_col = findfirst(==("radius_area"), headers)
+            if !isnothing(r_area_col) && length(lines) > 1
                 vals = split(lines[2], ",")
-                r_est = parse(Float64, vals[r_area_idw_col])
+                r_est = parse(Float64, vals[r_area_col])
                 # Radius should be within 30% of true value
                 @test abs(r_est - r_true) / r_true < 0.3
             end
@@ -137,20 +136,6 @@
         nbs_ids_sphere = ones(Int32, n)
         result_sphere = FLiP._filter_linear_nbs(coords_sphere, nbs_ids_sphere, cfg)
         @test !haskey(result_sphere, Int32(1))
-    end
-
-    @testset "IDW slice method" begin
-        # Full circle: rho should integrate to ~2πr and πr²
-        n = 200
-        r = 0.15
-        phi = range(-π, π; length=n+1)[1:n]
-        rho = fill(r, n) .+ 0.001 .* randn(n)
-
-        cfg = FLiP._CFG
-        ca, circ, comp = FLiP._method_idw_slice(collect(rho), collect(phi), cfg, r)
-        @test comp > 0.8
-        @test abs(circ - 2π * r) / (2π * r) < 0.15
-        @test abs(ca - π * r^2) / (π * r^2) < 0.15
     end
 
     @testset "Spline slice method" begin
@@ -183,6 +168,80 @@
         result = FLiP.qsm(tree_result=nothing, output_dir=mktempdir(), output_prefix="empty")
         @test result.status == :no_data
         @test result.n_nodes == 0
+    end
+
+    @testset "2D surface smoothing — uniform surface unchanged" begin
+        nphi, nz = 36, 5
+        surface = fill(0.1, nphi, nz)
+        surface_copy = copy(surface)
+        FLiP._smooth_surface_2d!(surface_copy, 0.5, 0.3, 3)
+        @test all(abs.(surface_copy .- surface) .< 1e-12)
+    end
+
+    @testset "2D surface smoothing — z-gradient reduced but preserved" begin
+        nphi, nz = 36, 10
+        # Step function: slices 1–5 at r=0.1, slices 6–10 at r=0.2
+        surface = fill(0.1, nphi, nz)
+        surface[:, 6:10] .= 0.2
+
+        FLiP._smooth_surface_2d!(surface, 0.5, 0.3, 1)
+
+        # Interior of each plateau should remain close to original
+        @test all(abs.(surface[:, 1] .- 0.1) .< 1e-10)    # boundary slice, no z-neighbor below
+        @test all(abs.(surface[:, 10] .- 0.2) .< 1e-10)   # boundary slice, no z-neighbor above
+        # Near the step (slices 5 and 6) values should have moved toward each other
+        @test all(surface[:, 5] .> 0.1)
+        @test all(surface[:, 6] .< 0.2)
+    end
+
+    @testset "2D gap fill — partial coverage filled from neighbors" begin
+        nphi, nz = 36, 3
+        surface = fill(0.15, nphi, nz)
+        # Create a 90° gap (9 bins) in the middle slice only
+        gap_bins = 1:9
+        surface[gap_bins, 2] .= NaN
+
+        FLiP._fill_gaps_2d!(surface)
+
+        # All NaN cells should now be filled
+        @test all(isfinite.(surface))
+        # Filled values should be close to 0.15 (neighbors are all 0.15)
+        @test all(abs.(surface[gap_bins, 2] .- 0.15) .< 1e-10)
+    end
+
+    @testset "2D build_rho_surface — basic binning" begin
+        # 4 points, 2 slices, 4 phi bins
+        rho = [0.1, 0.2, 0.15, 0.25]
+        phi = [-π + 0.1, -π + 0.1, π - 0.1, π - 0.1]  # bins 1 and 4
+        pt_slice_ids = [1, 1, 2, 2]
+        surface = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 2, 4)
+        @test size(surface) == (4, 2)
+        # First two points go to bin 1, slice 1 → mean = 0.15
+        @test surface[1, 1] ≈ 0.15
+        # Cells with no points should be NaN
+        @test isnan(surface[2, 1])
+    end
+
+    @testset "2D spline method — full cylinder" begin
+        # Generate a full cylinder: 3 slices, r=0.15
+        r = 0.15
+        n_per_slice = 200
+        n_slices = 3
+        n = n_per_slice * n_slices
+
+        rho = fill(r, n) .+ 0.001 .* randn(n)
+        phi = repeat(range(-π, π; length=n_per_slice + 1)[1:n_per_slice], n_slices)
+        pt_slice_ids = vcat([fill(s, n_per_slice) for s in 1:n_slices]...)
+
+        cfg = FLiP._CFG
+        results = FLiP._method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, r)
+
+        @test length(results) == n_slices
+        for s in 1:n_slices
+            @test results[s].completeness > 0.8
+            @test abs(results[s].circumference - 2π * r) / (2π * r) < 0.15
+            @test abs(results[s].cross_area - π * r^2) / (π * r^2) < 0.15
+        end
     end
 
 end
