@@ -51,6 +51,19 @@ mutable struct FLiPConfig
     tree_assembly_merge_threshold::Float64
     tree_assembly_occlusion_tolerance::Float64
 
+    # qsm
+    qsm_nbs_linearity_threshold::Float64
+    qsm_slice_height_scalar::Float64
+    qsm_min_node_size::Int
+    qsm_phi_bin_min::Int
+    qsm_phi_bin_max::Int
+    qsm_surface_res_scalar::Float64
+    qsm_idw_k::Int
+    qsm_idw_max_dist::Int
+    qsm_outlier_iqr::Float64
+    qsm_completeness_threshold::Float64
+    qsm_breast_height::Float64
+
     # coordinate precision
     coordinate_precision::DataType
 
@@ -82,6 +95,7 @@ function FLiPConfig(d::Dict)
     sg = get(d, "segment_ground",                   Dict{String,Any}())
     pp = get(d, "preprocess",                       Dict{String,Any}())
     ts = get(d, "tree_segmentation",                Dict{String,Any}())
+    qm = get(d, "qsm",                             Dict{String,Any}())
     pl = get(d, "pipeline",                         Dict{String,Any}())
 
     FLiPConfig(
@@ -110,6 +124,18 @@ function FLiPConfig(d::Dict)
         Float64(get(ts, "linearity_angle_deg", 80.0)),
         Float64(get(ts, "assembly_merge_threshold", 0.5)),
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
+
+        Float64(get(qm, "nbs_linearity_threshold", 0.5)),
+        Float64(get(qm, "slice_height_scalar", 3.0)),
+        Int(get(qm, "min_node_size", 5)),
+        Int(get(qm, "phi_bin_min", 36)),
+        Int(get(qm, "phi_bin_max", 360)),
+        Float64(get(qm, "surface_res_scalar", 0.5)),
+        Int(get(qm, "idw_k", 3)),
+        Int(get(qm, "idw_max_dist", 2)),
+        Float64(get(qm, "outlier_iqr", 1.5)),
+        Float64(get(qm, "completeness_threshold", 0.25)),
+        Float64(get(qm, "breast_height", 1.3)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

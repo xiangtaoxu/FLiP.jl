@@ -50,6 +50,19 @@ linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion 
 assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
 assembly_occlusion_tolerance = 0.1  # Max distance (m) to search for nearby assigned points when rescuing orphan NBS
 
+[qsm]
+nbs_linearity_threshold = 0.5   # Minimum linearity (λ₃-λ₂)/λ₃ for an NBS to be processed by QSM
+slice_height_scalar = 3.0       # Multiplier on subsample_res for z-slice height
+min_node_size = 5               # Minimum points per slice to keep
+phi_bin_min = 36                # Minimum angular bins for rho-phi grid
+phi_bin_max = 360               # Maximum angular bins for rho-phi grid
+surface_res_scalar = 0.5        # Multiplier on subsample_res for surface resolution
+idw_k = 3                       # k-neighbors for IDW gap filling
+idw_max_dist = 2                # Max bin-distance for IDW extrapolation
+outlier_iqr = 1.5               # IQR multiplier for rho outlier removal
+completeness_threshold = 0.25   # Minimum fraction of phi-bins filled to accept node
+breast_height = 1.3             # Reference height (m) for DBH calculation
+
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation
 n_sigma     = 1.0     # Outlier threshold: mean + n_sigma * std

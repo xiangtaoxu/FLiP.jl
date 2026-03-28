@@ -25,4 +25,5 @@ end
     include("test_main.jl")
     include("test_transformations.jl")
     include("test_e57.jl")
+    include("test_qsm.jl")
 end
