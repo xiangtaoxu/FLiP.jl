@@ -115,6 +115,17 @@
                 # Radius should be within 30% of true value
                 @test abs(r_est - r_true) / r_true < 0.3
             end
+
+            # Check new quality metric columns exist
+            @test "rho_mean" in headers
+            @test "rho_std" in headers
+            @test "rho_cv" in headers
+            # For a clean cylinder, CV should be low
+            rho_cv_col = findfirst(==("rho_cv"), headers)
+            if !isnothing(rho_cv_col) && length(lines) > 1
+                cv_val = parse(Float64, split(lines[2], ",")[rho_cv_col])
+                @test cv_val < 0.15
+            end
         end
     end
 
@@ -234,13 +245,61 @@
         pt_slice_ids = vcat([fill(s, n_per_slice) for s in 1:n_slices]...)
 
         cfg = FLiP._CFG
-        results = FLiP._method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, r)
+        results, surface_grid, phi_bins = FLiP._method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, r)
 
         @test length(results) == n_slices
         for s in 1:n_slices
             @test results[s].completeness > 0.8
             @test abs(results[s].circumference - 2π * r) / (2π * r) < 0.15
             @test abs(results[s].cross_area - π * r^2) / (π * r^2) < 0.15
+        end
+    end
+
+    @testset "Rho quality metrics — shell has low CV" begin
+        using Statistics: mean, std
+        # Shell: all points near r=0.15 → CV should be very low
+        r = 0.15
+        n_pts = 200
+        rho_shell = fill(r, n_pts) .+ 0.001 .* randn(n_pts)
+        cv_shell = std(rho_shell) / mean(rho_shell)
+        @test cv_shell < 0.1
+
+        # Filled disc: uniform from 0 to r → CV should be high
+        rho_disc = r .* rand(n_pts)
+        cv_disc = std(rho_disc) / mean(rho_disc)
+        @test cv_disc > 0.3
+    end
+
+    @testset "Rho percentile filter — shrinks toward inner surface" begin
+        using Statistics: mean
+        # Mix of shell points (r=0.15) and outer noise/leaf returns (r=0.20..0.40)
+        n_shell = 100; n_noise = 100
+        rho = vcat(fill(0.15, n_shell) .+ 0.002 .* randn(n_shell),
+                   0.20 .+ 0.20 .* rand(n_noise))
+        phi = collect(range(-π, π; length=n_shell + n_noise + 1)[1:n_shell + n_noise])
+        pt_slice_ids = ones(Int, n_shell + n_noise)
+
+        surface_full = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 36, 1.0)
+        surface_75   = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 36, 0.75)
+
+        # Percentile-filtered surface should have smaller mean rho (closer to inner shell)
+        mean_full = mean(filter(isfinite, surface_full))
+        mean_75   = mean(filter(isfinite, surface_75))
+        @test mean_75 < mean_full
+    end
+
+    @testset "build_rho_surface percentile=1.0 matches default" begin
+        rho = [0.1, 0.2, 0.15, 0.25]
+        phi = [-π + 0.1, -π + 0.1, π - 0.1, π - 0.1]
+        pt_slice_ids = [1, 1, 1, 1]
+        s1 = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 4)
+        s2 = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 4, 1.0)
+        for i in eachindex(s1)
+            if isnan(s1[i])
+                @test isnan(s2[i])
+            else
+                @test s1[i] ≈ s2[i]
+            end
         end
     end
 

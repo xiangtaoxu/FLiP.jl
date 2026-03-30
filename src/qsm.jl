@@ -29,6 +29,7 @@ mutable struct QSMNode
     qsm_node_id::Int
     nbs_id::Int32
     tree_id::Int32
+    tree_nbs_id::Int32
     agh::Float64
     height::Float64
     completeness::Float64
@@ -43,6 +44,9 @@ mutable struct QSMNode
     circumference::Float64
     radius_area::Float64
     radius_circ::Float64
+    rho_mean::Float64
+    rho_std::Float64
+    rho_cv::Float64
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -513,33 +517,73 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
+    _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num; rho_percentile=1.0)
         -> Matrix{Float64}  # (phi_bin_num, n_slices)
 
-Bin all NBS points into a 2D grid of mean rho values.
-Empty cells are NaN.
+Bin all NBS points into a 2D grid of rho values. Empty cells are NaN.
+
+When `rho_percentile >= 1.0` (default), each cell is the arithmetic mean of all
+rho values. When `< 1.0`, the top `(1 - rho_percentile)` fraction of rho
+values per cell is discarded before averaging, shrinking the fit toward the
+inner surface (removing noise and leaf returns at large radii).
 """
 function _build_rho_surface(rho::Vector{Float64}, phi::Vector{Float64},
                             pt_slice_ids::Vector{Int}, n_slices::Int,
-                            phi_bin_num::Int)
+                            phi_bin_num::Int,
+                            rho_percentile::Float64=1.0)
     dphi = 2π / phi_bin_num
-    bin_sum = zeros(phi_bin_num, n_slices)
-    bin_count = zeros(Int, phi_bin_num, n_slices)
 
-    @inbounds for j in eachindex(rho)
-        b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
-        s = pt_slice_ids[j]
-        bin_sum[b, s] += rho[j]
-        bin_count[b, s] += 1
-    end
+    if rho_percentile >= 1.0
+        # Fast path: single-pass mean (original behavior)
+        bin_sum = zeros(phi_bin_num, n_slices)
+        bin_count = zeros(Int, phi_bin_num, n_slices)
 
-    surface = fill(NaN, phi_bin_num, n_slices)
-    @inbounds for s in 1:n_slices, b in 1:phi_bin_num
-        if bin_count[b, s] > 0
-            surface[b, s] = bin_sum[b, s] / bin_count[b, s]
+        @inbounds for j in eachindex(rho)
+            b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
+            s = pt_slice_ids[j]
+            bin_sum[b, s] += rho[j]
+            bin_count[b, s] += 1
         end
+
+        surface = fill(NaN, phi_bin_num, n_slices)
+        @inbounds for s in 1:n_slices, b in 1:phi_bin_num
+            if bin_count[b, s] > 0
+                surface[b, s] = bin_sum[b, s] / bin_count[b, s]
+            end
+        end
+        return surface
+    else
+        # Percentile path: collect per-cell rho, discard top fraction, average remainder
+        # Outer points (large rho) are more likely noise/leaf returns, so we keep
+        # the inner rho_percentile fraction and discard the rest.
+        cell_rhos = Dict{Int, Vector{Float64}}()
+        @inbounds for j in eachindex(rho)
+            b = clamp(floor(Int, (phi[j] + π) / dphi) + 1, 1, phi_bin_num)
+            s = pt_slice_ids[j]
+            key = (s - 1) * phi_bin_num + b
+            v = get!(cell_rhos, key) do; Float64[] end
+            push!(v, rho[j])
+        end
+
+        surface = fill(NaN, phi_bin_num, n_slices)
+        for (key, rhos) in cell_rhos
+            b = mod1(key, phi_bin_num)
+            s = (key - 1) ÷ phi_bin_num + 1
+            if length(rhos) == 1
+                surface[b, s] = rhos[1]
+            else
+                thresh = quantile(rhos, rho_percentile)
+                s_sum = 0.0; s_count = 0
+                for r in rhos
+                    if r <= thresh
+                        s_sum += r; s_count += 1
+                    end
+                end
+                surface[b, s] = s_count > 0 ? s_sum / s_count : mean(rhos)
+            end
+        end
+        return surface
     end
-    return surface
 end
 
 """
@@ -669,7 +713,8 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
     dphi = 2π / phi_bin_num
 
     # Build 2D surface
-    surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
+    surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num,
+                                cfg.qsm_rho_percentile)
 
     # Compute completeness per slice before gap-filling
     completeness = Vector{Float64}(undef, n_slices)
@@ -701,7 +746,86 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
         results[s] = (cross_area=area, circumference=circ, completeness=completeness[s])
     end
 
-    return results
+    return (results, surface, phi_bin_num)
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 5C: Generate 3D surface point cloud from smoothed 2D rho surface
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+    _generate_surface_points(surface, centers, e1, e2, slice_res, gen_res, slice_rho_cv)
+        -> (Matrix{Float64}, Vector{Float64})  # (M×3 coords, M rho_cv values)
+
+Convert a smoothed 2D rho surface (phi × z-slice) to 3D xyz points.
+Linearly interpolates between z-slices to achieve approximately `gen_res`
+axial spacing. Returns coordinates and per-point `rho_cv` (interpolated
+between slices for inter-slice points).
+"""
+function _generate_surface_points(surface::Matrix{Float64},
+                                   centers::Matrix{Float64},
+                                   e1::NTuple{3,Float64},
+                                   e2::NTuple{3,Float64},
+                                   slice_res::Float64,
+                                   gen_res::Float64,
+                                   slice_rho_cv::Vector{Float64})
+    nphi, nslices = size(surface)
+    dphi = 2π / nphi
+    n_zsub = max(1, ceil(Int, slice_res / gen_res))
+
+    # Upper bound for pre-allocation
+    n_est = nphi * (nslices + max(0, nslices - 1) * (n_zsub - 1))
+    pts = Matrix{Float64}(undef, n_est, 3)
+    cv_vals = Vector{Float64}(undef, n_est)
+    idx = 0
+
+    @inbounds for s in 1:nslices
+        cv_s = slice_rho_cv[s]
+        # Points at slice center
+        for b in 1:nphi
+            rho = surface[b, s]
+            (isfinite(rho) && rho > 0) || continue
+            phi_val = -π + (b - 0.5) * dphi
+            u = rho * cos(phi_val)
+            v = rho * sin(phi_val)
+            idx += 1
+            pts[idx, 1] = centers[s, 1] + u * e1[1] + v * e2[1]
+            pts[idx, 2] = centers[s, 2] + u * e1[2] + v * e2[2]
+            pts[idx, 3] = centers[s, 3] + u * e1[3] + v * e2[3]
+            cv_vals[idx] = cv_s
+        end
+
+        # Interpolated points between slice s and s+1
+        if s < nslices && n_zsub > 1
+            for k in 1:(n_zsub - 1)
+                frac = k / n_zsub
+                icx = centers[s, 1] + frac * (centers[s+1, 1] - centers[s, 1])
+                icy = centers[s, 2] + frac * (centers[s+1, 2] - centers[s, 2])
+                icz = centers[s, 3] + frac * (centers[s+1, 3] - centers[s, 3])
+                cv_interp = cv_s + frac * (slice_rho_cv[s+1] - cv_s)
+                for b in 1:nphi
+                    rho1 = surface[b, s]
+                    rho2 = surface[b, s+1]
+                    (isfinite(rho1) && isfinite(rho2) && rho1 > 0 && rho2 > 0) || continue
+                    rho = rho1 + frac * (rho2 - rho1)
+                    phi_val = -π + (b - 0.5) * dphi
+                    u = rho * cos(phi_val)
+                    v = rho * sin(phi_val)
+                    idx += 1
+                    pts[idx, 1] = icx + u * e1[1] + v * e2[1]
+                    pts[idx, 2] = icy + u * e1[2] + v * e2[2]
+                    pts[idx, 3] = icz + u * e1[3] + v * e2[3]
+                    cv_vals[idx] = cv_interp
+                end
+            end
+        end
+    end
+
+    if idx > 0
+        return (pts[1:idx, :], cv_vals[1:idx])
+    else
+        return (Matrix{Float64}(undef, 0, 3), Float64[])
+    end
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -776,6 +900,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               info::NBSInfo,
                               nbs_id::Int32,
                               tree_ids::AbstractVector{<:Integer},
+                              tree_nbs_ids::AbstractVector{<:Integer},
                               agh_values::AbstractVector{<:Real},
                               cfg::FLiPConfig,
                               next_node_id::Int)
@@ -799,11 +924,54 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     end
     dominant_tree = isempty(tree_counts) ? Int32(0) : first(sort!(collect(tree_counts); by=last, rev=true))[1]
 
+    # Determine dominant tree_nbs_id for this NBS
+    tnbs_counts = Dict{Int32, Int}()
+    @inbounds for j in eachindex(indices)
+        tnid = Int32(tree_nbs_ids[indices[j]])
+        tnid > 0 || continue
+        tnbs_counts[tnid] = get(tnbs_counts, tnid, 0) + 1
+    end
+    dominant_tree_nbs = isempty(tnbs_counts) ? Int32(0) : first(sort!(collect(tnbs_counts); by=last, rev=true))[1]
+
     n_slices = size(centers, 1)
     rho_median_global = length(rho) > 0 ? median(rho) : 0.01
 
+    # Pre-compute per-slice rho distribution statistics (quality metrics)
+    slice_rho_mean = zeros(n_slices)
+    slice_rho_std = zeros(n_slices)
+    slice_rho_cv = zeros(n_slices)
+    slice_rho_count = zeros(Int, n_slices)
+    # Pass 1: sums and counts
+    @inbounds for j in eachindex(rho)
+        s = pt_slice_ids[j]
+        slice_rho_mean[s] += rho[j]
+        slice_rho_count[s] += 1
+    end
+    @inbounds for s in 1:n_slices
+        c = slice_rho_count[s]
+        if c > 0
+            slice_rho_mean[s] /= c
+        end
+    end
+    # Pass 2: variance
+    @inbounds for j in eachindex(rho)
+        s = pt_slice_ids[j]
+        d = rho[j] - slice_rho_mean[s]
+        slice_rho_std[s] += d * d
+    end
+    @inbounds for s in 1:n_slices
+        c = slice_rho_count[s]
+        if c > 1
+            slice_rho_std[s] = sqrt(slice_rho_std[s] / (c - 1))
+        else
+            slice_rho_std[s] = 0.0
+        end
+        m = slice_rho_mean[s]
+        slice_rho_cv[s] = m > 0 ? slice_rho_std[s] / m : 0.0
+    end
+
     # Method B: 2D spline surface for all slices at once
-    spl_results = _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
+    spl_results, surface_grid, _ = _method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, rho_median_global)
 
     # Process each slice
     slice_nodes = QSMNode[]
@@ -826,19 +994,25 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         completeness < cfg.qsm_completeness_threshold && continue
 
         node = QSMNode(
-            next_node_id, nbs_id, dominant_tree,
+            next_node_id, nbs_id, dominant_tree, dominant_tree_nbs,
             mean_agh, slice_res, completeness, n_pts,
             centers[s, 1], centers[s, 2], centers[s, 3],
             info.direction[1], info.direction[2], info.direction[3],
             ca, circ,
             sqrt(max(0.0, ca / π)), circ / (2π),
+            slice_rho_mean[s], slice_rho_std[s], slice_rho_cv[s],
         )
         push!(slice_nodes, node)
         next_node_id += 1
     end
 
     append!(nodes, slice_nodes)
-    return next_node_id
+
+    # Generate surface point cloud from the smoothed 2D surface
+    gen_res = cfg.pipeline_subsample_res / 2.0
+    surface_pts, surface_cv = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res, slice_rho_cv)
+
+    return (next_node_id, surface_pts, surface_cv)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -925,26 +1099,28 @@ function _build_node_table(nodes::Vector{QSMNode})
     end
 
     headers = [
-        "qsm_node_id", "nbs_id", "tree_id", "agh",
+        "qsm_node_id", "nbs_id", "tree_id", "tree_nbs_id", "agh",
         "cross_area", "circumference",
         "radius_area", "radius_circ",
         "height", "volume", "surface_area",
         "completeness", "n_points",
         "center_x", "center_y", "center_z",
         "direction_x", "direction_y", "direction_z",
+        "rho_mean", "rho_std", "rho_cv",
     ]
 
     table = Matrix{Any}(undef, n, length(headers))
     for i in 1:n
         nd = nodes[i]
         table[i, :] = Any[
-            nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.agh,
+            nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.tree_nbs_id, nd.agh,
             nd.cross_area, nd.circumference,
             nd.radius_area, nd.radius_circ,
             nd.height, vol[i], sa[i],
             nd.completeness, nd.n_points,
             nd.center_x, nd.center_y, nd.center_z,
             nd.direction_x, nd.direction_y, nd.direction_z,
+            nd.rho_mean, nd.rho_std, nd.rho_cv,
         ]
     end
 
@@ -1066,9 +1242,11 @@ NamedTuple with fields:
 - `status`: `:success` or `:no_linear_nbs`
 - `n_nodes`: Number of QSM nodes created
 - `n_trees`: Number of trees with QSM data
-- `node_csv_path`: Path to node-level CSV
-- `tree_csv_path`: Path to tree-level CSV
+- `node_csv_path`: Path to node-level CSV (includes all NBS)
+- `tree_csv_path`: Path to tree-level CSV (tree NBS only)
 - `pc_output`: Point cloud with `:qsm_node_id` attribute added
+- `qsm_surface_cloud`: Point cloud of QSM surface with `:nbs_id` attribute
+- `surface_cloud_path`: Path to surface cloud LAZ file
 """
 function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::AbstractString="",
                output_prefix::AbstractString="output", tree_cloud_path::AbstractString="", kwargs...)
@@ -1087,6 +1265,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     # Required attributes
     nbs_ids = hasattribute(pc, :nbs_id) ? getattribute(pc, :nbs_id) : zeros(Int32, N)
     tree_ids = hasattribute(pc, :tree_id) ? getattribute(pc, :tree_id) : zeros(Int32, N)
+    tree_nbs_ids = hasattribute(pc, :tree_nbs_id) ? getattribute(pc, :tree_nbs_id) : zeros(Int32, N)
     agh_values = hasattribute(pc, :AGH) ? getattribute(pc, :AGH) : zeros(Float64, N)
 
     println("[qsm] Processing $(N) points")
@@ -1107,11 +1286,22 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     next_node_id = 1
 
     qsm_node_ids = zeros(Int32, N)
+    surface_parts = Matrix{Float64}[]
+    surface_nbs_parts = Vector{Int32}[]
+    surface_cv_parts = Vector{Float64}[]
 
     for (nid, info) in sort!(collect(linear_nbs); by=first)
         n_before = length(nodes)
-        next_node_id = _process_single_nbs!(nodes, coords, info, nid,
-                                            tree_ids, agh_values, cfg, next_node_id)
+        next_node_id, surf_pts, surf_cv = _process_single_nbs!(nodes, coords, info, nid,
+                                            tree_ids, tree_nbs_ids, agh_values, cfg, next_node_id)
+
+        # Accumulate surface point cloud
+        if size(surf_pts, 1) > 0
+            push!(surface_parts, surf_pts)
+            push!(surface_nbs_parts, fill(nid, size(surf_pts, 1)))
+            push!(surface_cv_parts, surf_cv)
+        end
+
         # Map points to QSM node IDs
         n_after = length(nodes)
         if n_after > n_before
@@ -1161,6 +1351,23 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         end
     end
 
+    # Build QSM surface point cloud
+    surf_cloud_path = joinpath(output_dir, "$(output_prefix)qsm_surface.laz")
+    if !isempty(surface_parts)
+        surf_coords = vcat(surface_parts...)
+        surf_nbs = vcat(surface_nbs_parts...)
+        surf_cv = vcat(surface_cv_parts...)
+        qsm_surface_cloud = PointCloudData(surf_coords, Dict{Symbol,Vector}(:nbs_id => surf_nbs, :rho_cv => surf_cv))
+        println("[qsm] Generated QSM surface cloud: $(npoints(qsm_surface_cloud)) points")
+    else
+        qsm_surface_cloud = PointCloudData(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
+    end
+
+    if !isempty(output_dir) && npoints(qsm_surface_cloud) > 0
+        write_pc(surf_cloud_path, qsm_surface_cloud)
+        println("[qsm] Wrote QSM surface cloud: $surf_cloud_path")
+    end
+
     # Add QSM node IDs to point cloud and overwrite tree cloud on disk
     pc_out = setattribute!(pc, :qsm_node_id, qsm_node_ids)
     if !isempty(tree_cloud_path)
@@ -1175,5 +1382,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         node_csv_path = node_csv,
         tree_csv_path = tree_csv,
         pc_output = pc_out,
+        qsm_surface_cloud = qsm_surface_cloud,
+        surface_cloud_path = surf_cloud_path,
     )
 end
