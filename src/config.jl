@@ -41,15 +41,25 @@ mutable struct FLiPConfig
     # tree segmentation
     tree_nearground_agh_threshold::Float64
     tree_neighbor_radius::Float64
-    tree_slice_length::Float64
     tree_frontier_min_cc_size::Int
-    tree_max_lcs_iterations::Int
     tree_nbs_neighbor_distance::Int
     tree_min_nbs_size::Int
     tree_nbs_max_iterations::Int
     tree_linearity_angle_deg::Float64
     tree_assembly_merge_threshold::Float64
     tree_assembly_occlusion_tolerance::Float64
+
+    # qsm
+    qsm_nbs_linearity_threshold::Float64
+    qsm_slice_height_scalar::Float64
+    qsm_min_node_size::Int
+    qsm_phi_bin_min::Int
+    qsm_phi_bin_max::Int
+    qsm_surface_res_scalar::Float64
+    qsm_completeness_threshold::Float64
+    qsm_breast_height::Float64
+    qsm_spl_z_smoothing::Float64
+    qsm_rho_percentile::Float64
 
     # coordinate precision
     coordinate_precision::DataType
@@ -82,6 +92,7 @@ function FLiPConfig(d::Dict)
     sg = get(d, "segment_ground",                   Dict{String,Any}())
     pp = get(d, "preprocess",                       Dict{String,Any}())
     ts = get(d, "tree_segmentation",                Dict{String,Any}())
+    qm = get(d, "qsm",                             Dict{String,Any}())
     pl = get(d, "pipeline",                         Dict{String,Any}())
 
     FLiPConfig(
@@ -101,15 +112,24 @@ function FLiPConfig(d::Dict)
 
         Float64(get(ts, "nearground_agh_threshold", 0.3)),
         Float64(get(ts, "neighbor_radius", -1.0)),
-        Float64(get(ts, "slice_length", 0.1)),
         Int(get(ts, "frontier_min_cc_size", 3)),
-        Int(get(ts, "max_lcs_iterations", 5000)),
         Int(get(ts, "nbs_neighbor_distance", 2)),
         Int(get(ts, "min_nbs_size", 5)),
         Int(get(ts, "nbs_max_iterations", 10000)),
         Float64(get(ts, "linearity_angle_deg", 80.0)),
         Float64(get(ts, "assembly_merge_threshold", 0.5)),
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
+
+        Float64(get(qm, "nbs_linearity_threshold", 0.5)),
+        Float64(get(qm, "slice_height_scalar", 3.0)),
+        Int(get(qm, "min_node_size", 5)),
+        Int(get(qm, "phi_bin_min", 36)),
+        Int(get(qm, "phi_bin_max", 360)),
+        Float64(get(qm, "surface_res_scalar", 0.5)),
+        Float64(get(qm, "completeness_threshold", 0.25)),
+        Float64(get(qm, "breast_height", 1.3)),
+        Float64(get(qm, "spl_z_smoothing", 0.3)),
+        Float64(get(qm, "rho_percentile", 1.0)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

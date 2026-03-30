@@ -126,15 +126,6 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
         preprocess_written = true
     else
         println("[main] preprocess disabled by config")
-        # Try to load from existing preprocess output (single or multi-file)
-        pc_preprocess = _pipeline_load(output_dir, output_prefix, "preprocess", output_fmt)
-        if !isnothing(pc_preprocess)
-            preprocess_written = true
-        else
-            # No preprocess output found — read input files directly without preprocessing
-            pc_preprocess = preprocess(; cfg=cfg)
-            preprocess_written = true
-        end
     end
 
     # 2) ground segmentation
@@ -145,25 +136,26 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     ground_written = false
     agh_written = false
 
+    n_preprocess = 0
+    n_ground = 0
+
     if cfg.pipeline_enable_ground_segmentation
         ground_input = _pipeline_require(pc_preprocess, preprocess_path, "preprocess output", "ground segmentation")
+        pc_preprocess = nothing  # release input — no longer needed
         ground_res = ground_segmentation(ground_input; cfg=cfg)
+        ground_input = nothing
         ground_points = ground_res.ground_points
         pc_agh = ground_res.agh_cloud
+        n_preprocess = npoints(ground_res.agh_cloud)
+        n_ground = npoints(ground_points)
         ground_written = _pipeline_write(ground_path, ground_points)
+        ground_points = nothing  # written to disk, release
         if cfg.pipeline_enable_agh
             agh_written = _pipeline_write(agh_path, pc_agh)
         end
     else
         println("[main] ground segmentation disabled by config")
-        if isfile(ground_path)
-            ground_points = _pipeline_load(ground_path, "ground output")
-            ground_written = true
-        end
-        if isfile(agh_path)
-            pc_agh = _pipeline_load(agh_path, "AGH output")
-            agh_written = true
-        end
+        pc_preprocess = nothing  # no downstream consumer, release
     end
 
     # 3) tree segmentation
@@ -176,17 +168,16 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     tree_res = nothing
     if cfg.pipeline_enable_tree_segmentation
         tree_input = _pipeline_require(pc_agh, agh_path, "AGH output", "tree segmentation")
-        # Release upstream data to free memory before heavy graph processing
-        pc_preprocess = nothing
-        ground_points = nothing
-        pc_agh = nothing
+        pc_agh = nothing  # release — tree_input holds the reference
         GC.gc()
         tree_res = tree_segmentation(tree_input; cfg=cfg)
+        tree_input = nothing  # release input
         tree_components = tree_res.n_components
         tree_written = _pipeline_write(tree_path, tree_res.pc_output)
         tree_skeleton_written = _pipeline_write(tree_skeleton_path, tree_res.skeleton_cloud)
     else
         println("[main] tree segmentation disabled by config")
+        pc_agh = nothing  # no downstream consumer, release
     end
 
     # 4) qsm
@@ -203,7 +194,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     end
 
     qsm_res = if cfg.pipeline_enable_qsm
-        qsm(tree_result=tree_res, config_path=String(config_path), output_dir=output_dir, output_prefix=output_prefix)
+        qsm(tree_result=tree_res, config_path=String(config_path), output_dir=output_dir, output_prefix=output_prefix, tree_cloud_path=tree_path)
     else
         (status=:skipped,)
     end
@@ -233,13 +224,17 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
         (status=:skipped,)
     end
 
+    # Release heavy data before returning lightweight summary
+    tree_res = nothing
+    GC.gc()
+
     return (
         input_path=input_path,
         output_dir=output_dir,
         output_prefix=output_prefix,
-        n_preprocess_input=isnothing(pc_preprocess) ? 0 : npoints(pc_preprocess),
-        n_preprocess=isnothing(pc_preprocess) ? 0 : npoints(pc_preprocess),
-        n_ground=isnothing(ground_points) ? 0 : npoints(ground_points),
+        n_preprocess_input=n_preprocess,
+        n_preprocess=n_preprocess,
+        n_ground=n_ground,
         tree_components=tree_components,
         preprocess_path=preprocess_path,
         ground_path=ground_path,
