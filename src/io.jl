@@ -153,16 +153,21 @@ function write_las(path::AbstractString, pc::PointCloud)
     _ensure_laspy()
 
     header = _laspy.LasHeader(point_format=6, version="1.4")
-    header.offsets = _np.array(Py([0.0, 0.0, 0.0]))
-    header.scales = _np.array(Py([1e-6, 1e-6, 1e-6]))
+
+    # Compute offsets from data to keep (coord - offset) / scale within Int32 range.
+    # Using coordinate minima as offsets ensures stored integers start near zero.
+    coords = coordinates(pc)
+    x_vals = Vector{Float64}(coords[:, 1])
+    y_vals = Vector{Float64}(coords[:, 2])
+    z_vals = Vector{Float64}(coords[:, 3])
+    header.offsets = _np.array(Py([minimum(x_vals), minimum(y_vals), minimum(z_vals)]))
+    header.scales  = _np.array(Py([1e-6, 1e-6, 1e-6]))
 
     las = _laspy.LasData(header)
-
-    # Coordinates
-    coords = coordinates(pc)
-    las.x = _jl_to_numpy(Vector{Float64}(coords[:, 1]))
-    las.y = _jl_to_numpy(Vector{Float64}(coords[:, 2]))
-    las.z = _jl_to_numpy(Vector{Float64}(coords[:, 3]))
+    # Coordinates (reuse vectors extracted above for offsets)
+    las.x = _jl_to_numpy(x_vals)
+    las.y = _jl_to_numpy(y_vals)
+    las.z = _jl_to_numpy(z_vals)
 
     # Standard LAS fields
     std_laspy_names = Set(v[1] for v in values(_LAS_STD_FIELDS))
