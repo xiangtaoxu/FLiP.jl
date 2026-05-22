@@ -1,58 +1,63 @@
-@inline function _pipeline_write(path::AbstractString, pc::PointCloud)
-    write_pc(path, pc)
-    println("[main] wrote: $path")
-    return true
-end
+"""
+    _prepare_stage_input(data, cfg, stem, label, consumer) -> PointCloud
 
-"""Load a single pipeline output file."""
-@inline function _pipeline_load(path::AbstractString, label::AbstractString)
-    isfile(path) || throw(ArgumentError("$label not found: $path"))
-    println("[main] resume: loading $(path)")
-    return read_pc(path)
+Materialize a stage's PointCloud input. If `data` is non-nothing, return it
+unchanged. Otherwise, try the single-file output `{prefix}{stem}.{fmt}` on
+disk; if that's missing, try the multi-file `{prefix}{stem}_S{i}.{fmt}`
+pattern and merge. Throws if no source is available.
+"""
+function _prepare_stage_input(data, cfg::FLiPConfig, stem::AbstractString,
+                              label::AbstractString, consumer::AbstractString)
+    isnothing(data) || return data
+
+    fmt = lowercase(cfg.pipeline_output_format)
+    single = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    if isfile(single)
+        println("[main] resume: loading $single")
+        return read_pc(single)
+    end
+
+    scans = find_scan_outputs(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, stem, fmt)
+    if !isempty(scans)
+        println("[main] resume: loading $(length(scans)) $stem files from $(cfg.pipeline_output_dir)")
+        all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(scans))
+        all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(scans))
+        for (i, fpath) in enumerate(scans)
+            println("[main] resume: loading $fpath")
+            pc = read_pc(fpath)
+            all_coords[i] = coordinates(pc)
+            all_attrs[i]  = _all_attributes(pc)
+        end
+        merged = merge_pointclouds(all_coords, all_attrs)
+        length(scans) > 1 && println("[main] resume: merged $(length(scans)) scans → $(npoints(merged)) points")
+        return merged
+    end
+
+    throw(ArgumentError(
+        "$consumer requires $label in memory, at $single, or as $(cfg.pipeline_output_prefix)$(stem)_S{i}.$fmt scans; no data available"))
 end
 
 """
-Load pipeline output that may be a single file or multiple `_S{i}` files.
+    _load_tree_result(cfg) -> NamedTuple
 
-Tries `{prefix}{stem}.{fmt}` first; if not found, discovers
-`{prefix}{stem}_S{i}.{fmt}` files, loads each, and merges into one cloud.
-Returns `nothing` if no matching files exist.
+Reconstruct a tree-segmentation result NamedTuple from disk (used by stages
+4 and 5 when stage 3 was disabled or skipped). Loads the tree output and the
+optional skeleton; fills `filtered_cloud`, `n_components`, `neighbor_radius`
+with empty / zero defaults. Throws if the tree output is not on disk.
 """
-function _pipeline_load(output_dir::AbstractString, output_prefix::AbstractString, stem::AbstractString, fmt::AbstractString)
-    # Try single-file first
-    single_path = get_output_path(output_dir, output_prefix, stem, fmt)
-    if isfile(single_path)
-        println("[main] resume: loading $single_path")
-        return read_pc(single_path)
-    end
-
-    # Try multi-file _S{i} pattern
-    candidates = find_scan_outputs(output_dir, output_prefix, stem, fmt)
-    isempty(candidates) && return nothing
-
-    println("[main] resume: loading $(length(candidates)) $(stem) files from $output_dir")
-    all_coords = Vector{Matrix{<:AbstractFloat}}(undef, length(candidates))
-    all_attrs  = Vector{Dict{Symbol,Vector}}(undef, length(candidates))
-    for (i, fpath) in enumerate(candidates)
-        println("[main] resume: loading $fpath")
-        pc = read_pc(fpath)
-        all_coords[i] = coordinates(pc)
-        all_attrs[i]  = _all_attributes(pc)
-    end
-
-    merged = merge_pointclouds(all_coords, all_attrs)
-    length(candidates) > 1 && println("[main] resume: merged $(length(candidates)) scans → $(npoints(merged)) points")
-    return merged
-end
-
-@inline function _pipeline_require(data, path::AbstractString, data_label::AbstractString, consumer_label::AbstractString)
-    if !isnothing(data)
-        return data
-    end
-    if isfile(path)
-        return _pipeline_load(path, data_label)
-    end
-    throw(ArgumentError("$consumer_label requires $data_label in memory or at $path; no data available"))
+function _load_tree_result(cfg::FLiPConfig)
+    pc_tree = _prepare_stage_input(nothing, cfg, "tree",
+                                   "tree output", "qsm/report stage")
+    fmt = lowercase(cfg.pipeline_output_format)
+    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
+    pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
+    return (
+        pc_output=pc_tree,
+        skeleton_cloud=pc_skeleton,
+        filtered_cloud=pc_tree[1:0],
+        n_components=0,
+        neighbor_radius=0.0,
+    )
 end
 
 """
@@ -127,7 +132,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     n_ground = 0
 
     if cfg.pipeline_enable_ground_segmentation
-        ground_input = _pipeline_require(pc_preprocess, preprocess_path, "preprocess output", "ground segmentation")
+        ground_input = _prepare_stage_input(pc_preprocess, cfg, "preprocess", "preprocess output", "ground segmentation")
         pc_preprocess = nothing  # release input — no longer needed
         ground_res = ground_segmentation(ground_input; cfg=cfg)
         ground_input = nothing
@@ -135,10 +140,10 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
         pc_agh = ground_res.agh_cloud
         n_preprocess = npoints(ground_res.agh_cloud)
         n_ground = npoints(ground_points)
-        ground_written = _pipeline_write(ground_path, ground_points)
+        write_pc(ground_path, ground_points); println("[main] wrote: $ground_path"); ground_written = true
         ground_points = nothing  # written to disk, release
         if cfg.pipeline_enable_agh
-            agh_written = _pipeline_write(agh_path, pc_agh)
+            write_pc(agh_path, pc_agh); println("[main] wrote: $agh_path"); agh_written = true
         end
     else
         println("[main] ground segmentation disabled by config")
@@ -154,14 +159,14 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
     tree_res = nothing
     if cfg.pipeline_enable_tree_segmentation
-        tree_input = _pipeline_require(pc_agh, agh_path, "AGH output", "tree segmentation")
+        tree_input = _prepare_stage_input(pc_agh, cfg, "agh", "AGH output", "tree segmentation")
         pc_agh = nothing  # release — tree_input holds the reference
         GC.gc()
         tree_res = tree_segmentation(tree_input; cfg=cfg)
         tree_input = nothing  # release input
         tree_components = tree_res.n_components
-        tree_written = _pipeline_write(tree_path, tree_res.pc_output)
-        tree_skeleton_written = _pipeline_write(tree_skeleton_path, tree_res.skeleton_cloud)
+        write_pc(tree_path, tree_res.pc_output); println("[main] wrote: $tree_path"); tree_written = true
+        write_pc(tree_skeleton_path, tree_res.skeleton_cloud); println("[main] wrote: $tree_skeleton_path"); tree_skeleton_written = true
     else
         println("[main] tree segmentation disabled by config")
         pc_agh = nothing  # no downstream consumer, release
@@ -169,15 +174,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
     # 4) qsm
     if isnothing(tree_res) && cfg.pipeline_enable_qsm
-        pc_tree = _pipeline_require(nothing, tree_path, "tree output", "qsm")
-        pc_skeleton = isfile(tree_skeleton_path) ? _pipeline_load(tree_skeleton_path, "tree skeleton output") : pc_tree[1:0]
-        tree_res = (
-            pc_output=pc_tree,
-            skeleton_cloud=pc_skeleton,
-            filtered_cloud=pc_tree[1:0],
-            n_components=0,
-            neighbor_radius=0.0,
-        )
+        tree_res = _load_tree_result(cfg)
     end
 
     qsm_res = if cfg.pipeline_enable_qsm
@@ -188,15 +185,7 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
     # 5) report
     if isnothing(tree_res) && cfg.pipeline_enable_generate_report
-        pc_tree = _pipeline_require(nothing, tree_path, "tree output", "generate_report")
-        pc_skeleton = isfile(tree_skeleton_path) ? _pipeline_load(tree_skeleton_path, "tree skeleton output") : pc_tree[1:0]
-        tree_res = (
-            pc_output=pc_tree,
-            skeleton_cloud=pc_skeleton,
-            filtered_cloud=pc_tree[1:0],
-            n_components=0,
-            neighbor_radius=0.0,
-        )
+        tree_res = _load_tree_result(cfg)
     end
 
     report_res = if cfg.pipeline_enable_generate_report
