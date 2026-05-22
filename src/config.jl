@@ -60,6 +60,8 @@ mutable struct FLiPConfig
     qsm_breast_height::Float64
     qsm_spl_z_smoothing::Float64
     qsm_rho_percentile::Float64
+    qsm_min_octant_taubin::Int
+    qsm_min_octant_centroid::Int
 
     # coordinate precision
     coordinate_precision::DataType
@@ -130,6 +132,8 @@ function FLiPConfig(d::Dict)
         Float64(get(qm, "breast_height", 1.3)),
         Float64(get(qm, "spl_z_smoothing", 0.3)),
         Float64(get(qm, "rho_percentile", 1.0)),
+        Int(get(qm, "min_octant_taubin", 3)),
+        Int(get(qm, "min_octant_centroid", 5)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

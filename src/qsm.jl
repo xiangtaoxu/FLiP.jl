@@ -260,7 +260,9 @@ Returns 3D centers (K×3), vector of point-index vectors per slice,
 and scalar t-values (projection on PC1) per point.
 """
 function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
-                                slice_res::Float64, min_node_size::Int)
+                                slice_res::Float64, min_node_size::Int,
+                                min_octant_taubin::Int=3,
+                                min_octant_centroid::Int=5)
     d = info.direction
     cx, cy, cz = info.center
     indices = info.point_indices
@@ -300,7 +302,6 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
             centers_3d[s, :] .= NaN
             continue
         end
-        valid_slices[s] = true
 
         # Project to 2D plane perpendicular to PC1
         ns = length(local_js)
@@ -315,12 +316,26 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
             v_arr[k] = dx * e2[1] + dy * e2[2] + dz * e2[3]
         end
 
-        if ns >= 10
+        # Angular coverage relative to NBS axis: count distinct π/4 octants
+        covered_octants = falses(8)
+        @inbounds for k in 1:ns
+            oct = clamp(floor(Int, (atan(v_arr[k], u_arr[k]) + π) / (π / 4)) + 1, 1, 8)
+            covered_octants[oct] = true
+        end
+        n_octants = count(covered_octants)
+
+        local cu::Float64, cv::Float64
+        if ns >= 10 && n_octants >= min_octant_taubin
             cu, cv, _ = taubin_circle_fit(u_arr, v_arr)
-        else
+        elseif n_octants >= min_octant_centroid
             cu = mean(u_arr)
             cv = mean(v_arr)
+        else
+            # Insufficient angular coverage — defer to neighbor interpolation
+            centers_3d[s, :] .= NaN
+            continue
         end
+        valid_slices[s] = true
 
         # Convert 2D center back to 3D
         t_center = t_min + (s - 0.5) * slice_res
@@ -900,7 +915,6 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               info::NBSInfo,
                               nbs_id::Int32,
                               tree_ids::AbstractVector{<:Integer},
-                              tree_nbs_ids::AbstractVector{<:Integer},
                               agh_values::AbstractVector{<:Real},
                               cfg::FLiPConfig,
                               next_node_id::Int)
@@ -909,7 +923,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
 
     # Step 2-3: Slice, fit centers, smooth
     centers, _, _, _, pt_slice_ids, e1, e2 =
-        _slice_and_fit_centers(coords, info, slice_res, cfg.qsm_min_node_size)
+        _slice_and_fit_centers(coords, info, slice_res, cfg.qsm_min_node_size,
+                               cfg.qsm_min_octant_taubin, cfg.qsm_min_octant_centroid)
     _smooth_centerline!(centers)
 
     # Step 4: Unroll
@@ -924,14 +939,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     end
     dominant_tree = isempty(tree_counts) ? Int32(0) : first(sort!(collect(tree_counts); by=last, rev=true))[1]
 
-    # Determine dominant tree_nbs_id for this NBS
-    tnbs_counts = Dict{Int32, Int}()
-    @inbounds for j in eachindex(indices)
-        tnid = Int32(tree_nbs_ids[indices[j]])
-        tnid > 0 || continue
-        tnbs_counts[tnid] = get(tnbs_counts, tnid, 0) + 1
-    end
-    dominant_tree_nbs = isempty(tnbs_counts) ? Int32(0) : first(sort!(collect(tnbs_counts); by=last, rev=true))[1]
+    # The group key `nbs_id` is the merged tree_nbs_id (A1); they are identical by construction.
+    dominant_tree_nbs = nbs_id
 
     n_slices = size(centers, 1)
     rho_median_global = length(rho) > 0 ? median(rho) : 0.01
@@ -1099,7 +1108,7 @@ function _build_node_table(nodes::Vector{QSMNode})
     end
 
     headers = [
-        "qsm_node_id", "nbs_id", "tree_id", "tree_nbs_id", "agh",
+        "qsm_node_id", "tree_nbs_id", "tree_id", "agh",
         "cross_area", "circumference",
         "radius_area", "radius_circ",
         "height", "volume", "surface_area",
@@ -1113,7 +1122,7 @@ function _build_node_table(nodes::Vector{QSMNode})
     for i in 1:n
         nd = nodes[i]
         table[i, :] = Any[
-            nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.tree_nbs_id, nd.agh,
+            nd.qsm_node_id, nd.nbs_id, nd.tree_id, nd.agh,
             nd.cross_area, nd.circumference,
             nd.radius_area, nd.radius_circ,
             nd.height, vol[i], sa[i],
@@ -1245,7 +1254,7 @@ NamedTuple with fields:
 - `node_csv_path`: Path to node-level CSV (includes all NBS)
 - `tree_csv_path`: Path to tree-level CSV (tree NBS only)
 - `pc_output`: Point cloud with `:qsm_node_id` attribute added
-- `qsm_surface_cloud`: Point cloud of QSM surface with `:nbs_id` attribute
+- `qsm_surface_cloud`: Point cloud of QSM surface with `:tree_nbs_id` attribute
 - `surface_cloud_path`: Path to surface cloud LAZ file
 """
 function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::AbstractString="",
@@ -1262,8 +1271,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     coords = coordinates(pc)
     N = size(coords, 1)
 
-    # Required attributes
-    nbs_ids = hasattribute(pc, :nbs_id) ? getattribute(pc, :nbs_id) : zeros(Int32, N)
+    # Required attributes (group QSM by tree_nbs_id — the merged, post-assembly identifier)
     tree_ids = hasattribute(pc, :tree_id) ? getattribute(pc, :tree_id) : zeros(Int32, N)
     tree_nbs_ids = hasattribute(pc, :tree_nbs_id) ? getattribute(pc, :tree_nbs_id) : zeros(Int32, N)
     agh_values = hasattribute(pc, :AGH) ? getattribute(pc, :AGH) : zeros(Float64, N)
@@ -1271,7 +1279,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     println("[qsm] Processing $(N) points")
 
     # Step 1: Filter linear NBS segments
-    linear_nbs = _filter_linear_nbs(coords, nbs_ids, cfg)
+    linear_nbs = _filter_linear_nbs(coords, tree_nbs_ids, cfg)
     println("[qsm] Found $(length(linear_nbs)) linear NBS segments (threshold=$(cfg.qsm_nbs_linearity_threshold))")
 
     if isempty(linear_nbs)
@@ -1293,7 +1301,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     for (nid, info) in sort!(collect(linear_nbs); by=first)
         n_before = length(nodes)
         next_node_id, surf_pts, surf_cv = _process_single_nbs!(nodes, coords, info, nid,
-                                            tree_ids, tree_nbs_ids, agh_values, cfg, next_node_id)
+                                            tree_ids, agh_values, cfg, next_node_id)
 
         # Accumulate surface point cloud
         if size(surf_pts, 1) > 0
@@ -1357,7 +1365,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         surf_coords = vcat(surface_parts...)
         surf_nbs = vcat(surface_nbs_parts...)
         surf_cv = vcat(surface_cv_parts...)
-        qsm_surface_cloud = PointCloudData(surf_coords, Dict{Symbol,Vector}(:nbs_id => surf_nbs, :rho_cv => surf_cv))
+        qsm_surface_cloud = PointCloudData(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho_cv => surf_cv))
         println("[qsm] Generated QSM surface cloud: $(npoints(qsm_surface_cloud)) points")
     else
         qsm_surface_cloud = PointCloudData(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())

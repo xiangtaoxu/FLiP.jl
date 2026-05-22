@@ -841,7 +841,7 @@ function process_orphan_segments(
         tree_id[i] > 0 && push!(assigned_idx, i)
     end
 
-    orphan_to_tree_nbs = Dict{Int, Dict{Int32, Int}}()
+    orphan_to_tree_nbs = Dict{Int, Dict{Int32, Dict{Int32, Int}}}()  # orph_nbs → tid → tnid → count
 
     if !isempty(assigned_idx)
         assigned_3xM = Matrix{eltype(coords)}(undef, 3, length(assigned_idx))
@@ -869,20 +869,23 @@ function process_orphan_segments(
             end
         end
 
-        # Record tree_nbs_id connections for later merge target
+        # Record (tree_id, tree_nbs_id) connections for later merge target.
+        # Nested by tid so the apply step can pick the best tnid *within best_tid*.
         for (orph_nbs, orph_pts) in orphan_nbs_points
-            tnbs_counts = Dict{Int32, Int}()
+            tnbs_by_tid = Dict{Int32, Dict{Int32, Int}}()
             for i in orph_pts
                 query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
                 hits = inrange(kdtree, query, occlusion_tol)
                 for j in hits
                     aid = assigned_idx[j]
-                    tnid = tree_nbs_id[aid]
-                    tnid > 0 || continue
-                    tnbs_counts[tnid] = get(tnbs_counts, tnid, 0) + 1
+                    tid_a = tree_id[aid]
+                    tnid  = tree_nbs_id[aid]
+                    (tid_a > 0 && tnid > 0) || continue
+                    inner = get!(tnbs_by_tid, tid_a, Dict{Int32, Int}())
+                    inner[tnid] = get(inner, tnid, 0) + 1
                 end
             end
-            isempty(tnbs_counts) || (orphan_to_tree_nbs[orph_nbs] = tnbs_counts)
+            isempty(tnbs_by_tid) || (orphan_to_tree_nbs[orph_nbs] = tnbs_by_tid)
         end
     end
 
@@ -932,19 +935,29 @@ function process_orphan_segments(
         @info "Orphan rescue iteration $orphan_iteration: rescued $n_rescued NBS"
     end
 
-    # Apply orphan assignments to point-level arrays
+    # Apply orphan assignments to point-level arrays.
+    # `next_fresh_tnbs` allocates globally-unique labels for orphans whose
+    # `best_tid` has no nearby NBS (rescued purely via orphan→orphan propagation).
+    next_fresh_tnbs = Int32(maximum(tree_nbs_id; init = Int32(0))) + Int32(1)
+
     for (orph_nbs, best_tid) in orphan_tree_id
         best_tid > 0 || continue
-        tnbs_counts = get(orphan_to_tree_nbs, orph_nbs, Dict{Int32, Int}())
-        best_tnbs = Int32(orph_nbs)
-        if !isempty(tnbs_counts)
-            best_tnbs_cnt = 0
-            for (tnid, cnt) in tnbs_counts
-                if cnt > best_tnbs_cnt
-                    best_tnbs_cnt = cnt
-                    best_tnbs = tnid
-                end
+
+        tnbs_by_tid = get(orphan_to_tree_nbs, orph_nbs, Dict{Int32, Dict{Int32, Int}}())
+        tnbs_counts = get(tnbs_by_tid, best_tid, Dict{Int32, Int}())
+
+        best_tnbs = Int32(0)
+        best_tnbs_cnt = 0
+        for (tnid, cnt) in tnbs_counts
+            if cnt > best_tnbs_cnt
+                best_tnbs_cnt = cnt
+                best_tnbs = tnid
             end
+        end
+
+        if best_tnbs == 0
+            best_tnbs = next_fresh_tnbs
+            next_fresh_tnbs += Int32(1)
         end
 
         for i in orphan_nbs_points[orph_nbs]
