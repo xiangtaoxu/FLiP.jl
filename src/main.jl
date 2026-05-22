@@ -153,6 +153,80 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
 end
 
 """
+    _stage_tree(cfg, pc_agh) -> NamedTuple
+
+Run tree segmentation, write the tree and skeleton outputs, and return the
+full `tree_segmentation` result plus path / written-flag / n_components
+metadata. If `pc_agh` is `nothing`, the input is loaded from disk via
+`_prepare_stage_input`.
+
+Returns `(result, tree_path, skeleton_path, tree_written, skeleton_written,
+n_components)`. `result` is `nothing` when the stage is disabled.
+"""
+function _stage_tree(cfg::FLiPConfig, pc_agh)
+    fmt = lowercase(cfg.pipeline_output_format)
+    tree_path     = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "tree",     fmt)
+    skeleton_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "skeleton", fmt)
+
+    if !cfg.pipeline_enable_tree_segmentation
+        println("[main] tree segmentation disabled by config")
+        return (result=nothing,
+                tree_path=tree_path, skeleton_path=skeleton_path,
+                tree_written=false, skeleton_written=false,
+                n_components=0)
+    end
+
+    tree_input = _prepare_stage_input(pc_agh, cfg, "agh", "AGH output", "tree segmentation")
+    GC.gc()
+    res = tree_segmentation(tree_input; cfg=cfg)
+    tree_input = nothing  # release input
+
+    write_pc(tree_path,     res.pc_output);      println("[main] wrote: $tree_path")
+    write_pc(skeleton_path, res.skeleton_cloud); println("[main] wrote: $skeleton_path")
+
+    return (result=res,
+            tree_path=tree_path, skeleton_path=skeleton_path,
+            tree_written=true, skeleton_written=true,
+            n_components=res.n_components)
+end
+
+"""
+    _stage_qsm(cfg, tree_res, config_path) -> NamedTuple
+
+Run the QSM stage (or `(status=:skipped,)` if disabled). If `tree_res` is
+`nothing` and QSM is enabled, the tree result is reconstructed from disk
+via `_load_tree_result`.
+"""
+function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
+    cfg.pipeline_enable_qsm || return (status=:skipped,)
+    tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+    fmt = lowercase(cfg.pipeline_output_format)
+    tree_path = get_output_path(cfg.pipeline_output_dir, cfg.pipeline_output_prefix, "tree", fmt)
+    return qsm(tree_result=tr,
+               config_path=String(config_path),
+               output_dir=cfg.pipeline_output_dir,
+               output_prefix=cfg.pipeline_output_prefix,
+               tree_cloud_path=tree_path)
+end
+
+"""
+    _stage_report(cfg, tree_res, qsm_res, config_path) -> NamedTuple
+
+Run the report stage (or `(status=:skipped,)` if disabled). If `tree_res` is
+`nothing` and the report stage is enabled, the tree result is reconstructed
+from disk via `_load_tree_result`.
+"""
+function _stage_report(cfg::FLiPConfig, tree_res, qsm_res, config_path::AbstractString)
+    cfg.pipeline_enable_generate_report || return (status=:skipped,)
+    tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+    return generate_report(tree_result=tr,
+                           qsm_result=qsm_res,
+                           config_path=String(config_path),
+                           output_dir=cfg.pipeline_output_dir,
+                           output_prefix=cfg.pipeline_output_prefix)
+end
+
+"""
     run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
 Run FLiP main pipeline stages in order:
@@ -189,57 +263,26 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
     n_ground           = g.n_ground
 
     # 3) tree segmentation
-    tree_path = get_output_path(output_dir, output_prefix, "tree", output_fmt)
-    tree_skeleton_path = get_output_path(output_dir, output_prefix, "skeleton", output_fmt)
-    tree_written = false
-    tree_skeleton_written = false
-    tree_components = 0
-
-    tree_res = nothing
-    if cfg.pipeline_enable_tree_segmentation
-        tree_input = _prepare_stage_input(pc_agh, cfg, "agh", "AGH output", "tree segmentation")
-        pc_agh = nothing  # release — tree_input holds the reference
-        GC.gc()
-        tree_res = tree_segmentation(tree_input; cfg=cfg)
-        tree_input = nothing  # release input
-        tree_components = tree_res.n_components
-        write_pc(tree_path, tree_res.pc_output); println("[main] wrote: $tree_path"); tree_written = true
-        write_pc(tree_skeleton_path, tree_res.skeleton_cloud); println("[main] wrote: $tree_skeleton_path"); tree_skeleton_written = true
-    else
-        println("[main] tree segmentation disabled by config")
-        pc_agh = nothing  # no downstream consumer, release
-    end
+    t = _stage_tree(cfg, pc_agh)
+    pc_agh = nothing  # released — _stage_tree consumed it
 
     # 4) qsm
-    if isnothing(tree_res) && cfg.pipeline_enable_qsm
-        tree_res = _load_tree_result(cfg)
-    end
-
-    qsm_res = if cfg.pipeline_enable_qsm
-        qsm(tree_result=tree_res, config_path=String(config_path), output_dir=output_dir, output_prefix=output_prefix, tree_cloud_path=tree_path)
-    else
-        (status=:skipped,)
-    end
+    q = _stage_qsm(cfg, t.result, config_path)
 
     # 5) report
-    if isnothing(tree_res) && cfg.pipeline_enable_generate_report
-        tree_res = _load_tree_result(cfg)
-    end
+    r = _stage_report(cfg, t.result, q, config_path)
 
-    report_res = if cfg.pipeline_enable_generate_report
-        generate_report(
-            tree_result=tree_res,
-            qsm_result=qsm_res,
-            config_path=String(config_path),
-            output_dir=output_dir,
-            output_prefix=output_prefix,
-        )
-    else
-        (status=:skipped,)
-    end
+    # Locals retained by the summary builder
+    tree_path             = t.tree_path
+    tree_skeleton_path    = t.skeleton_path
+    tree_written          = t.tree_written
+    tree_skeleton_written = t.skeleton_written
+    tree_components       = t.n_components
+    qsm_res    = q
+    report_res = r
 
     # Release heavy data before returning lightweight summary
-    tree_res = nothing
+    t = nothing
     GC.gc()
 
     return (
