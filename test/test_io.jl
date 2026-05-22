@@ -24,10 +24,10 @@
             coords = rand(Float64, 150, 3)
             pc = make_test_pointcloud(coords)
             agh = rand(Float64, length(pc))
-            pc_agh = setattribute!(pc, :AGH, agh)
+            setattribute!(pc, :AGH, agh)
 
             output_path = joinpath(test_dir, "test_agh_output.las")
-            write_las(output_path, pc_agh)
+            write_las(output_path, pc)
             @test isfile(output_path)
 
             pc2 = read_las(output_path)

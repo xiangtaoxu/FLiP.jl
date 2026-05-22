@@ -31,22 +31,28 @@
     @testset "PointCloud attributes" begin
         coords = rand(Float64, 100, 3)
         pc = make_test_pointcloud(coords)
-        
-        # Add attribute
+
+        # setattribute! mutates the cloud in place and returns it
         test_attr = rand(100)
-        pc2 = setattribute!(pc, :test_attr, test_attr)
-        @test !hasattribute(pc, :test_attr)
-        @test hasattribute(pc2, :test_attr)
-        @test getattribute(pc2, :test_attr) == test_attr
+        ret = setattribute!(pc, :test_attr, test_attr)
+        @test ret === pc
+        @test hasattribute(pc, :test_attr)
+        @test getattribute(pc, :test_attr) == test_attr
 
-        # Replace attribute
+        # Replace attribute (still mutating)
         test_attr2 = rand(100)
-        pc3 = setattribute!(pc2, :test_attr, test_attr2)
-        @test getattribute(pc3, :test_attr) == test_attr2
+        setattribute!(pc, :test_attr, test_attr2)
+        @test getattribute(pc, :test_attr) == test_attr2
 
-        # Delete custom attribute
-        pc4 = deleteattribute(pc3, :test_attr)
+        # Non-mutating add returns a new cloud
+        pc_added = addattribute(pc, :extra, rand(100))
+        @test hasattribute(pc_added, :extra)
+        @test !hasattribute(pc, :extra)
+
+        # Delete custom attribute (non-mutating)
+        pc4 = deleteattribute(pc, :test_attr)
         @test !hasattribute(pc4, :test_attr)
+        @test hasattribute(pc, :test_attr)  # original unchanged
 
         # Invalid attribute length
         @test_throws ArgumentError setattribute!(pc, :wrong, rand(50))

@@ -1283,9 +1283,9 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     println("[qsm] Found $(length(linear_nbs)) linear NBS segments (threshold=$(cfg.qsm_nbs_linearity_threshold))")
 
     if isempty(linear_nbs)
-        pc_out = setattribute!(pc, :qsm_node_id, zeros(Int32, N))
+        setattribute!(pc, :qsm_node_id, zeros(Int32, N))
         return (status=:no_linear_nbs, n_nodes=0, n_trees=0,
-                node_csv_path="", tree_csv_path="", pc_output=pc_out)
+                node_csv_path="", tree_csv_path="", pc_output=pc)
     end
 
     # Steps 2-6: Process each NBS
@@ -1377,9 +1377,9 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     end
 
     # Add QSM node IDs to point cloud and overwrite tree cloud on disk
-    pc_out = setattribute!(pc, :qsm_node_id, qsm_node_ids)
+    setattribute!(pc, :qsm_node_id, qsm_node_ids)
     if !isempty(tree_cloud_path)
-        write_pc(tree_cloud_path, pc_out)
+        write_pc(tree_cloud_path, pc)
         println("[qsm] Overwrote tree cloud with qsm_node_id: $tree_cloud_path")
     end
 
@@ -1389,7 +1389,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         n_trees = n_trees,
         node_csv_path = node_csv,
         tree_csv_path = tree_csv,
-        pc_output = pc_out,
+        pc_output = pc,
         qsm_surface_cloud = qsm_surface_cloud,
         surface_cloud_path = surf_cloud_path,
     )

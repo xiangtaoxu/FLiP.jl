@@ -441,8 +441,8 @@ function create_skeleton_cloud(
 
     # Build skeleton PointCloud
     skel_pc = PointCloud(skel_coords, Dict{Symbol,Vector}())
-    skel_pc = setattribute!(skel_pc, :node_id,  skel_nids)
-    skel_pc = setattribute!(skel_pc,  :n_points, skel_npts)
+    setattribute!(skel_pc, :node_id,  skel_nids)
+    setattribute!(skel_pc, :n_points, skel_npts)
 
     # Count point-wise cross-node edge connections
     edge_counts = Dict{Tuple{Int,Int}, Int}()
@@ -1138,10 +1138,11 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     end
 
     # ── Build output point cloud ─────────────────────────────────────────
-    pc_output = setattribute!(pc_filtered, :nbs_id, global_nbs_id)
-    pc_output = setattribute!(pc_output, :node_id, global_node_id)
-    pc_output = setattribute!(pc_output, :tree_id, global_tree_id)
-    pc_output = setattribute!(pc_output, :tree_nbs_id, global_tree_nbs_id)
+    setattribute!(pc_filtered, :nbs_id, global_nbs_id)
+    setattribute!(pc_filtered, :node_id, global_node_id)
+    setattribute!(pc_filtered, :tree_id, global_tree_id)
+    setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
+    pc_output = pc_filtered
 
     if !isempty(cfg.pipeline_output_dir)
         obj_path = joinpath(expanduser(cfg.pipeline_output_dir), "$(cfg.pipeline_output_prefix)skeleton_graph.obj")

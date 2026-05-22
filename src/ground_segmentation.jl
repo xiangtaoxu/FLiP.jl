@@ -249,8 +249,8 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
             idw_k=cfg.pipeline_idw_k,
             idw_power=cfg.pipeline_idw_power,
         )
-        pc_agh = setattribute!(pc_use, :AGH, agh)
-        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_agh, ground_area=ground_area)
+        setattribute!(pc_use, :AGH, agh)
+        return (ground_points=ground_points, aboveground_height=agh, agh_cloud=pc_use, ground_area=ground_area)
     end
 
     return (ground_points=ground_points, aboveground_height=Float64[], agh_cloud=pc_use, ground_area=ground_area)

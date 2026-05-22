@@ -78,9 +78,12 @@ function deleteattribute(pc::PointCloud, name::Symbol)
     return PointCloud(pc.coords, new_attrs)
 end
 
-"""Add or replace a scalar attribute. Returns a new point cloud (original is not mutated)."""
-function setattribute!(pc::PointCloud, attr::Symbol, values::Vector)
-    return addattribute(pc, attr, values)
+"""Add or replace a scalar attribute in place. Returns the (mutated) point cloud."""
+function setattribute!(pc::PointCloud, attr::Symbol, values::AbstractVector)
+    length(values) == npoints(pc) ||
+        throw(ArgumentError("attribute :$attr length $(length(values)) does not match point count $(npoints(pc))"))
+    pc.attrs[attr] = collect(values)
+    return pc
 end
 
 # ── Subsetting ─────────────────────────────────────────────────────
