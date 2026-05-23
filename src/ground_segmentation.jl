@@ -146,25 +146,28 @@ end
         xy_resolution::Real, idw_k::Int=8, idw_power::Real=2.0,
         ground_polygon::Union{Nothing,AbstractMatrix}=nothing) -> Vector{Float64}
 
-Compute above-ground height (AGH) for each point in `pc` by interpolating
-`ground_points` z values at the query XY via [`interpolate_idw`](@ref), then
-returning `z_query - z_interp`.
+Compute above-ground height (AGH) for each point in `pc`:
+1. Build a regular XY lattice covering the ground bbox at `xy_resolution`
+   spacing.
+2. Fill the lattice with IDW-interpolated z from the k nearest ground
+   points (one [`interpolate_idw`](@ref) call for the whole grid).
+3. For each query, snap to the nearest grid cell and return
+   `z_query - z_cell`.
 
-`xy_resolution` controls the maximum allowed distance from a query to its
-nearest known ground point: queries whose nearest ground sample is farther
-than `sqrt(2) * xy_resolution` get NaN. This preserves the spirit of the
-older grid-based cap (the diagonal of one grid cell) without materializing
-the intermediate grid.
+Queries whose nearest grid cell is farther than `sqrt(2) * xy_resolution`
+(i.e. outside the ground bbox by more than one cell diagonal) get NaN.
+Inside the bbox, even sparse-ground regions are interpolated — the grid
+provides spatial smoothing and bbox-wide z continuity.
 
 If `ground_polygon` is provided (M×2 vertex matrix), points outside the
-polygon also get NaN — useful when caller did not crop the cloud to the
-ground footprint and wants AGH masked off outside it.
+polygon also get NaN — useful when the caller did not crop the cloud to
+the ground footprint and wants AGH masked off outside it.
 
 # Arguments
 - `pc`: query cloud (N points)
 - `ground_points`: known ground samples (≥ 3 required)
-- `xy_resolution`: governs the "too far from ground" cap (must be > 0)
-- `idw_k`: IDW neighbors (must be ≥ 1)
+- `xy_resolution`: grid spacing in meters (must be > 0)
+- `idw_k`: IDW neighbors used to fill each grid cell (must be ≥ 1)
 - `idw_power`: IDW exponent (must be > 0)
 - `ground_polygon`: optional XY polygon for outside-footprint NaN masking
 """
@@ -186,25 +189,65 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     n = size(points, 1)
 
-    # Pointwise IDW directly on query XY — no intermediate regular grid.
-    # interpolate_idw handles non-finite queries and the max-distance cap.
-    z_interp = interpolate_idw(@view(ground_coords[:, 1:2]),
-                               @view(ground_coords[:, 3]),
-                               @view(points[:, 1:2]);
-                               k=idw_k, power=idw_power,
-                               max_distance=sqrt(2.0) * float(xy_resolution))
+    # 1. Ground XY bbox (single pass; also validates finiteness)
+    xmin = Inf; ymin = Inf
+    xmax = -Inf; ymax = -Inf
+    @inbounds for i in 1:size(ground_coords, 1)
+        x = float(ground_coords[i, 1])
+        y = float(ground_coords[i, 2])
+        z = float(ground_coords[i, 3])
+        (isfinite(x) && isfinite(y) && isfinite(z)) ||
+            throw(ArgumentError("ground_points contain non-finite values"))
+        x < xmin && (xmin = x); x > xmax && (xmax = x)
+        y < ymin && (ymin = y); y > ymax && (ymax = y)
+    end
 
+    # 2. Regular grid covering the bbox at xy_resolution spacing
+    step = float(xy_resolution)
+    nx = max(1, floor(Int, (xmax - xmin) / step) + 1)
+    ny = max(1, floor(Int, (ymax - ymin) / step) + 1)
+    n_grid = nx * ny
+    grid_xy = Matrix{Float64}(undef, n_grid, 2)
+    @inbounds for iy in 0:(ny - 1), ix in 0:(nx - 1)
+        row = iy * nx + ix + 1
+        grid_xy[row, 1] = xmin + ix * step
+        grid_xy[row, 2] = ymin + iy * step
+    end
+
+    # 3. One batched IDW call fills every grid cell from k nearest ground points
+    grid_z = interpolate_idw(@view(ground_coords[:, 1:2]),
+                             @view(ground_coords[:, 3]),
+                             grid_xy;
+                             k=idw_k, power=idw_power)
+
+    # 4. KDTree on grid samples (2 × n_grid layout for NearestNeighbors)
+    grid_xy_t = Matrix{Float64}(undef, 2, n_grid)
+    @inbounds for i in 1:n_grid
+        grid_xy_t[1, i] = grid_xy[i, 1]
+        grid_xy_t[2, i] = grid_xy[i, 2]
+    end
+    grid_tree = KDTree(grid_xy_t)
+    max_d = sqrt(2.0) * step
+
+    # 5. Snap each query to its nearest grid cell (threaded)
     agh = Vector{Float64}(undef, n)
     @inbounds Threads.@threads for i in 1:n
+        xq = float(points[i, 1])
+        yq = float(points[i, 2])
         zq = float(points[i, 3])
-        if !isfinite(zq) || !isfinite(z_interp[i])
+        if !(isfinite(xq) && isfinite(yq) && isfinite(zq))
+            agh[i] = NaN
+            continue
+        end
+        idxs, dists = knn(grid_tree, SVector(xq, yq), 1, true)
+        if dists[1] > max_d
             agh[i] = NaN
         else
-            agh[i] = zq - z_interp[i]
+            agh[i] = zq - grid_z[idxs[1]]
         end
     end
 
-    # Optional: NaN out points outside the ground footprint polygon.
+    # 6. Optional: NaN out points outside an explicit ground footprint polygon
     if ground_polygon !== nothing
         inside_idx = XY_polygon_filter(points, ground_polygon)
         inside_mask = falses(n)

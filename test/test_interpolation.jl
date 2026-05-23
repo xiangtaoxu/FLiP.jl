@@ -80,10 +80,27 @@ end
     @test agh[n_gnd + 1] ≈ 5.0 atol=0.5
     @test agh[n_gnd + 2] ≈ 10.0 atol=0.5
 
-    # Queries far from any ground sample → NaN
+    # Queries well outside the ground bbox → NaN
     far = make_test_pointcloud([1e6 1e6 0.0])
     agh_far = calculate_aboveground_height(far, ground_pc; xy_resolution=0.5)
     @test isnan(agh_far[1])
+
+    @testset "in-bbox sparse-ground queries are still interpolated" begin
+        # Regression for the bug where the Stage-4 pointwise IDW NaN'd out
+        # queries that sit inside the ground bbox but in a sparsely-sampled
+        # region. The restored grid-based AGH must give a finite value.
+        sparse_ground = [
+            0.0     0.0   0.0;
+            100.0   0.0   1.0;
+            100.0 100.0   2.0;
+            0.0   100.0   1.0;
+        ]
+        sparse_pc = make_test_pointcloud(sparse_ground)
+        query = make_test_pointcloud([50.0 50.0 5.0])
+        agh_sparse = calculate_aboveground_height(query, sparse_pc; xy_resolution=0.5)
+        @test isfinite(agh_sparse[1])
+        @test agh_sparse[1] ≈ 4.0 atol=0.5  # z_query=5, IDW of corners ≈ 1
+    end
 
     @testset "ground_polygon mask" begin
         # Tight polygon over only the first quadrant; second canopy point at (2.5, 7.5)
