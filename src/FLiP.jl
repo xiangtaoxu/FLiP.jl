@@ -55,7 +55,7 @@ include("util/pointcloud_utils.jl")
 include("preprocess.jl")
 include("ground_segmentation.jl")
 include("mesh.jl")
-include("graph.jl")
+include("util/graph_utils.jl")
 include("tree_segmentation.jl")
 include("qsm.jl")
 include("generate_report.jl")
@@ -110,7 +110,7 @@ export shortest_path_distances
 export shortest_path_subset!
 export slice_by_shortest_path
 export generate_proto_nodes_from_slice_label
-export greedy_connected_neighborhood_search
+export greedy_neighborhood_search
 export longest_linear_path
 export tree_segmentation
 export label_non_branching_segments

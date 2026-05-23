@@ -31,7 +31,7 @@ splits them into connected components via `connected_component_subset!`, and ret
 them ranked largest-first.
 
 **Subsequent iterations**: draws seeds from `frontier_buf` — rejected frontier CCs
-accumulated from prior `greedy_connected_neighborhood_search` calls. Filters out
+accumulated from prior `greedy_neighborhood_search` calls. Filters out
 already-labeled vertices, sorts the remainder by ascending z, and returns each as a
 single-point seed cluster. When `frontier_buf` is exhausted, falls back to the next
 lowest-z unlabeled point via `z_cursor` (O(1) amortised). Returns an empty vector when
@@ -208,7 +208,7 @@ end
     label_non_branching_segments(graph, points; cfg) -> NamedTuple
 
 Segment every vertex of `graph` into non-branching segments (NBS) using
-`greedy_connected_neighborhood_search`. Connected components smaller than
+`greedy_neighborhood_search`. Connected components smaller than
 `cfg.tree_min_nbs_size` are discarded upfront (label 0). Valid
 segments are relabeled by descending size (largest segment → label 1).
 
@@ -281,7 +281,7 @@ function label_non_branching_segments(
             end
             any_claimed && continue
 
-            result = greedy_connected_neighborhood_search(
+            result = greedy_neighborhood_search(
                 graph, start_vertices, neighbor_distance;
                 vertex_mask          = unlabeled_mask,
                 workspace            = gsws,

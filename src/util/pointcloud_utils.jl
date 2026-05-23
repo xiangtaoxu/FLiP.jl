@@ -1,6 +1,8 @@
 """
-Point-cloud filtering and subsampling. All functions accept an N×3
-coordinate matrix and return `Vector{Int}` indices of points to keep.
+Point-cloud filtering, subsampling, and connected-component labelling.
+Most functions accept an N×3 coordinate matrix and return `Vector{Int}`
+indices of points to keep; `connected_component_labels` instead returns
+a per-point label vector.
 
 Functions:
 - `distance_subsample(points, min_dist)`                       — keep points at least `min_dist` apart
@@ -12,6 +14,8 @@ Functions:
 - `upward_conic_filter(points, cone_theta_deg; max_search_delta_z)`
                                                                — drop points inside upward cones from kept points
 - `XY_polygon_filter(points, polygon)`                         — keep points inside XY polygon
+- `connected_component_labels(points, max_dist; min_cc_size=1)`
+                                                               — label exact Euclidean connected components
 """
 
 # ── Subsampling ───────────────────────────────────────────────────
@@ -291,7 +295,7 @@ function voxel_connected_component_filter(points::AbstractMatrix{<:Real}, voxel_
 
     # --- Step 3: Union adjacent occupied voxels (26-connectivity) ---
     parent = collect(1:nv)
-    rnk    = zeros(Int, nv)
+    ranks  = zeros(Int, nv)
 
     for vk in voxel_keys
         va = voxel_id[vk]
@@ -299,7 +303,7 @@ function voxel_connected_component_filter(points::AbstractMatrix{<:Real}, voxel_
         for dz in -1:1, dy in -1:1, dx in -1:1
             (dx == 0 && dy == 0 && dz == 0) && continue
             nb = get(voxel_id, (cx + dx, cy + dy, cz + dz), 0)
-            nb != 0 && _uf_union!(parent, rnk, va, nb)
+            nb != 0 && _uf_union!(parent, ranks, va, nb)
         end
     end
 
@@ -474,4 +478,61 @@ function XY_polygon_filter(points::AbstractMatrix{<:Real}, polygon::AbstractMatr
     end
 
     return findall(keep)
+end
+
+# ── Connected-component labelling ─────────────────────────────────
+
+"""
+    connected_component_labels(points::AbstractMatrix{<:Real}, max_distance::Real,
+                               min_cc_size::Integer=1) -> Vector{Int}
+
+Label exact Euclidean connected components in a point cloud.
+
+Two points are connected when their Euclidean distance is ≤ `max_distance`.
+Connectivity is computed exactly using KDTree radius queries plus
+union-find over points, without materializing a full graph.
+
+# Arguments
+- `points`: N×3 matrix of XYZ coordinates
+- `max_distance`: Maximum Euclidean distance for connectivity (must be > 0)
+- `min_cc_size`: Minimum component size to keep. Components with fewer
+    points are assigned label `0` (must be >= 1)
+
+# Returns
+- `Vector{Int}`: Contiguous component labels in `1:k` for retained
+    components, where label `1` is the largest retained component and
+    labels increase with decreasing component size. Components below
+    `min_cc_size` receive `0`.
+"""
+function connected_component_labels(points::AbstractMatrix{<:Real},
+                                    max_distance::Real,
+                                    min_cc_size::Integer=1)
+    size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
+    max_distance > 0 || throw(ArgumentError("max_distance must be > 0"))
+    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
+
+    n = size(points, 1)
+    n == 0 && return Int[]
+    n == 1 && return (min_cc_size == 1 ? [1] : [0])
+
+    T = eltype(points)
+    tree = KDTree(Matrix{T}(transpose(points)))
+    radius = float(max_distance)
+    parent = collect(1:n)
+    ranks  = zeros(Int, n)
+
+    @inbounds for i in 1:n
+        neighbors_i = inrange(tree, vec(@view points[i, :]), radius)
+        for j in neighbors_i
+            j > i || continue
+            _uf_union!(parent, ranks, i, j)
+        end
+    end
+
+    # Collapse paths so parent[i] == root(i) for every i, then map roots
+    # to contiguous frequency-rank labels (≥ min_cc_size; else 0).
+    @inbounds for i in eachindex(parent)
+        parent[i] = _uf_find!(parent, i)
+    end
+    return _filter_array_by_occurrence(parent, Int(min_cc_size))
 end
