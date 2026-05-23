@@ -43,7 +43,6 @@ neighbor_radius = -1.0         # If <= 0, defaults to 1.5 * pipeline.subsample_r
 frontier_min_cc_size = 3       # Minimum frontier CC size during NBS greedy expansion
 nbs_neighbor_distance = 2      # Hop distance for greedy NBS search
 min_nbs_size = 5               # Minimum points per NBS segment (also min CC size for tree graph)
-nbs_max_iterations = 10000     # Maximum NBS iterations
 linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
 assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
 assembly_occlusion_tolerance = 0.1  # Max distance (m) to search for nearby assigned points when rescuing orphan NBS

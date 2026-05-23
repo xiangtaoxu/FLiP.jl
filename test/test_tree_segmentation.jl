@@ -73,4 +73,37 @@
         @test isempty(seeded3.assigned_nbs)
         @test all(==(Int32(0)), tree_id3)
     end
+
+    @testset "Step 4.3 reorder: tree_nbs_id alone matches (tree_id, tree_nbs_id)" begin
+        # 7 points across 3 trees and 4 distinct (tree_id, tree_nbs_id) groups:
+        # group A (tree 1, nbs 7) has 3 points → should rank 1
+        # group B (tree 2, nbs 4) has 2 points → should rank 2
+        # group C (tree 3, nbs 9) has 1 point  → should rank 3
+        # plus a (tree 0, nbs 5) unassigned point → should end at 0
+        tree_id     = Int32[1, 1, 1, 2, 2, 3, 0]
+        tree_nbs_id = Int32[7, 7, 7, 4, 4, 9, 5]
+
+        # Reference: compound-key reorder (mirrors the old logic exactly)
+        groups = Dict{Tuple{Int32,Int32}, Vector{Int}}()
+        for i in eachindex(tree_id)
+            (tree_id[i] > 0 && tree_nbs_id[i] > 0) || continue
+            push!(get!(groups, (tree_id[i], tree_nbs_id[i]), Int[]), i)
+        end
+        sorted = sort!(collect(groups); by = kv -> -length(kv[2]))
+        expected = zeros(Int32, length(tree_id))
+        for (lbl, (_, pts)) in enumerate(sorted)
+            for i in pts
+                expected[i] = Int32(lbl)
+            end
+        end
+
+        # New path: zero out unassigned first, then relabel_by_occurrence
+        new_tnbs = copy(tree_nbs_id)
+        for i in eachindex(tree_id)
+            tree_id[i] == 0 && (new_tnbs[i] = Int32(0))
+        end
+        new_tnbs = relabel_by_occurrence(new_tnbs; positive_only=true, T_out=Int32)
+
+        @test new_tnbs == expected
+    end
 end

@@ -260,7 +260,6 @@ function label_non_branching_segments(
 
     min_segment_size       = cfg.tree_min_nbs_size
     neighbor_distance      = cfg.tree_nbs_neighbor_distance
-    max_iter               = cfg.tree_nbs_max_iterations
     nearground_agh_ceiling = cfg.tree_nearground_agh_threshold + 2.0 * cfg.pipeline_subsample_res
 
     global_nbs_id  = zeros(Int, N)
@@ -291,7 +290,7 @@ function label_non_branching_segments(
     last_pct_report  = 0
     t_nbs_start      = time()
 
-    while next_id - 1 < max_iter
+    while true
         seed_clusters = _find_seed_clusters(
             points, agh_values, nearground_agh_ceiling,
             unlabeled_mask, graph,
@@ -348,7 +347,6 @@ function label_non_branching_segments(
             end
 
             n_labeled_total += n_labeled
-            next_id - 1 >= max_iter && break
         end
 
         pct = round(Int, 100.0 * n_labeled_total / N)
@@ -753,30 +751,16 @@ function assemble_segments(
         @info "Assembly iteration $iteration: assigned $n_assigned_this_round NBS" total_assigned=length(assigned_nbs)
     end
 
-    # ── Step 4.3: re-order tree_nbs_id by descending (tree, NBS)-group size ─
-    # Rule B merges have already updated tree_nbs_id during growth, so groups are
-    # keyed by the final (tree_id, tree_nbs_id) pair.
-    group_points = Dict{Tuple{Int32, Int32}, Vector{Int}}()
-    @inbounds for i in 1:N
-        tid = tree_id[i]
-        nid = tree_nbs_id[i]
-        (tid > 0 && nid > 0) || continue
-        push!(get!(group_points, (tid, nid), Int[]), i)
-    end
-
-    sorted_groups = sort!(collect(group_points); by = kv -> -length(kv[2]))
-    global_label = Int32(1)
-    for (_, pts) in sorted_groups
-        @inbounds for i in pts
-            tree_nbs_id[i] = global_label
-        end
-        global_label += 1
-    end
-
-    # Zero out tree_nbs_id for unassigned points
+    # ── Step 4.3: re-order tree_nbs_id by descending group size ──────
+    # Within this assemble_segments call, every non-zero tree_nbs_id value belongs
+    # to exactly one tree: original NBS labels are unique 1..K, Rule A leaves them
+    # untouched, and Rule B adopts the target NBS's (already-unique) label. So
+    # keying by tree_nbs_id alone is equivalent to keying by (tree_id, tree_nbs_id)
+    # and lets us delegate to `relabel_by_occurrence`.
     @inbounds for i in 1:N
         tree_id[i] == 0 && (tree_nbs_id[i] = Int32(0))
     end
+    tree_nbs_id = relabel_by_occurrence(tree_nbs_id; positive_only=true, T_out=Int32)
 
     n_trees = length(unique(tid for tid in tree_id if tid > 0))
     n_assigned_pts = count(>(Int32(0)), tree_id)

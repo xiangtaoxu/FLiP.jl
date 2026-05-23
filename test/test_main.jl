@@ -247,7 +247,6 @@ min_cc_size = 2
 max_lcs_iterations = 10
 nbs_neighbor_distance = 2
 nbs_min_segment_size = 2
-nbs_max_iterations = 100
 linearity_angle_deg = 60.0
 """)
         end
