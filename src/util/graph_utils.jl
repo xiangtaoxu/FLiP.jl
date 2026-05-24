@@ -31,8 +31,9 @@ immediately above the function that uses it):
 """
 
 """
-    build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real)
-        -> NamedTuple{(:graph, :weights), Tuple{SimpleGraph{Int}, SparseMatrixCSC{Float64,Int}}}
+    build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real; weights::Bool=true)
+        -> NamedTuple{(:graph, :weights),
+                      Tuple{SimpleGraph{Int}, Union{Nothing,SparseMatrixCSC{Float64,Int}}}}
 
 Build an undirected radius-neighbor graph for a point cloud.
 
@@ -43,44 +44,59 @@ Euclidean edge lengths symmetrically.
 # Arguments
 - `points`: N×3 matrix of XYZ coordinates
 - `radius`: Neighborhood radius for edge creation (must be > 0)
+- `weights`: when `false`, skip the sparse weight matrix entirely and return
+  `weights=nothing` (saves ~3× `2·10·N` Int/Float64 triplet entries during
+  construction plus the held sparse matrix; appropriate when the caller only
+  needs the `SimpleGraph`).
 
 # Returns
-- `NamedTuple`: `graph` is a `SimpleGraph{Int}` and `weights` is a symmetric sparse
-  matrix of Euclidean edge lengths
+- `NamedTuple`: `graph` is a `SimpleGraph{Int}` and `weights` is either a
+  symmetric sparse matrix of Euclidean edge lengths or `nothing`.
 """
-function build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real)
+function build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real;
+                            weights::Bool=true)
     _validate_graph_points(points)
     radius > 0 || throw(ArgumentError("radius must be > 0"))
 
     n = size(points, 1)
     graph = SimpleGraph(n)
-    n == 0 && return (graph=graph, weights=spzeros(Float64, 0, 0))
+    if n == 0
+        return (graph=graph, weights=weights ? spzeros(Float64, 0, 0) : nothing)
+    end
 
     tree = _graph_kdtree(points)
     search_radius = float(radius)
+    nbr_buf = sizehint!(Int[], 64)
 
-    # Estimate edge count for pre-allocation (assume ~10 neighbors per point)
-    edge_estimate = 10 * n
-    rows = Int[];    sizehint!(rows, 2 * edge_estimate)
-    cols = Int[];    sizehint!(cols, 2 * edge_estimate)
-    vals = Float64[];sizehint!(vals, 2 * edge_estimate)
+    if weights
+        edge_estimate = 10 * n
+        rows = Int[];    sizehint!(rows, 2 * edge_estimate)
+        cols = Int[];    sizehint!(cols, 2 * edge_estimate)
+        vals = Float64[];sizehint!(vals, 2 * edge_estimate)
 
-    @inbounds for i in 1:n
-        neighbors_i = inrange(tree, vec(@view points[i, :]), search_radius)
-        for j in neighbors_i
-            j > i || continue
-            add_edge!(graph, i, j)
-            dij = _edge_distance(points, i, j)
-            push!(rows, i)
-            push!(cols, j)
-            push!(vals, dij)
-            push!(rows, j)
-            push!(cols, i)
-            push!(vals, dij)
+        @inbounds for i in 1:n
+            empty!(nbr_buf)
+            inrange!(nbr_buf, tree, vec(@view points[i, :]), search_radius)
+            for j in nbr_buf
+                j > i || continue
+                add_edge!(graph, i, j)
+                dij = _edge_distance(points, i, j)
+                push!(rows, i); push!(cols, j); push!(vals, dij)
+                push!(rows, j); push!(cols, i); push!(vals, dij)
+            end
         end
+        return (graph=graph, weights=sparse(rows, cols, vals, n, n))
+    else
+        @inbounds for i in 1:n
+            empty!(nbr_buf)
+            inrange!(nbr_buf, tree, vec(@view points[i, :]), search_radius)
+            for j in nbr_buf
+                j > i || continue
+                add_edge!(graph, i, j)
+            end
+        end
+        return (graph=graph, weights=nothing)
     end
-
-    return (graph=graph, weights=sparse(rows, cols, vals, n, n))
 end
 
 """

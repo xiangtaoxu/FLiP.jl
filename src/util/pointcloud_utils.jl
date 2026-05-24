@@ -541,11 +541,13 @@ function connected_component_labels(points::AbstractMatrix{<:Real},
     radius = float(max_distance)
     parent = collect(1:n)
     ranks  = zeros(Int, n)
+    nbr_buf = sizehint!(Int[], 64)
 
     @inbounds for i in 1:n
         q = SVector(points[i, 1], points[i, 2], points[i, 3])
-        neighbors_i = inrange(tree, q, radius)
-        for j in neighbors_i
+        empty!(nbr_buf)
+        inrange!(nbr_buf, tree, q, radius)
+        for j in nbr_buf
             j > i || continue
             _uf_union!(parent, ranks, i, j)
         end

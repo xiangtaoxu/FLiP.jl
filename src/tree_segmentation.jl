@@ -221,7 +221,7 @@ function _process_single_connected_component(cc_coords::AbstractMatrix{<:Real},
                                              cc_agh::AbstractVector{<:Real},
                                              neighbor_radius::Real;
                                              cfg::FLiPConfig)
-    g_res    = build_radius_graph(cc_coords, neighbor_radius)
+    g_res    = build_radius_graph(cc_coords, neighbor_radius; weights=false)
     nbs_res  = label_non_branching_segments(g_res.graph, cc_coords, cc_agh; cfg=cfg)
     skel_res = create_skeleton_cloud(g_res.graph, cc_coords, nbs_res.node_id)
     asm_res  = assemble_segments(g_res.graph, cc_coords,
@@ -859,7 +859,7 @@ function process_orphan_segments(
     # ── Source 1: radius graph among orphan points ───────────────
     @info "[tree_segmentation] orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
     orphan_coords = coords[orphan_pt_idx, :]
-    orphan_graph  = build_radius_graph(orphan_coords, occlusion_tol).graph
+    orphan_graph  = build_radius_graph(orphan_coords, occlusion_tol; weights=false).graph
 
     orphan_nbs_of_pt = zeros(Int, n_orphan_pts)
     @inbounds for (j, i) in enumerate(orphan_pt_idx)
