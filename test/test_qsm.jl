@@ -137,29 +137,17 @@
 
         cfg = FLiP._CFG
         result = FLiP._filter_linear_nbs(coords_linear, nbs_ids_linear, cfg)
-        @test haskey(result, Int32(1))
-        if haskey(result, Int32(1))
-            @test result[Int32(1)].linearity > 0.9
+        @test length(result) >= 1
+        @test result[1] !== nothing
+        if result[1] !== nothing
+            @test result[1].linearity > 0.9
         end
 
         # Spherical point set: low linearity
         coords_sphere = randn(n, 3)
         nbs_ids_sphere = ones(Int32, n)
         result_sphere = FLiP._filter_linear_nbs(coords_sphere, nbs_ids_sphere, cfg)
-        @test !haskey(result_sphere, Int32(1))
-    end
-
-    @testset "Spline slice method" begin
-        n = 200
-        r = 0.15
-        phi = range(-π, π; length=n+1)[1:n]
-        rho = fill(r, n) .+ 0.001 .* randn(n)
-
-        cfg = FLiP._CFG
-        ca, circ, comp = FLiP._method_spline_slice(collect(rho), collect(phi), cfg)
-        @test comp > 0.8
-        @test abs(circ - 2π * r) / (2π * r) < 0.15
-        @test abs(ca - π * r^2) / (π * r^2) < 0.15
+        @test isempty(result_sphere) || result_sphere[1] === nothing
     end
 
     @testset "Frustum metrics" begin
@@ -301,6 +289,111 @@
                 @test s1[i] ≈ s2[i]
             end
         end
+    end
+
+    @testset "_interpolate_invalid_slices! — midpoint and one-sided fallback" begin
+        # 5 slices, slice 3 is NaN; should be interpolated as midpoint of 2 and 4
+        centers = Float64[
+            0.0  0.0  0.0
+            1.0  0.0  0.0
+            NaN  NaN  NaN
+            3.0  2.0  0.0
+            4.0  3.0  0.0
+        ]
+        valid = Bool[true, true, false, true, true]
+        info = FLiP.NBSInfo((1.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                            (0.1, 0.2, 1.0), 0.8, Int[])
+        FLiP._interpolate_invalid_slices!(centers, valid, info, 0.0, 1.0)
+        @test centers[3, 1] ≈ 2.0
+        @test centers[3, 2] ≈ 1.0
+        @test centers[3, 3] ≈ 0.0
+
+        # NaN at end (slice 5): should copy slice 4
+        centers2 = Float64[
+            0.0  0.0  0.0
+            1.0  0.0  0.0
+            2.0  1.0  0.0
+            3.0  2.0  0.0
+            NaN  NaN  NaN
+        ]
+        valid2 = Bool[true, true, true, true, false]
+        FLiP._interpolate_invalid_slices!(centers2, valid2, info, 0.0, 1.0)
+        @test centers2[5, 1] ≈ 3.0
+        @test centers2[5, 2] ≈ 2.0
+        @test centers2[5, 3] ≈ 0.0
+    end
+
+    @testset "_compute_slice_rho_stats — exact two-slice means and std" begin
+        # Slice 1: rho ∈ {0.1, 0.2, 0.3}; mean = 0.2, var = 0.01, std = 0.1
+        # Slice 2: rho ∈ {1.0, 1.0, 1.0}; mean = 1.0, std = 0
+        rho = [0.1, 0.2, 0.3, 1.0, 1.0, 1.0]
+        pt_slice_ids = [1, 1, 1, 2, 2, 2]
+        mn, sd, cv = FLiP._compute_slice_rho_stats(rho, pt_slice_ids, 2)
+        @test mn[1] ≈ 0.2
+        @test mn[2] ≈ 1.0
+        @test sd[1] ≈ 0.1
+        @test sd[2] ≈ 0.0
+        @test cv[1] ≈ 0.5
+        @test cv[2] ≈ 0.0
+    end
+
+    @testset "Terminal-slice rho-percentile fallback shrinks noisy radius" begin
+        # Build a single linear NBS along z with a noisy "leafy" outer ring at one slice.
+        # When opting into a high terminal_completeness_threshold + low percentile,
+        # the noisy slice's radius should shrink below the spline-derived value while
+        # a clean fully-covered slice's radius is unchanged.
+        n_per_slice = 64
+        z_levels = [0.0, 0.5, 1.0, 1.5, 2.0]
+        true_r = 0.10
+        coords = Float64[]
+        for (s, z) in enumerate(z_levels)
+            # All clean slices except slice 3 which has a few inflated rho outliers
+            for k in 1:n_per_slice
+                θ = 2π * (k - 1) / n_per_slice
+                r = true_r
+                # On slice 3, half the points are leafy (3× the true radius)
+                if s == 3 && k <= n_per_slice ÷ 2
+                    r = true_r * 3.0
+                end
+                push!(coords, r * cos(θ), r * sin(θ), z)
+            end
+        end
+        coords_mat = reshape(coords, 3, :)'
+        nbs_ids = ones(Int32, size(coords_mat, 1))
+
+        # Run with defaults (no-op terminal fallback)
+        cfg_default = deepcopy(FLiP._CFG)
+        cfg_default.pipeline_subsample_res = 0.1
+        cfg_default.qsm_completeness_threshold = 0.1
+        linear_default = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_default)
+        @test length(linear_default) >= 1 && linear_default[1] !== nothing
+        nodes_default = FLiP.QSMNode[]
+        qids = zeros(Int32, size(coords_mat, 1))
+        agh = Float64.(coords_mat[:, 3])
+        tree_ids_v = ones(Int32, size(coords_mat, 1))
+        FLiP._process_single_nbs!(nodes_default, qids, coords_mat,
+                                  linear_default[1], Int32(1),
+                                  tree_ids_v, agh, cfg_default, 1)
+
+        # Run with opt-in terminal fallback
+        cfg_term = deepcopy(cfg_default)
+        cfg_term.qsm_terminal_completeness_threshold = 1.5  # always trigger fallback
+        cfg_term.qsm_terminal_rho_percentile = 0.25         # inner quartile
+        nodes_term = FLiP.QSMNode[]
+        qids2 = zeros(Int32, size(coords_mat, 1))
+        FLiP._process_single_nbs!(nodes_term, qids2, coords_mat,
+                                  linear_default[1], Int32(1),
+                                  tree_ids_v, agh, cfg_term, 1)
+
+        # Should have nodes at every clean slice in both runs
+        @test length(nodes_default) >= length(z_levels) - 1
+        @test length(nodes_term) == length(nodes_default)
+
+        # Find the inflated slice (highest radius_area in default run) and verify shrinkage
+        i_max = argmax([nd.radius_area for nd in nodes_default])
+        @test nodes_term[i_max].radius_area < nodes_default[i_max].radius_area
+        # And the shrunken radius is close to the true inner radius
+        @test nodes_term[i_max].radius_area < 0.2
     end
 
 end

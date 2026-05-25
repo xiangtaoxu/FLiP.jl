@@ -62,6 +62,8 @@ mutable struct FLiPConfig
     qsm_rho_percentile::Float64
     qsm_min_octant_taubin::Int
     qsm_min_octant_centroid::Int
+    qsm_terminal_completeness_threshold::Float64
+    qsm_terminal_rho_percentile::Float64
 
     # coordinate precision
     coordinate_precision::DataType
@@ -134,6 +136,9 @@ function FLiPConfig(d::Dict)
         Float64(get(qm, "rho_percentile", 1.0)),
         Int(get(qm, "min_octant_taubin", 3)),
         Int(get(qm, "min_octant_centroid", 5)),
+        Float64(get(qm, "terminal_completeness_threshold",
+                        get(qm, "completeness_threshold", 0.25))),
+        Float64(get(qm, "terminal_rho_percentile", 1.0)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

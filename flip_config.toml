@@ -61,6 +61,8 @@ spl_z_smoothing = 0.3           # Cross-slice smoothing weight for spline method
 rho_percentile = 1.0            # Rho percentile filter per bin (1.0=mean of all, <1.0=discard outer fraction, shrinks toward inner surface)
 min_octant_taubin = 3           # Min distinct angular octants (of 8) for a slice to use Taubin circle fit
 min_octant_centroid = 5         # Min distinct angular octants (of 8) for a slice to use centroid fallback; below this the slice is deferred to neighbor interpolation
+terminal_completeness_threshold = 0.25  # Below this fraction of filled phi-bins, override the spline-derived radius with a rho-percentile estimate (default = completeness_threshold = no-op since such slices are already dropped)
+terminal_rho_percentile = 1.0   # Percentile of rho for the terminal-slice fallback radius (1.0 = mean = no shrinkage; 0.5 = median; lower → shrinks toward inner wood, reduces overestimation from leafy/noisy outer points)
 
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation
