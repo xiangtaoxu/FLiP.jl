@@ -61,7 +61,6 @@ mutable struct FLiPConfig
     qsm_spl_z_smoothing::Float64
     qsm_rho_percentile::Float64
     qsm_min_octant_taubin::Int
-    qsm_min_octant_centroid::Int
     qsm_terminal_completeness_threshold::Float64
     qsm_terminal_rho_percentile::Float64
 
@@ -135,7 +134,6 @@ function FLiPConfig(d::Dict)
         Float64(get(qm, "spl_z_smoothing", 0.3)),
         Float64(get(qm, "rho_percentile", 1.0)),
         Int(get(qm, "min_octant_taubin", 3)),
-        Int(get(qm, "min_octant_centroid", 5)),
         Float64(get(qm, "terminal_completeness_threshold",
                         get(qm, "completeness_threshold", 0.25))),
         Float64(get(qm, "terminal_rho_percentile", 1.0)),

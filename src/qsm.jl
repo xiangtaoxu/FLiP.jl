@@ -346,7 +346,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     # 2a: Slice, fit centers, smooth
     centers, slice_point_indices, _, _, pt_slice_ids, e1, e2 =
         _slice_and_fit_centers(coords, info, slice_res, cfg.qsm_min_node_size,
-                               cfg.qsm_min_octant_taubin, cfg.qsm_min_octant_centroid)
+                               cfg.qsm_min_octant_taubin)
     _smooth_centerline!(centers)
 
     # 2b: Unroll points to (rho, phi) and compute per-slice rho statistics
@@ -460,8 +460,7 @@ and scalar t-values (projection on PC1) per point.
 """
 function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
                                 slice_res::Float64, min_node_size::Int,
-                                min_octant_taubin::Int=3,
-                                min_octant_centroid::Int=5)
+                                min_octant_taubin::Int=3)
     d = info.direction
     cx, cy, cz = info.center
     indices = info.point_indices
@@ -526,13 +525,22 @@ function _slice_and_fit_centers(coords::AbstractMatrix{<:Real}, info::NBSInfo,
         local cu::Float64, cv::Float64
         if ns >= 10 && n_octants >= min_octant_taubin
             cu, cv, _ = taubin_circle_fit(u_arr, v_arr)
-        elseif n_octants >= min_octant_centroid
+
+            # Post-hoc octant check around the Taubin-fitted center: a pathologically
+            # large radius places the center far outside the slice, collapsing the
+            # angular spread seen from there. Fall back to centroid in that case.
+            post_covered = falses(8)
+            @inbounds for k in 1:ns
+                oct = clamp(floor(Int,
+                    (atan(v_arr[k] - cv, u_arr[k] - cu) + π) / OCTANT_WIDTH) + 1, 1, 8)
+                post_covered[oct] = true
+            end
+            if count(post_covered) < min_octant_taubin
+                cu = mean(u_arr); cv = mean(v_arr)
+            end
+        else
             cu = mean(u_arr)
             cv = mean(v_arr)
-        else
-            # Insufficient angular coverage — defer to neighbor interpolation
-            centers_3d[s, :] .= NaN
-            continue
         end
         valid_slices[s] = true
 
