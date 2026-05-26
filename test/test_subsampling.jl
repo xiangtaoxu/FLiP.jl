@@ -9,14 +9,14 @@
         ]
         
         # With min distance 0.1, should keep points 1 and 3
-        indices = distance_subsample_indices(coords, 0.1)
+        indices = distance_subsample(coords, 0.1)
         @test length(indices) == 2
         @test 1 in indices
         @test 3 in indices
         
-        # Test with PointCloud
+        # Test with PointCloud (index form)
         pc = make_test_pointcloud(coords)
-        pc_sub = distance_subsample(pc, 0.1)
+        pc_sub = pc[distance_subsample(coordinates(pc), 0.1)]
         @test length(pc_sub) == 2
         
         # Test that kept points maintain minimum distance
@@ -29,9 +29,9 @@
         end
         
         # Test error handling
-        @test_throws ArgumentError distance_subsample_indices(coords, 0.0)
-        @test_throws ArgumentError distance_subsample_indices(coords, -1.0)
-        @test_throws ArgumentError distance_subsample_indices(rand(10, 2), 0.1)
+        @test_throws ArgumentError distance_subsample(coords, 0.0)
+        @test_throws ArgumentError distance_subsample(coords, -1.0)
+        @test_throws ArgumentError distance_subsample(rand(10, 2), 0.1)
     end
     
     @testset "Subsampling preserves attributes" begin
@@ -40,7 +40,7 @@
         pc = make_test_pointcloud(coords; attrs=Dict(:test_attr => test_attr))
         
         # Distance
-        pc_dist = distance_subsample(pc, 0.1)
+        pc_dist = pc[distance_subsample(coordinates(pc), 0.1)]
         @test hasattribute(pc_dist, :test_attr)
         @test length(getattribute(pc_dist, :test_attr)) == length(pc_dist)
     end

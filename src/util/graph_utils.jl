@@ -1,57 +1,39 @@
 """
-    connected_component_labels(points::AbstractMatrix{<:Real}, max_distance::Real,
-                               min_cc_size::Integer=1) -> Vector{Int}
+Graph algorithms used by tree segmentation. Most functions either operate on
+`SimpleGraph` + weight matrices, or build such a graph from a point-cloud
+N×3 coordinate matrix.
 
-Label exact Euclidean connected components in a point cloud.
+Functions:
+- `build_radius_graph(points, radius)`               — KDTree-radius graph + weights
+- `build_graph(graph, points, comp_idx, vidx)`       — induce subgraph for a component
+- `quotient_graph(points, graph, labels)`            — collapse vertices by label
+- `shortest_path_distances(points, graph, weights, target)` — Dijkstra from a target
+- `shortest_path_subset!(ws, graph, weights, subset, target)`
+                                                     — Dijkstra restricted to a vertex subset
+- `connected_component_subset!(ws, graph, subset; min_cc_size)`
+                                                     — subset-restricted CC via BFS
+- `slice_by_shortest_path(points, graph, weights, target, slice_len)`
+                                                     — bucket vertices by SP distance
+- `generate_proto_nodes_from_slice_label(points, slice_labels, max_dist; min_cc_size)`
+                                                     — proto-node labels from slices
+- `greedy_neighborhood_search(graph, starts, dist; …)`
+                                                     — NBS-style frontier expansion
+- `longest_linear_path(graph, points, root; edge_vectors)`
+                                                     — root-origin angular linear path
+- `graph_connected_component_labels(graph, min_cc_size=1)`
+                                                     — vertex labels ranked by component size
 
-Two points are connected when their Euclidean distance is less than or equal to
-`max_distance`. Connectivity is computed exactly using KDTree radius queries and
-union-find over points, without materializing a full graph.
-
-# Arguments
-- `points`: N×3 matrix of XYZ coordinates
-- `max_distance`: Maximum Euclidean distance for connectivity (must be > 0)
-- `min_cc_size`: Minimum component size to keep. Components with fewer points are
-    assigned label `0` (must be >= 1)
-
-# Returns
-- `Vector{Int}`: Contiguous component labels in `1:k` for retained components,
-    where label `1` is the largest retained component; labels increase with
-    decreasing retained component size. Components below `min_cc_size` receive `0`.
+Workspaces (pre-allocated buffers for repeated calls; each is defined
+immediately above the function that uses it):
+- `ConnectedComponentSubsetWorkspace`
+- `ShortestPathSubsetWorkspace`
+- `GreedySearchWorkspace`
 """
-function connected_component_labels(points::AbstractMatrix{<:Real}, max_distance::Real,
-                                    min_cc_size::Integer)
-    _validate_graph_points(points)
-    max_distance > 0 || throw(ArgumentError("max_distance must be > 0"))
-    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
-
-    n = size(points, 1)
-    n == 0 && return Int[]
-    n == 1 && return (min_cc_size == 1 ? [1] : [0])
-
-    tree = _graph_kdtree(points)
-    radius = float(max_distance)
-    parent = collect(1:n)
-    rnk = zeros(Int, n)
-
-    @inbounds for i in 1:n
-        neighbors_i = inrange(tree, vec(@view points[i, :]), radius)
-        for j in neighbors_i
-            j > i || continue
-            _uf_union!(parent, rnk, i, j)
-        end
-    end
-
-    return _compact_component_labels_by_size!(parent, Int(min_cc_size))
-end
-
-function connected_component_labels(points::AbstractMatrix{<:Real}, max_distance::Real)
-    return connected_component_labels(points, max_distance, 1)
-end
 
 """
-    build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real)
-        -> NamedTuple{(:graph, :weights), Tuple{SimpleGraph{Int}, SparseMatrixCSC{Float64,Int}}}
+    build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real; weights::Bool=true)
+        -> NamedTuple{(:graph, :weights),
+                      Tuple{SimpleGraph{Int}, Union{Nothing,SparseMatrixCSC{Float64,Int}}}}
 
 Build an undirected radius-neighbor graph for a point cloud.
 
@@ -62,44 +44,59 @@ Euclidean edge lengths symmetrically.
 # Arguments
 - `points`: N×3 matrix of XYZ coordinates
 - `radius`: Neighborhood radius for edge creation (must be > 0)
+- `weights`: when `false`, skip the sparse weight matrix entirely and return
+  `weights=nothing` (saves ~3× `2·10·N` Int/Float64 triplet entries during
+  construction plus the held sparse matrix; appropriate when the caller only
+  needs the `SimpleGraph`).
 
 # Returns
-- `NamedTuple`: `graph` is a `SimpleGraph{Int}` and `weights` is a symmetric sparse
-  matrix of Euclidean edge lengths
+- `NamedTuple`: `graph` is a `SimpleGraph{Int}` and `weights` is either a
+  symmetric sparse matrix of Euclidean edge lengths or `nothing`.
 """
-function build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real)
+function build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real;
+                            weights::Bool=true)
     _validate_graph_points(points)
     radius > 0 || throw(ArgumentError("radius must be > 0"))
 
     n = size(points, 1)
     graph = SimpleGraph(n)
-    n == 0 && return (graph=graph, weights=spzeros(Float64, 0, 0))
+    if n == 0
+        return (graph=graph, weights=weights ? spzeros(Float64, 0, 0) : nothing)
+    end
 
     tree = _graph_kdtree(points)
     search_radius = float(radius)
+    nbr_buf = sizehint!(Int[], 64)
 
-    # Estimate edge count for pre-allocation (assume ~10 neighbors per point)
-    edge_estimate = 10 * n
-    rows = Int[];    sizehint!(rows, 2 * edge_estimate)
-    cols = Int[];    sizehint!(cols, 2 * edge_estimate)
-    vals = Float64[];sizehint!(vals, 2 * edge_estimate)
+    if weights
+        edge_estimate = 10 * n
+        rows = Int[];    sizehint!(rows, 2 * edge_estimate)
+        cols = Int[];    sizehint!(cols, 2 * edge_estimate)
+        vals = Float64[];sizehint!(vals, 2 * edge_estimate)
 
-    @inbounds for i in 1:n
-        neighbors_i = inrange(tree, vec(@view points[i, :]), search_radius)
-        for j in neighbors_i
-            j > i || continue
-            add_edge!(graph, i, j)
-            dij = _edge_distance(points, i, j)
-            push!(rows, i)
-            push!(cols, j)
-            push!(vals, dij)
-            push!(rows, j)
-            push!(cols, i)
-            push!(vals, dij)
+        @inbounds for i in 1:n
+            empty!(nbr_buf)
+            inrange!(nbr_buf, tree, vec(@view points[i, :]), search_radius)
+            for j in nbr_buf
+                j > i || continue
+                add_edge!(graph, i, j)
+                dij = _edge_distance(points, i, j)
+                push!(rows, i); push!(cols, j); push!(vals, dij)
+                push!(rows, j); push!(cols, i); push!(vals, dij)
+            end
         end
+        return (graph=graph, weights=sparse(rows, cols, vals, n, n))
+    else
+        @inbounds for i in 1:n
+            empty!(nbr_buf)
+            inrange!(nbr_buf, tree, vec(@view points[i, :]), search_radius)
+            for j in nbr_buf
+                j > i || continue
+                add_edge!(graph, i, j)
+            end
+        end
+        return (graph=graph, weights=nothing)
     end
-
-    return (graph=graph, weights=sparse(rows, cols, vals, n, n))
 end
 
 """
@@ -236,6 +233,13 @@ function build_graph(graph::SimpleGraph{Int}, points::AbstractMatrix{<:Real},
     return (graph=comp_graph, weights=sparse(rows, cols, vals, n_local, n_local))
 end
 
+"""
+    ConnectedComponentSubsetWorkspace(n_vertices)
+
+Reusable scratch space for [`connected_component_subset!`](@ref).
+Pre-allocate once with `ConnectedComponentSubsetWorkspace(nv(graph))`
+to avoid per-call allocation of O(N) arrays.
+"""
 mutable struct ConnectedComponentSubsetWorkspace
     allowed::BitVector
     visited::BitVector
@@ -247,84 +251,6 @@ function ConnectedComponentSubsetWorkspace(n_vertices::Integer)
     n_vertices >= 0 || throw(ArgumentError("n_vertices must be >= 0"))
     n = Int(n_vertices)
     return ConnectedComponentSubsetWorkspace(falses(n), falses(n), zeros(Int, n), Int[])
-end
-
-mutable struct ShortestPathSubsetWorkspace
-    allowed::BitVector
-    visited::BitVector
-    local_index::Vector{Int}
-    distances::Vector{Float64}
-    parents::Vector{Int}
-    heap_vertices::Vector{Int}
-    heap_dists::Vector{Float64}
-end
-
-function ShortestPathSubsetWorkspace(n_vertices::Integer)
-    n_vertices >= 0 || throw(ArgumentError("n_vertices must be >= 0"))
-    n = Int(n_vertices)
-    return ShortestPathSubsetWorkspace(
-        falses(n),
-        falses(n),
-        zeros(Int, n),
-        fill(Inf, n),
-        zeros(Int, n),
-        Int[],
-        Float64[],
-    )
-end
-
-"""
-    GreedySearchWorkspace
-
-Reusable scratch space for `greedy_connected_neighborhood_search`.
-
-Pre-allocate once with `GreedySearchWorkspace(nv(graph))` and pass via the
-`workspace` keyword to avoid per-call allocation of O(N) arrays.
-"""
-mutable struct GreedySearchWorkspace
-    mask_allowed::BitVector      # eligible vertices for this call
-    included::BitVector          # vertices accepted into the grown region
-    in_queue::BitVector          # BFS dedup flag (reset via touched_queue)
-    node_id_map::Vector{Int}     # per-vertex frontier wave ID
-    touched_queue::Vector{Int}   # indices set in in_queue this BFS round
-    layer_a::Vector{Int}         # BFS double-buffer A
-    layer_b::Vector{Int}         # BFS double-buffer B
-    new_pts::Vector{Int}         # neighborhood candidates collected each round
-    new_frontier::Vector{Int}    # accepted next frontier after CC check
-    vertices_buf::Vector{Int}    # accumulates all accepted vertices
-    cc_ws::ConnectedComponentSubsetWorkspace
-    # Incremental per-node centroid accumulators (indexed by node_id, push!-grown)
-    node_sum_x::Vector{Float64}
-    node_sum_y::Vector{Float64}
-    node_sum_z::Vector{Float64}
-    node_count::Vector{Int}
-    # Per-CC scratch buffers for _find_best_frontier (reused each iteration)
-    frontier_cc_cx::Vector{Float64}
-    frontier_cc_cy::Vector{Float64}
-    frontier_cc_cz::Vector{Float64}
-    frontier_cc_count::Vector{Int}
-end
-
-function GreedySearchWorkspace(n_vertices::Integer)
-    n_vertices >= 0 || throw(ArgumentError("n_vertices must be >= 0"))
-    n = Int(n_vertices)
-    return GreedySearchWorkspace(
-        falses(n), falses(n), falses(n),
-        zeros(Int, n),
-        sizehint!(Int[], 512),
-        sizehint!(Int[], 64), sizehint!(Int[], 64),
-        sizehint!(Int[], 256), sizehint!(Int[], 64),
-        sizehint!(Int[], 256),
-        ConnectedComponentSubsetWorkspace(n),
-        sizehint!(Float64[], 64),
-        sizehint!(Float64[], 64),
-        sizehint!(Float64[], 64),
-        sizehint!(Int[], 64),
-        sizehint!(Float64[], 8),
-        sizehint!(Float64[], 8),
-        sizehint!(Float64[], 8),
-        sizehint!(Int[], 8),
-    )
 end
 
 """
@@ -412,6 +338,37 @@ function connected_component_subset!(graph::SimpleGraph{Int},
                                      min_cc_size::Integer=1)
     workspace = ConnectedComponentSubsetWorkspace(nv(graph))
     return connected_component_subset!(workspace, graph, subset, min_cc_size)
+end
+
+"""
+    ShortestPathSubsetWorkspace(n_vertices)
+
+Reusable scratch space for [`shortest_path_subset!`](@ref).
+Pre-allocate once with `ShortestPathSubsetWorkspace(nv(graph))` to
+avoid per-call allocation of O(N) arrays (and the Dijkstra heap).
+"""
+mutable struct ShortestPathSubsetWorkspace
+    allowed::BitVector
+    visited::BitVector
+    local_index::Vector{Int}
+    distances::Vector{Float64}
+    parents::Vector{Int}
+    heap_vertices::Vector{Int}
+    heap_dists::Vector{Float64}
+end
+
+function ShortestPathSubsetWorkspace(n_vertices::Integer)
+    n_vertices >= 0 || throw(ArgumentError("n_vertices must be >= 0"))
+    n = Int(n_vertices)
+    return ShortestPathSubsetWorkspace(
+        falses(n),
+        falses(n),
+        zeros(Int, n),
+        fill(Inf, n),
+        zeros(Int, n),
+        Int[],
+        Float64[],
+    )
 end
 
 """
@@ -809,10 +766,63 @@ function longest_linear_path(graph::SimpleGraph{Int}, points::AbstractMatrix{<:R
 end
 
 """
-    greedy_connected_neighborhood_search(graph, start_vertices, neighbor_distance;
-                                         vertex_mask=nothing, workspace=nothing,
-                                         points=nothing, linearity_angle_deg=80.0,
-                                         min_frontier_cc_size=1)
+    GreedySearchWorkspace(n_vertices)
+
+Reusable scratch space for [`greedy_neighborhood_search`](@ref).
+Pre-allocate once with `GreedySearchWorkspace(nv(graph))` and pass via
+the `workspace` keyword to avoid per-call allocation of O(N) arrays.
+"""
+mutable struct GreedySearchWorkspace
+    mask_allowed::BitVector      # eligible vertices for this call
+    included::BitVector          # vertices accepted into the grown region
+    in_queue::BitVector          # BFS dedup flag (reset via touched_queue)
+    node_id_map::Vector{Int}     # per-vertex frontier wave ID
+    touched_queue::Vector{Int}   # indices set in in_queue this BFS round
+    layer_a::Vector{Int}         # BFS double-buffer A
+    layer_b::Vector{Int}         # BFS double-buffer B
+    new_pts::Vector{Int}         # neighborhood candidates collected each round
+    new_frontier::Vector{Int}    # accepted next frontier after CC check
+    vertices_buf::Vector{Int}    # accumulates all accepted vertices
+    cc_ws::ConnectedComponentSubsetWorkspace
+    # Incremental per-node centroid accumulators (indexed by node_id, push!-grown)
+    node_sum_x::Vector{Float64}
+    node_sum_y::Vector{Float64}
+    node_sum_z::Vector{Float64}
+    node_count::Vector{Int}
+    # Per-CC scratch buffers for _find_best_frontier (reused each iteration)
+    frontier_cc_cx::Vector{Float64}
+    frontier_cc_cy::Vector{Float64}
+    frontier_cc_cz::Vector{Float64}
+    frontier_cc_count::Vector{Int}
+end
+
+function GreedySearchWorkspace(n_vertices::Integer)
+    n_vertices >= 0 || throw(ArgumentError("n_vertices must be >= 0"))
+    n = Int(n_vertices)
+    return GreedySearchWorkspace(
+        falses(n), falses(n), falses(n),
+        zeros(Int, n),
+        sizehint!(Int[], 512),
+        sizehint!(Int[], 64), sizehint!(Int[], 64),
+        sizehint!(Int[], 256), sizehint!(Int[], 64),
+        sizehint!(Int[], 256),
+        ConnectedComponentSubsetWorkspace(n),
+        sizehint!(Float64[], 64),
+        sizehint!(Float64[], 64),
+        sizehint!(Float64[], 64),
+        sizehint!(Int[], 64),
+        sizehint!(Float64[], 8),
+        sizehint!(Float64[], 8),
+        sizehint!(Float64[], 8),
+        sizehint!(Int[], 8),
+    )
+end
+
+"""
+    greedy_neighborhood_search(graph, start_vertices, neighbor_distance;
+                               vertex_mask=nothing, workspace=nothing,
+                               points=nothing, linearity_angle_deg=80.0,
+                               min_frontier_cc_size=1)
         -> NamedTuple{(:vertices, :node_ids, :max_node_id)}
 
 Greedy connectivity expansion starting from one or more seed vertices `start_vertices`.
@@ -858,7 +868,7 @@ sequential structure of the expanded path.
     `node_id == 1` for all seed vertices, incrementing by 1 for each accepted frontier wave
   - `max_node_id`: highest frontier ID assigned (equals number of frontier waves)
 """
-function greedy_connected_neighborhood_search(
+function greedy_neighborhood_search(
     graph::SimpleGraph{Int},
     start_vertices::AbstractVector{<:Integer},
     neighbor_distance::Integer;
@@ -1615,37 +1625,6 @@ end
     return sqrt(dx * dx + dy * dy + dz * dz)
 end
 
-function _compact_component_labels_by_size!(parent::Vector{Int}, min_cc_size::Int=1)
-    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
-
-    labels = zeros(Int, length(parent))
-    root_sizes = Dict{Int, Int}()
-
-    @inbounds for i in eachindex(parent)
-        root = _uf_find!(parent, i)
-        root_sizes[root] = get(root_sizes, root, 0) + 1
-    end
-
-    roots = collect(keys(root_sizes))
-    sort!(roots; by=r -> (-root_sizes[r], r))
-
-    root_to_label = Dict{Int, Int}()
-    next_label = 1
-    for root in roots
-        if root_sizes[root] >= min_cc_size
-            root_to_label[root] = next_label
-            next_label += 1
-        end
-    end
-
-    @inbounds for i in eachindex(parent)
-        root = _uf_find!(parent, i)
-        labels[i] = get(root_to_label, root, 0)
-    end
-
-    return labels
-end
-
 function _validate_shortest_path_inputs(points::AbstractMatrix{<:Real}, graph::SimpleGraph{Int},
                                         weights::SparseMatrixCSC{<:Real,<:Integer})
     _validate_graph_points(points)
@@ -1907,4 +1886,40 @@ function _select_linear_neighbor(previous::Int, current::Int, candidates::Vector
     end
 
     return best
+end
+
+"""
+    graph_connected_component_labels(graph::SimpleGraph{Int},
+                                     min_cc_size::Integer=1) -> Vector{Int}
+
+Label graph connected components by descending component size. Components smaller
+than `min_cc_size` receive label `0`; valid components receive labels `1..K` with
+`1` = largest. Returns a `Vector{Int}` of length `nv(graph)`.
+
+Distinct from `connected_component_labels(points, max_distance, …)` in
+`pointcloud_utils.jl`, which builds a union-find over raw XYZ coordinates rather
+than operating on a pre-built graph.
+"""
+function graph_connected_component_labels(graph::SimpleGraph{Int},
+                                          min_cc_size::Integer=1)
+    min_cc_size >= 1 || throw(ArgumentError("min_cc_size must be >= 1"))
+
+    n = nv(graph)
+    n == 0 && return Int[]
+
+    labels = zeros(Int, n)
+    components = connected_components(graph)
+    order = sortperm(length.(components); rev=true)
+
+    next_label = 1
+    for idx in order
+        comp = components[idx]
+        length(comp) >= min_cc_size || continue
+        @inbounds for v in comp
+            labels[v] = next_label
+        end
+        next_label += 1
+    end
+
+    return labels
 end

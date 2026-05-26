@@ -39,23 +39,23 @@ import Graphs
         @test_throws ArgumentError connected_component_labels(coords, 0.5, 0)
     end
 
-    @testset "Connected component labels from graph" begin
+    @testset "graph_connected_component_labels" begin
         graph = Graphs.SimpleGraph(6)
         Graphs.add_edge!(graph, 1, 2)
         Graphs.add_edge!(graph, 2, 3)
         Graphs.add_edge!(graph, 4, 5)
 
-        labels = connected_component_labels(graph)
+        labels = graph_connected_component_labels(graph)
         @test labels == [1, 1, 1, 2, 2, 3]
 
-        labels_min2 = connected_component_labels(graph, 2)
+        labels_min2 = graph_connected_component_labels(graph, 2)
         @test labels_min2 == [1, 1, 1, 2, 2, 0]
 
-        labels_min4 = connected_component_labels(graph, 4)
+        labels_min4 = graph_connected_component_labels(graph, 4)
         @test labels_min4 == [0, 0, 0, 0, 0, 0]
 
-        @test connected_component_labels(Graphs.SimpleGraph(0)) == Int[]
-        @test_throws ArgumentError connected_component_labels(graph, 0)
+        @test graph_connected_component_labels(Graphs.SimpleGraph(0)) == Int[]
+        @test_throws ArgumentError graph_connected_component_labels(graph, 0)
     end
 
     @testset "Connected components on subset" begin
@@ -266,13 +266,6 @@ import Graphs
         @test_throws ArgumentError generate_proto_nodes_from_slice_label(coords, slice_labels, 0.0)
         @test_throws ArgumentError generate_proto_nodes_from_slice_label(coords, slice_labels, 0.15, 0)
         @test_throws ArgumentError generate_proto_nodes_from_slice_label(rand(7, 2), slice_labels, 0.15)
-
-        graph_res = build_radius_graph(coords, 0.15)
-        proto_nodes_graph = generate_proto_nodes_from_slice_label(coords, graph_res.graph, slice_labels, min_cc_size=1)
-        @test proto_nodes_graph == proto_nodes
-
-        @test_throws ArgumentError generate_proto_nodes_from_slice_label(coords, graph_res.graph, slice_labels[1:6], min_cc_size=1)
-        @test_throws ArgumentError generate_proto_nodes_from_slice_label(rand(7, 2), graph_res.graph, slice_labels, min_cc_size=1)
     end
 
     @testset "Longest linear path" begin

@@ -59,6 +59,108 @@ function _jl_to_numpy(vec::Vector{T}) where T
     return _np.array(Py(vec), copy=true)
 end
 
+# ── Input/output file-path helpers ────────────────────────────────
+
+"""
+    find_input_files(; cfg::FLiPConfig=_CFG) -> Vector{String}
+
+Discover input point cloud files from the configured `pipeline_input_path`.
+
+If `pipeline_input_path` points to a single file, returns `[input_path]`.
+If it points to a directory, returns all files matching
+`{input_prefix}*.{input_format}` sorted alphabetically. Errors when the
+directory exists but contains no matching files.
+"""
+function find_input_files(; cfg::FLiPConfig=_CFG)
+    input_path = cfg.pipeline_input_path
+    prefix = cfg.pipeline_input_prefix
+    fmt = lowercase(cfg.pipeline_input_format)
+
+    # Single file mode
+    if isfile(input_path)
+        return [input_path]
+    end
+
+    # Directory mode
+    isdir(input_path) || error("input_path is not a file or directory: $input_path")
+    ext = "." * fmt
+    files = sort(filter(readdir(input_path; join=true)) do f
+        bn = basename(f)
+        startswith(bn, prefix) && endswith(lowercase(bn), ext)
+    end)
+    isempty(files) && error("No .$(fmt) files matching prefix '$(prefix)' found in: $input_path")
+    return files
+end
+
+"""
+    get_output_path(dir, prefix, stem, fmt) -> String
+
+Build the single-file output path `{dir}/{prefix}{stem}.{fmt}`. Pure string
+construction; does not touch the filesystem.
+"""
+get_output_path(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString) =
+    joinpath(dir, "$(prefix)$(stem).$(fmt)")
+
+"""
+    get_scan_output_path(dir, prefix, stem, fmt, i) -> String
+
+Build the per-scan output path `{dir}/{prefix}{stem}_S{i}.{fmt}`. Used when a
+stage produces one output per input scan (multi-file mode).
+"""
+get_scan_output_path(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString, i::Integer) =
+    joinpath(dir, "$(prefix)$(stem)_S$(i).$(fmt)")
+
+"""
+    find_scan_outputs(dir, prefix, stem, fmt) -> Vector{String}
+
+Return the sorted list of files in `dir` matching the
+`{prefix}{stem}_S{i}.{fmt}` pattern, sorted by `i`. Returns an empty vector
+if no matches exist. Used by resume logic to discover previously-written
+scan outputs.
+"""
+function find_scan_outputs(dir::AbstractString, prefix::AbstractString, stem::AbstractString, fmt::AbstractString)
+    isdir(dir) || return String[]
+    file_prefix = "$(prefix)$(stem)_S"
+    ext_lower   = "." * lowercase(fmt)
+    # Anchored regex prevents prefixes containing _S\d+ (e.g. site "Site_S03_")
+    # from fooling the index extraction. Parse the index in-line so we never
+    # rely on a separate filter + match pair (where match could return nothing).
+    re = Regex("^" * _escape_regex(file_prefix) * "(\\d+)" *
+               _escape_regex(ext_lower) * "\$", "i")
+    pairs = Tuple{Int,String}[]
+    for f in readdir(dir; join=true)
+        m = match(re, basename(f))
+        m === nothing && continue
+        push!(pairs, (parse(Int, m.captures[1]), f))
+    end
+    sort!(pairs, by=first)
+    return [p[2] for p in pairs]
+end
+
+_escape_regex(s::AbstractString) = replace(s, r"([.+*?^\$\{\}\(\)\|\[\]\\])" => s"\\\1")
+
+# ── LAS extra-byte type-code mappings ─────────────────────────────
+
+# LAS spec data_type code ↔ Julia scalar type, used for reading/writing
+# user-defined extra bytes attached to LAS point records.
+const _EXTRA_TYPE_TO_CODE = Dict{DataType,Int}(
+    UInt8 => 1, Int8 => 2, UInt16 => 3, Int16 => 4,
+    UInt32 => 5, Int32 => 6, UInt64 => 7, Int64 => 8,
+    Float32 => 9, Float64 => 10,
+)
+
+const _LAS_EXTRA_SCALAR_TYPES = Dict(
+    1 => UInt8, 2 => Int8, 3 => UInt16, 4 => Int16,
+    5 => UInt32, 6 => Int32, 7 => UInt64, 8 => Int64,
+    9 => Float32, 10 => Float64,
+)
+
+const _LAS_EXTRA_SCALAR_BYTES = Dict(
+    1 => 1, 2 => 1, 3 => 2, 4 => 2,
+    5 => 4, 6 => 4, 7 => 8, 8 => 8,
+    9 => 4, 10 => 8,
+)
+
 # ── LAS field name mappings ────────────────────────────────────────
 
 # FLiP attr name → (laspy field name, Julia type)
@@ -130,7 +232,7 @@ function read_las(path::AbstractString; precision::DataType=coord_type())
     catch
     end
 
-    return PointCloudData(coords, attrs)
+    return PointCloud(coords, attrs)
 end
 
 const read_laz = read_las
@@ -290,6 +392,7 @@ function _read_e57_to_raw(path::AbstractString; scan_index::Int=-1, precision::D
             return (coords, attrs)
         end
     finally
+        e57_obj.close()
     end
 end
 
@@ -314,7 +417,7 @@ coords = coordinates(pc)
 """
 function read_e57(path::AbstractString; scan_index::Int=-1, precision::DataType=coord_type())
     coords, attrs = _read_e57_to_raw(path; scan_index=scan_index, precision=precision)
-    return PointCloudData(coords, attrs)
+    return PointCloud(coords, attrs)
 end
 
 """
@@ -529,5 +632,38 @@ function read_pc_metadata(path::AbstractString; scan_index::Int=-1)
         return read_e57_metadata(path; scan_index=scan_index)
     else
         error("Unsupported point cloud format: $ext (supported: .las, .laz, .e57)")
+    end
+end
+
+# ── Generic CSV writer ────────────────────────────────────────────
+
+"""
+    _write_csv(path, columns, headers)
+
+Write per-column typed vectors to a CSV file under the given header names.
+`columns` and `headers` must be parallel; every column must have the same
+length. Floats are rounded to 8 significant digits; other values are
+stringified with `string()`.
+"""
+function _write_csv(path::String, columns::Vector{<:AbstractVector}, headers::Vector{String})
+    length(columns) == length(headers) ||
+        throw(ArgumentError("columns ($(length(columns))) and headers ($(length(headers))) must have the same length"))
+    isempty(columns) && return
+    n_rows = length(first(columns))
+    n_cols = length(columns)
+    open(path, "w") do io
+        println(io, join(headers, ","))
+        for i in 1:n_rows
+            vals = String[]
+            for j in 1:n_cols
+                v = columns[j][i]
+                if v isa AbstractFloat
+                    push!(vals, string(round(v; sigdigits=8)))
+                else
+                    push!(vals, string(v))
+                end
+            end
+            println(io, join(vals, ","))
+        end
     end
 end

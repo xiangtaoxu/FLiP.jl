@@ -14,17 +14,17 @@ Mutable struct holding package-wide default parameters for all filtering functio
 Modify fields directly or reload from a TOML file with `load_config!`.
 """
 mutable struct FLiPConfig
-    # statistical_filter / statistical_filter_indices
+    # statistical_filter
     statistical_filter_k_neighbors::Int
     statistical_filter_n_sigma::Float64
 
-    # voxel_connected_component_filter_indices
+    # voxel_connected_component_filter
     voxel_cc_filter_min_cc_size::Int
 
-    # upward_conic_filter_indices
+    # upward_conic_filter
     upward_conic_filter_max_search_delta_z::Float64
 
-    # rnn_filter / rnn_filter_indices
+    # rnn_filter
     rnn_filter_min_rnn_size::Int
 
     # segment_ground
@@ -44,10 +44,10 @@ mutable struct FLiPConfig
     tree_frontier_min_cc_size::Int
     tree_nbs_neighbor_distance::Int
     tree_min_nbs_size::Int
-    tree_nbs_max_iterations::Int
     tree_linearity_angle_deg::Float64
     tree_assembly_merge_threshold::Float64
     tree_assembly_occlusion_tolerance::Float64
+    tree_resolve_isolated_branches::Bool
 
     # qsm
     qsm_nbs_linearity_threshold::Float64
@@ -61,7 +61,8 @@ mutable struct FLiPConfig
     qsm_spl_z_smoothing::Float64
     qsm_rho_percentile::Float64
     qsm_min_octant_taubin::Int
-    qsm_min_octant_centroid::Int
+    qsm_qc_enable::Bool
+    qsm_qc_continuity_ratio::Float64
 
     # coordinate precision
     coordinate_precision::DataType
@@ -117,10 +118,10 @@ function FLiPConfig(d::Dict)
         Int(get(ts, "frontier_min_cc_size", 3)),
         Int(get(ts, "nbs_neighbor_distance", 2)),
         Int(get(ts, "min_nbs_size", 5)),
-        Int(get(ts, "nbs_max_iterations", 10000)),
         Float64(get(ts, "linearity_angle_deg", 80.0)),
         Float64(get(ts, "assembly_merge_threshold", 0.5)),
         Float64(get(ts, "assembly_occlusion_tolerance", 0.1)),
+        Bool(get(ts, "resolve_isolated_branches", false)),
 
         Float64(get(qm, "nbs_linearity_threshold", 0.5)),
         Float64(get(qm, "slice_height_scalar", 3.0)),
@@ -133,7 +134,8 @@ function FLiPConfig(d::Dict)
         Float64(get(qm, "spl_z_smoothing", 0.3)),
         Float64(get(qm, "rho_percentile", 1.0)),
         Int(get(qm, "min_octant_taubin", 3)),
-        Int(get(qm, "min_octant_centroid", 5)),
+        Bool(get(qm, "qc_enable", true)),
+        Float64(get(qm, "qc_continuity_ratio", 0.7)),
 
         let prec_str = lowercase(get(pl, "coordinate_precision", "Float32"))
             prec_str == "float64" ? Float64 : Float32

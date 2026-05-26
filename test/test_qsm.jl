@@ -30,28 +30,6 @@
         @test abs(r - r_true) < 0.05
     end
 
-    @testset "Perpendicular basis" begin
-        d = (0.0, 0.0, 1.0)
-        e1, e2 = FLiP._perp_basis(d)
-        # Orthogonality
-        @test abs(e1[1]*d[1] + e1[2]*d[2] + e1[3]*d[3]) < 1e-10
-        @test abs(e2[1]*d[1] + e2[2]*d[2] + e2[3]*d[3]) < 1e-10
-        @test abs(e1[1]*e2[1] + e1[2]*e2[2] + e1[3]*e2[3]) < 1e-10
-        # Unit length
-        @test abs(sqrt(e1[1]^2 + e1[2]^2 + e1[3]^2) - 1.0) < 1e-10
-        @test abs(sqrt(e2[1]^2 + e2[2]^2 + e2[3]^2) - 1.0) < 1e-10
-    end
-
-    @testset "Smoothed centerline" begin
-        centers = [Float64(i) for i in 1:10, j in 1:3]
-        centers_copy = copy(centers)
-        FLiP._smooth_centerline!(centers_copy, 1)
-        # Interior points should be smoothed, endpoints less affected
-        @test size(centers_copy) == size(centers)
-        # First point: average of [1,2] → 1.5
-        @test centers_copy[1, 1] ≈ (centers[1,1] + centers[2,1]) / 2
-    end
-
     @testset "Synthetic cylinder QSM — integration" begin
         # Generate a vertical cylinder: r=0.1m, h=0.5m, 2000 points
         n = 2000
@@ -77,7 +55,7 @@
         ))
         tree_result = (
             pc_output=pc,
-            skeleton_cloud=FLiP.PointCloudData(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
+            skeleton_cloud=FLiP.PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
             filtered_cloud=pc,
             n_components=1,
             neighbor_radius=0.1,
@@ -115,17 +93,6 @@
                 # Radius should be within 30% of true value
                 @test abs(r_est - r_true) / r_true < 0.3
             end
-
-            # Check new quality metric columns exist
-            @test "rho_mean" in headers
-            @test "rho_std" in headers
-            @test "rho_cv" in headers
-            # For a clean cylinder, CV should be low
-            rho_cv_col = findfirst(==("rho_cv"), headers)
-            if !isnothing(rho_cv_col) && length(lines) > 1
-                cv_val = parse(Float64, split(lines[2], ",")[rho_cv_col])
-                @test cv_val < 0.15
-            end
         end
     end
 
@@ -137,29 +104,17 @@
 
         cfg = FLiP._CFG
         result = FLiP._filter_linear_nbs(coords_linear, nbs_ids_linear, cfg)
-        @test haskey(result, Int32(1))
-        if haskey(result, Int32(1))
-            @test result[Int32(1)].linearity > 0.9
+        @test length(result) >= 1
+        @test result[1] !== nothing
+        if result[1] !== nothing
+            @test result[1].linearity > 0.9
         end
 
         # Spherical point set: low linearity
         coords_sphere = randn(n, 3)
         nbs_ids_sphere = ones(Int32, n)
         result_sphere = FLiP._filter_linear_nbs(coords_sphere, nbs_ids_sphere, cfg)
-        @test !haskey(result_sphere, Int32(1))
-    end
-
-    @testset "Spline slice method" begin
-        n = 200
-        r = 0.15
-        phi = range(-π, π; length=n+1)[1:n]
-        rho = fill(r, n) .+ 0.001 .* randn(n)
-
-        cfg = FLiP._CFG
-        ca, circ, comp = FLiP._method_spline_slice(collect(rho), collect(phi), cfg)
-        @test comp > 0.8
-        @test abs(circ - 2π * r) / (2π * r) < 0.15
-        @test abs(ca - π * r^2) / (π * r^2) < 0.15
+        @test isempty(result_sphere) || result_sphere[1] === nothing
     end
 
     @testset "Frustum metrics" begin
@@ -245,7 +200,7 @@
         pt_slice_ids = vcat([fill(s, n_per_slice) for s in 1:n_slices]...)
 
         cfg = FLiP._CFG
-        results, surface_grid, phi_bins = FLiP._method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg, r)
+        results, surface_grid, phi_bins = FLiP._method_spline_2d(rho, phi, pt_slice_ids, n_slices, cfg)
 
         @test length(results) == n_slices
         for s in 1:n_slices
@@ -270,37 +225,237 @@
         @test cv_disc > 0.3
     end
 
-    @testset "Rho percentile filter — shrinks toward inner surface" begin
-        using Statistics: mean
-        # Mix of shell points (r=0.15) and outer noise/leaf returns (r=0.20..0.40)
-        n_shell = 100; n_noise = 100
-        rho = vcat(fill(0.15, n_shell) .+ 0.002 .* randn(n_shell),
-                   0.20 .+ 0.20 .* rand(n_noise))
-        phi = collect(range(-π, π; length=n_shell + n_noise + 1)[1:n_shell + n_noise])
-        pt_slice_ids = ones(Int, n_shell + n_noise)
+    @testset "_filter_rho_outliers — drops outliers per slice and compacts arrays" begin
+        # Two slices: slice 1 has three shell points + one outlier at rho=0.50;
+        # slice 2 is all shell. Percentile=0.75 should drop slice 1's outlier
+        # (keeping the 3 shell points whose quantile is 0.10).
+        rho = [0.10, 0.10, 0.10, 0.50, 0.10, 0.10, 0.10]
+        phi = [0.0, 1.0, 2.0, 3.0, -1.0, 0.0, 1.0]
+        pt_slice_ids = [1, 1, 1, 1, 2, 2, 2]
+        slice_point_indices = [Int[1, 2, 3, 4], Int[5, 6, 7]]
+        indices = collect(1:7)
 
-        surface_full = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 36, 1.0)
-        surface_75   = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 36, 0.75)
+        rho2, phi2, ids2, spi2, idx2 = FLiP._filter_rho_outliers(
+            rho, phi, pt_slice_ids, slice_point_indices, indices, 2, 0.75)
+        @test length(rho2) == 6
+        @test !(0.50 in rho2)                                  # outlier dropped
+        @test maximum(rho2) <= 0.10 + 1e-12
+        @test length(spi2[1]) == 3                             # slice 1 lost one
+        @test length(spi2[2]) == 3                             # slice 2 unchanged
+        @test all(1 .<= spi2[1] .<= length(rho2))              # compacted indices
+        @test all(1 .<= spi2[2] .<= length(rho2))
 
-        # Percentile-filtered surface should have smaller mean rho (closer to inner shell)
-        mean_full = mean(filter(isfinite, surface_full))
-        mean_75   = mean(filter(isfinite, surface_75))
-        @test mean_75 < mean_full
+        # Default 1.0 is a no-op
+        rho3, _, _, _, _ = FLiP._filter_rho_outliers(
+            rho, phi, pt_slice_ids, slice_point_indices, indices, 2, 1.0)
+        @test rho3 === rho
     end
 
-    @testset "build_rho_surface percentile=1.0 matches default" begin
+    @testset "_build_rho_surface — mean binning, NaN for empty cells" begin
         rho = [0.1, 0.2, 0.15, 0.25]
         phi = [-π + 0.1, -π + 0.1, π - 0.1, π - 0.1]
         pt_slice_ids = [1, 1, 1, 1]
-        s1 = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 4)
-        s2 = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 4, 1.0)
-        for i in eachindex(s1)
-            if isnan(s1[i])
-                @test isnan(s2[i])
-            else
-                @test s1[i] ≈ s2[i]
-            end
+        surface = FLiP._build_rho_surface(rho, phi, pt_slice_ids, 1, 4)
+        # Bin 1 (phi ~ -π + 0.1) gets [0.1, 0.2] → mean 0.15
+        # Bin 4 (phi ~ π - 0.1)  gets [0.15, 0.25] → mean 0.20
+        @test surface[1, 1] ≈ 0.15
+        @test surface[4, 1] ≈ 0.20
+        @test isnan(surface[2, 1])
+        @test isnan(surface[3, 1])
+    end
+
+    @testset "_finalize_centerline! — interpolation (window=0)" begin
+        # 5 slices, slice 3 is NaN; should be interpolated as midpoint of 2 and 4.
+        # window=0 skips smoothing so we can assert exact interpolated values.
+        centers = Float64[
+            0.0  0.0  0.0
+            1.0  0.0  0.0
+            NaN  NaN  NaN
+            3.0  2.0  0.0
+            4.0  3.0  0.0
+        ]
+        valid = Bool[true, true, false, true, true]
+        info = FLiP.NBSInfo((1.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                            (0.1, 0.2, 1.0), 0.8, Int[])
+        FLiP._finalize_centerline!(centers, valid, info, 0.0, 1.0; window=0)
+        @test centers[3, 1] ≈ 2.0
+        @test centers[3, 2] ≈ 1.0
+        @test centers[3, 3] ≈ 0.0
+
+        # NaN at end (slice 5): should copy slice 4
+        centers2 = Float64[
+            0.0  0.0  0.0
+            1.0  0.0  0.0
+            2.0  1.0  0.0
+            3.0  2.0  0.0
+            NaN  NaN  NaN
+        ]
+        valid2 = Bool[true, true, true, true, false]
+        FLiP._finalize_centerline!(centers2, valid2, info, 0.0, 1.0; window=0)
+        @test centers2[5, 1] ≈ 3.0
+        @test centers2[5, 2] ≈ 2.0
+        @test centers2[5, 3] ≈ 0.0
+    end
+
+    @testset "_finalize_centerline! — smoothing pass averages neighbors" begin
+        # All slices valid (no NaN), so only the smoothing pass mutates centers.
+        centers = [Float64(i) for i in 1:10, _ in 1:3]
+        valid = trues(10)
+        info = FLiP.NBSInfo((1.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                            (0.1, 0.2, 1.0), 0.8, Int[])
+        FLiP._finalize_centerline!(centers, valid, info, 0.0, 1.0; window=1)
+        # First row: avg of rows 1..2 → 1.5
+        @test centers[1, 1] ≈ 1.5
+        # Interior row 5: avg of rows 4..6 → 5.0
+        @test centers[5, 1] ≈ 5.0
+        # Last row: avg of rows 9..10 → 9.5
+        @test centers[10, 1] ≈ 9.5
+    end
+
+    @testset "QC: fused NBS — two parallel cylinders share one nbs_id" begin
+        using Statistics: mean
+        # Two vertical cylinders 0.30 m apart in x, both r=0.05, h=1.0, sharing
+        # one nbs_id. With QC off, the per-slice fit straddles both clusters and
+        # inflates the fitted radius. With QC on, the 3D CC step drops the
+        # secondary cluster and the fit returns ≈ true radius.
+        n_per_level = 36
+        z_levels    = collect(range(0.0, 1.0; length=11))
+        true_r      = 0.05
+        gap         = 0.30
+        coords = Float64[]
+        for z in z_levels, k in 1:n_per_level
+            θ = 2π * (k - 1) / n_per_level
+            push!(coords, true_r * cos(θ),       true_r * sin(θ), z)   # cyl A
+            push!(coords, gap + true_r * cos(θ), true_r * sin(θ), z)   # cyl B
         end
+        coords_mat = collect(reshape(coords, 3, :)')
+        n_pts = size(coords_mat, 1)
+        nbs_ids = ones(Int32, n_pts)
+
+        cfg_off = deepcopy(FLiP._CFG)
+        cfg_off.pipeline_subsample_res     = 0.05
+        cfg_off.qsm_completeness_threshold = 0.1
+        cfg_off.qsm_qc_enable              = false
+        cfg_on = deepcopy(cfg_off)
+        cfg_on.qsm_qc_enable               = true
+        # CC link radius = QC_CC_RADIUS_SCALAR (=2.0) × subsample_res = 0.10 m < cluster gap 0.20 m
+
+        linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
+        linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)
+        @test linear_off[1] !== nothing
+        @test linear_on[1]  !== nothing
+
+        nodes_off = FLiP.QSMNode[]; qids_off = zeros(Int32, n_pts)
+        nodes_on  = FLiP.QSMNode[]; qids_on  = zeros(Int32, n_pts)
+        agh  = Float64.(coords_mat[:, 3])
+        tids = ones(Int32, n_pts)
+        FLiP._process_single_nbs!(nodes_off, qids_off, coords_mat, linear_off[1], Int32(1),
+                                  tids, agh, cfg_off, 1)
+        FLiP._process_single_nbs!(nodes_on,  qids_on,  coords_mat, linear_on[1],  Int32(1),
+                                  tids, agh, cfg_on,  1)
+
+        @test !isempty(nodes_off) && !isempty(nodes_on)
+        r_off = mean([nd.radius_area for nd in nodes_off])
+        r_on  = mean([nd.radius_area for nd in nodes_on])
+        @test r_off > 2.0 * true_r          # straddles both cylinders
+        @test r_on  < 1.5 * true_r          # hugs one cylinder
+        @test r_on  < 0.5 * r_off           # meaningful reduction
+        # QC should drop the secondary cluster's points
+        @test count(>(0), qids_on) < count(>(0), qids_off)
+    end
+
+    @testset "QC: noisy blob — outliers around a clean cylinder" begin
+        using Statistics: mean
+        # Single cylinder r=0.05 + 10% outlier points scattered in a 0.30 m
+        # box around it. Without QC the outer points inflate the fitted
+        # radius; with QC the small-CC drop + 3D SOR strip them and the fit
+        # returns ≈ true radius.
+        n_per_level = 36
+        z_levels    = collect(range(0.0, 1.0; length=11))
+        true_r      = 0.05
+        coords = Float64[]
+        for z in z_levels, k in 1:n_per_level
+            θ = 2π * (k - 1) / n_per_level
+            push!(coords, true_r * cos(θ), true_r * sin(θ), z)
+        end
+        n_clean = length(coords) ÷ 3
+        for _ in 1:(n_clean ÷ 10)
+            push!(coords, 0.3 * (rand() - 0.5), 0.3 * (rand() - 0.5), rand())
+        end
+        coords_mat = collect(reshape(coords, 3, :)')
+        n_pts = size(coords_mat, 1)
+        nbs_ids = ones(Int32, n_pts)
+
+        cfg_off = deepcopy(FLiP._CFG)
+        cfg_off.pipeline_subsample_res     = 0.05
+        cfg_off.qsm_completeness_threshold = 0.1
+        cfg_off.qsm_qc_enable              = false
+        cfg_on = deepcopy(cfg_off)
+        cfg_on.qsm_qc_enable               = true
+
+        linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
+        linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)
+        @test linear_off[1] !== nothing
+        @test linear_on[1]  !== nothing
+
+        nodes_off = FLiP.QSMNode[]; qids_off = zeros(Int32, n_pts)
+        nodes_on  = FLiP.QSMNode[]; qids_on  = zeros(Int32, n_pts)
+        agh  = Float64.(coords_mat[:, 3])
+        tids = ones(Int32, n_pts)
+        FLiP._process_single_nbs!(nodes_off, qids_off, coords_mat, linear_off[1], Int32(1),
+                                  tids, agh, cfg_off, 1)
+        FLiP._process_single_nbs!(nodes_on,  qids_on,  coords_mat, linear_on[1],  Int32(1),
+                                  tids, agh, cfg_on,  1)
+
+        @test !isempty(nodes_off) && !isempty(nodes_on)
+        r_off = mean([nd.radius_area for nd in nodes_off])
+        r_on  = mean([nd.radius_area for nd in nodes_on])
+        @test r_on < r_off                           # QC reduces inflation
+        @test abs(r_on - true_r) / true_r < 0.5      # close to truth after QC
+        # QC drops at least some of the noise points
+        @test count(>(0), qids_on) < count(>(0), qids_off)
+    end
+
+    @testset "QC: clean cylinder is near-no-op" begin
+        using Statistics: mean
+        # Clean cylinder — QC on vs off should produce essentially the same
+        # fitted radius. QC must not "shave" valid stem surfaces.
+        n_per_level = 36
+        z_levels    = collect(range(0.0, 1.0; length=11))
+        true_r      = 0.08
+        coords = Float64[]
+        for z in z_levels, k in 1:n_per_level
+            θ = 2π * (k - 1) / n_per_level
+            push!(coords, true_r * cos(θ) + 0.001*randn(),
+                          true_r * sin(θ) + 0.001*randn(), z)
+        end
+        coords_mat = collect(reshape(coords, 3, :)')
+        n_pts = size(coords_mat, 1)
+        nbs_ids = ones(Int32, n_pts)
+
+        cfg_off = deepcopy(FLiP._CFG)
+        cfg_off.pipeline_subsample_res     = 0.05
+        cfg_off.qsm_completeness_threshold = 0.1
+        cfg_off.qsm_qc_enable              = false
+        cfg_on = deepcopy(cfg_off)
+        cfg_on.qsm_qc_enable               = true
+
+        linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
+        linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)
+        nodes_off = FLiP.QSMNode[]; qids_off = zeros(Int32, n_pts)
+        nodes_on  = FLiP.QSMNode[]; qids_on  = zeros(Int32, n_pts)
+        agh  = Float64.(coords_mat[:, 3])
+        tids = ones(Int32, n_pts)
+        FLiP._process_single_nbs!(nodes_off, qids_off, coords_mat, linear_off[1], Int32(1),
+                                  tids, agh, cfg_off, 1)
+        FLiP._process_single_nbs!(nodes_on,  qids_on,  coords_mat, linear_on[1],  Int32(1),
+                                  tids, agh, cfg_on,  1)
+
+        @test length(nodes_off) == length(nodes_on)
+        r_off = mean([nd.radius_area for nd in nodes_off])
+        r_on  = mean([nd.radius_area for nd in nodes_on])
+        @test abs(r_on - r_off) / r_off < 0.05      # within 5%
+        @test abs(r_on - true_r) / true_r < 0.10    # within 10% of truth
     end
 
 end

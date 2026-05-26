@@ -1,14 +1,14 @@
 """
 Core data structures and utilities for FLiP.jl.
 
-Uses a lightweight PointCloudData struct instead of PointClouds.LAS
-for minimal memory overhead and O(1) attribute operations.
+Uses a lightweight `PointCloud` struct instead of `PointClouds.LAS` for
+minimal memory overhead and O(1) attribute operations.
 """
 
 # ── Point cloud struct ─────────────────────────────────────────────
 
 """
-    PointCloudData{T<:AbstractFloat}
+    PointCloud{T<:AbstractFloat}
 
 Lightweight point cloud container storing coordinates as an N×3 matrix
 and attributes as a `Dict{Symbol,Vector}`. Parametrized by coordinate
@@ -18,33 +18,10 @@ precision `T` (typically `Float32` or `Float64`).
 - `coords::Matrix{T}` — N×3 matrix of XYZ coordinates
 - `attrs::Dict{Symbol,Vector}` — named attribute vectors (e.g., `:intensity`, `:classification`)
 """
-mutable struct PointCloudData{T<:AbstractFloat}
+mutable struct PointCloud{T<:AbstractFloat}
     coords::Matrix{T}            # N×3
     attrs::Dict{Symbol,Vector}
 end
-
-const AbstractPointCloud = PointCloudData
-const PointCloud = PointCloudData
-
-# ── Type mappings for LAS extra byte dimensions ───────────────────
-
-const _EXTRA_TYPE_TO_CODE = Dict{DataType,Int}(
-    UInt8 => 1, Int8 => 2, UInt16 => 3, Int16 => 4,
-    UInt32 => 5, Int32 => 6, UInt64 => 7, Int64 => 8,
-    Float32 => 9, Float64 => 10,
-)
-
-const _LAS_EXTRA_SCALAR_TYPES = Dict(
-    1 => UInt8, 2 => Int8, 3 => UInt16, 4 => Int16,
-    5 => UInt32, 6 => Int32, 7 => UInt64, 8 => Int64,
-    9 => Float32, 10 => Float64,
-)
-
-const _LAS_EXTRA_SCALAR_BYTES = Dict(
-    1 => 1, 2 => 1, 3 => 2, 4 => 2,
-    5 => 4, 6 => 4, 7 => 8, 8 => 8,
-    9 => 4, 10 => 8,
-)
 
 # ── Accessors ──────────────────────────────────────────────────────
 
@@ -56,7 +33,12 @@ Base.length(pc::PointCloud) = npoints(pc)
 """Return coordinates as an N×3 matrix (element type matches coordinate precision)."""
 coordinates(pc::PointCloud) = pc.coords
 
-"""Return a copy of all scalar attributes."""
+"""
+Return a shallow copy of all scalar attributes — the outer `Dict` is fresh,
+but the inner `Vector`s are shared with `pc`. Safe for read-only uses and
+for downstream `vcat`-style merging (which allocates new vectors); not safe
+if a caller mutates the returned vectors in place.
+"""
 _all_attributes(pc::PointCloud) = copy(pc.attrs)
 
 """Check whether an attribute exists."""
@@ -70,7 +52,7 @@ function addattribute(pc::PointCloud, name::Symbol, values::AbstractVector)
     length(values) == npoints(pc) || throw(ArgumentError("attribute :$name length $(length(values)) does not match point count $(npoints(pc))"))
     new_attrs = copy(pc.attrs)
     new_attrs[name] = collect(values)
-    return PointCloudData(pc.coords, new_attrs)
+    return PointCloud(pc.coords, new_attrs)
 end
 
 """Delete an attribute and return a new point cloud."""
@@ -78,19 +60,59 @@ function deleteattribute(pc::PointCloud, name::Symbol)
     haskey(pc.attrs, name) || return pc
     new_attrs = copy(pc.attrs)
     delete!(new_attrs, name)
-    return PointCloudData(pc.coords, new_attrs)
+    return PointCloud(pc.coords, new_attrs)
 end
 
-"""Add or replace a scalar attribute. Returns a new point cloud (original is not mutated)."""
-function setattribute!(pc::PointCloud, attr::Symbol, values::Vector)
-    return addattribute(pc, attr, values)
+"""Add or replace a scalar attribute in place. Returns the (mutated) point cloud."""
+function setattribute!(pc::PointCloud, attr::Symbol, values::AbstractVector)
+    length(values) == npoints(pc) ||
+        throw(ArgumentError("attribute :$attr length $(length(values)) does not match point count $(npoints(pc))"))
+    pc.attrs[attr] = collect(values)
+    return pc
 end
 
 # ── Subsetting ─────────────────────────────────────────────────────
 
 function Base.getindex(pc::PointCloud, inds::AbstractVector{<:Integer})
     new_attrs = Dict{Symbol,Vector}(k => v[inds] for (k, v) in pc.attrs)
-    return PointCloudData(pc.coords[inds, :], new_attrs)
+    return PointCloud(pc.coords[inds, :], new_attrs)
+end
+
+# ── Merging ────────────────────────────────────────────────────────
+
+"""
+    merge_pointclouds(coords_list, attrs_list) -> PointCloud
+
+Concatenate a list of N×3 coordinate matrices and merge attribute dicts by
+key intersection (attributes present in *all* clouds are kept; others are
+dropped). With a single-element list, returns a PointCloud built from that
+element without any concatenation.
+"""
+function merge_pointclouds(coords_list::AbstractVector{<:AbstractMatrix},
+                           attrs_list::AbstractVector{<:Dict{Symbol,<:Vector}})
+    length(coords_list) == length(attrs_list) ||
+        throw(ArgumentError("coords_list and attrs_list must have the same length"))
+    isempty(coords_list) && throw(ArgumentError("cannot merge an empty list"))
+
+    if length(coords_list) == 1
+        return PointCloud(coords_list[1], Dict{Symbol,Vector}(attrs_list[1]))
+    end
+
+    common_keys = Set(keys(attrs_list[1]))
+    all_keys = Set(keys(attrs_list[1]))
+    for a in @view attrs_list[2:end]
+        intersect!(common_keys, keys(a))
+        union!(all_keys, keys(a))
+    end
+    dropped = setdiff(all_keys, common_keys)
+    isempty(dropped) ||
+        @info "merge_pointclouds: dropping attributes missing from some scans: $(sort(collect(dropped); by=string))"
+    merged_attrs = Dict{Symbol,Vector}()
+    for k in common_keys
+        merged_attrs[k] = vcat((a[k] for a in attrs_list)...)
+    end
+    merged_coords = vcat(coords_list...)
+    return PointCloud(merged_coords, merged_attrs)
 end
 
 # ── Coordinate replacement ─────────────────────────────────────────
@@ -100,30 +122,37 @@ function _replace_coordinates(pc::PointCloud, new_coords::AbstractMatrix{<:Real}
     n == npoints(pc) || throw(ArgumentError("new_coords row count must match number of points"))
     size(new_coords, 2) == 3 || throw(ArgumentError("new_coords must be N×3"))
     T = eltype(pc.coords)
-    return PointCloudData(T.(new_coords), copy(pc.attrs))
+    return PointCloud(T.(new_coords), copy(pc.attrs))
 end
 
 # ── Summary functions ──────────────────────────────────────────────
 
 function bounds(pc::PointCloud)
     c = pc.coords
-    return (
-        minimum(c[:, 1]), maximum(c[:, 1]),
-        minimum(c[:, 2]), maximum(c[:, 2]),
-        minimum(c[:, 3]), maximum(c[:, 3]),
-    )
+    n = size(c, 1)
+    n > 0 || throw(ArgumentError("bounds: empty point cloud"))
+    xmin = xmax = c[1, 1]
+    ymin = ymax = c[1, 2]
+    zmin = zmax = c[1, 3]
+    @inbounds for i in 2:n
+        x = c[i, 1]; y = c[i, 2]; z = c[i, 3]
+        x < xmin && (xmin = x); x > xmax && (xmax = x)
+        y < ymin && (ymin = y); y > ymax && (ymax = y)
+        z < zmin && (zmin = z); z > zmax && (zmax = z)
+    end
+    return (xmin, xmax, ymin, ymax, zmin, zmax)
 end
 
 center(pc::PointCloud) = vec(mean(pc.coords, dims=1))
 
 # ── Display ────────────────────────────────────────────────────────
 
-function Base.show(io::IO, pc::PointCloudData)
-    print(io, "PointCloudData($(npoints(pc)) points, $(length(pc.attrs)) attributes)")
+function Base.show(io::IO, pc::PointCloud)
+    print(io, "PointCloud($(npoints(pc)) points, $(length(pc.attrs)) attributes)")
 end
 
-function Base.show(io::IO, ::MIME"text/plain", pc::PointCloudData)
-    println(io, "PointCloudData")
+function Base.show(io::IO, ::MIME"text/plain", pc::PointCloud)
+    println(io, "PointCloud")
     println(io, "  Points: $(npoints(pc))")
     attr_names = sort(collect(keys(pc.attrs)), by=string)
     print(io, "  Attributes: $(join(attr_names, ", "))")

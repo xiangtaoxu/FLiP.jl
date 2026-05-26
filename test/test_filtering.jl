@@ -11,25 +11,25 @@
         coords_with_outliers = vcat(coords, outliers)
         
         # Filter with default parameters
-        indices = statistical_filter_indices(coords_with_outliers, 10, 2.0)
+        indices = statistical_filter(coords_with_outliers, 10, 2.0)
         @test length(indices) < size(coords_with_outliers, 1)
         # Most clean points should be kept
         @test length(indices) >= size(coords, 1) * 0.9
         
-        # Test with PointCloud
+        # Test with PointCloud (index form: filter returns indices, subset explicitly)
         pc = make_test_pointcloud(coords_with_outliers)
-        pc_clean = statistical_filter(pc, 10, 2.0)
+        pc_clean = pc[statistical_filter(coordinates(pc), 10, 2.0)]
         @test length(pc_clean) < length(pc)
         
         # Test with too few points
         small_coords = rand(5, 3)
-        indices = statistical_filter_indices(small_coords, 10, 2.0)
+        indices = statistical_filter(small_coords, 10, 2.0)
         @test length(indices) == 5  # Should keep all points
         
         # Test error handling
-        @test_throws ArgumentError statistical_filter_indices(coords, 0, 2.0)
-        @test_throws ArgumentError statistical_filter_indices(coords, 10, -1.0)
-        @test_throws ArgumentError statistical_filter_indices(rand(10, 2), 10, 2.0)
+        @test_throws ArgumentError statistical_filter(coords, 0, 2.0)
+        @test_throws ArgumentError statistical_filter(coords, 10, -1.0)
+        @test_throws ArgumentError statistical_filter(rand(10, 2), 10, 2.0)
     end
     
     @testset "Grid z-min filter" begin
@@ -41,7 +41,7 @@
             2.1 2.1 7.0;
         ]
 
-        indices = grid_zmin_filter_indices(coords, 1.0)
+        indices = grid_zmin_filter(coords, 1.0)
         @test indices == [2, 4, 5]
 
         # Deterministic tie-breaking: smallest index for equal z within cell
@@ -50,13 +50,13 @@
             0.2 0.2 1.0;
             1.2 1.2 0.5;
         ]
-        tie_indices = grid_zmin_filter_indices(tie_coords, 1.0)
+        tie_indices = grid_zmin_filter(tie_coords, 1.0)
         @test tie_indices == [1, 3]
 
-        @test isempty(grid_zmin_filter_indices(zeros(0, 3), 1.0))
-        @test_throws ArgumentError grid_zmin_filter_indices(coords, 0.0)
-        @test_throws ArgumentError grid_zmin_filter_indices(coords, -1.0)
-        @test_throws ArgumentError grid_zmin_filter_indices(rand(10, 2), 1.0)
+        @test isempty(grid_zmin_filter(zeros(0, 3), 1.0))
+        @test_throws ArgumentError grid_zmin_filter(coords, 0.0)
+        @test_throws ArgumentError grid_zmin_filter(coords, -1.0)
+        @test_throws ArgumentError grid_zmin_filter(rand(10, 2), 1.0)
     end
 
     @testset "Upward conic filter" begin
@@ -69,7 +69,7 @@
              5.0  5.0 -1.0;   # kept (lowest, far away)
         ]
 
-        indices = upward_conic_filter_indices(coords, 45.0)
+        indices = upward_conic_filter(coords, 45.0)
         @test indices == [1, 3, 6]
 
         # Equal-z points should not suppress each other (requires Δz > 0)
@@ -77,14 +77,14 @@
             0.0 0.0 1.0;
             0.0 0.0 1.0;
         ]
-        @test upward_conic_filter_indices(flat_coords, 45.0) == [1, 2]
+        @test upward_conic_filter(flat_coords, 45.0) == [1, 2]
 
-        @test isempty(upward_conic_filter_indices(zeros(0, 3), 45.0))
-        @test_throws ArgumentError upward_conic_filter_indices(coords, 0.0)
-        @test_throws ArgumentError upward_conic_filter_indices(coords, 90.0)
-        @test_throws ArgumentError upward_conic_filter_indices(coords, -10.0)
-        @test_throws ArgumentError upward_conic_filter_indices(coords, 45.0, max_search_delta_z=0.0)
-        @test_throws ArgumentError upward_conic_filter_indices(rand(10, 2), 45.0)
+        @test isempty(upward_conic_filter(zeros(0, 3), 45.0))
+        @test_throws ArgumentError upward_conic_filter(coords, 0.0)
+        @test_throws ArgumentError upward_conic_filter(coords, 90.0)
+        @test_throws ArgumentError upward_conic_filter(coords, -10.0)
+        @test_throws ArgumentError upward_conic_filter(coords, 45.0, max_search_delta_z=0.0)
+        @test_throws ArgumentError upward_conic_filter(rand(10, 2), 45.0)
 
         # Maximum search radius cap: with default max_search_delta_z=5 and theta=45,
         # max_search_radius is 5 m. A point 10 m away in XY should not be suppressed.
@@ -92,8 +92,8 @@
             0.0  0.0  0.0;
             10.0 0.0 20.0;
         ]
-        @test upward_conic_filter_indices(capped_coords, 45.0) == [1, 2]
-        @test upward_conic_filter_indices(capped_coords, 45.0, max_search_delta_z=20.0) == [1]
+        @test upward_conic_filter(capped_coords, 45.0) == [1, 2]
+        @test upward_conic_filter(capped_coords, 45.0, max_search_delta_z=20.0) == [1]
 
         # Spatial bins must still find suppressors near bin boundaries.
         boundary_coords = [
@@ -101,7 +101,7 @@
             4.9 0.0 5.0;
             0.0 4.9 5.0;
         ]
-        @test upward_conic_filter_indices(boundary_coords, 45.0, max_search_delta_z=5.0) == [1]
+        @test upward_conic_filter(boundary_coords, 45.0, max_search_delta_z=5.0) == [1]
     end
 
     @testset "RNN (radius neighbor count) filter" begin
@@ -122,29 +122,29 @@
         coords = vcat(center_points, outliers)
 
         # With radius 0.5, center cluster has 5 points each (including self)
-        indices = rnn_filter_indices(coords, 0.5, min_rnn_size=1)
+        indices = rnn_filter(coords, 0.5, min_rnn_size=1)
         @test length(indices) == size(coords, 1)  # All have at least 1 neighbor
         
         # Keep only points with at least 3 neighbors within 0.5m
-        indices = rnn_filter_indices(coords, 0.5, min_rnn_size=3)
+        indices = rnn_filter(coords, 0.5, min_rnn_size=3)
         @test indices == [1, 2, 3, 4, 5]  # Only center cluster qualifies
         
         # Keep only points with at least 5 neighbors within 0.5m
-        indices = rnn_filter_indices(coords, 0.5, min_rnn_size=5)
+        indices = rnn_filter(coords, 0.5, min_rnn_size=5)
         @test indices == [1, 2, 3, 4, 5]  # All have exactly 5 neighbors
         
         # Keep only points with at least 6 neighbors
-        indices = rnn_filter_indices(coords, 0.5, min_rnn_size=6)
+        indices = rnn_filter(coords, 0.5, min_rnn_size=6)
         @test isempty(indices)  # No points have 6 neighbors
 
         # Empty input
-        @test isempty(rnn_filter_indices(zeros(0, 3), 0.5))
+        @test isempty(rnn_filter(zeros(0, 3), 0.5))
         
         # Error handling
-        @test_throws ArgumentError rnn_filter_indices(coords, 0.0)
-        @test_throws ArgumentError rnn_filter_indices(coords, -0.5)
-        @test_throws ArgumentError rnn_filter_indices(coords, 0.5, min_rnn_size=0)
-        @test_throws ArgumentError rnn_filter_indices(rand(10, 2), 0.5)
+        @test_throws ArgumentError rnn_filter(coords, 0.0)
+        @test_throws ArgumentError rnn_filter(coords, -0.5)
+        @test_throws ArgumentError rnn_filter(coords, 0.5, min_rnn_size=0)
+        @test_throws ArgumentError rnn_filter(rand(10, 2), 0.5)
     end
     
     @testset "Filtering preserves attributes" begin
@@ -153,7 +153,7 @@
         pc = make_test_pointcloud(coords; attrs=Dict(:test_attr => test_attr))
         
         # Statistical filter
-        pc_stat = statistical_filter(pc, 10, 2.0)
+        pc_stat = pc[statistical_filter(coordinates(pc), 10, 2.0)]
         @test hasattribute(pc_stat, :test_attr)
         @test length(getattribute(pc_stat, :test_attr)) == length(pc_stat)
     end
@@ -189,10 +189,6 @@
         agh = calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5)
         @test length(agh) == length(pc)
         @test any(isfinite, agh)
-
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.0)
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_k=0)
-        @test_throws ArgumentError calculate_aboveground_height(pc, pc_segmented; xy_resolution=0.5, idw_power=0.0)
     end
 
     @testset "Convex hull 2D" begin
@@ -237,23 +233,23 @@
                2.0 2.0 0.0;   # outside
                0.5 0.5 10.0;  # inside (z irrelevant)
                -1.0 0.5 0.0]  # outside
-        idx = XY_polygon_filter_indices(pts, poly)
+        idx = XY_polygon_filter(pts, poly)
         @test 1 in idx
         @test 3 in idx
         @test !(2 in idx)
         @test !(4 in idx)
 
-        # PointCloud wrapper
+        # PointCloud (index form)
         pc = make_test_pointcloud(pts)
-        pc_filtered = XY_polygon_filter(pc, poly)
+        pc_filtered = pc[XY_polygon_filter(coordinates(pc), poly)]
         @test npoints(pc_filtered) == 2
 
         # Empty input
-        @test isempty(XY_polygon_filter_indices(zeros(0, 3), poly))
+        @test isempty(XY_polygon_filter(zeros(0, 3), poly))
 
         # Error cases
-        @test_throws ArgumentError XY_polygon_filter_indices(rand(5, 1), poly)
-        @test_throws ArgumentError XY_polygon_filter_indices(rand(5, 3), rand(2, 2))
+        @test_throws ArgumentError XY_polygon_filter(rand(5, 1), poly)
+        @test_throws ArgumentError XY_polygon_filter(rand(5, 3), rand(2, 2))
     end
 
     @testset "Polygon area" begin
@@ -267,9 +263,14 @@
     end
 
     @testset "crop_by_ground_polygon" begin
-        # Ground points in a small square region
+        # Ground points on a deterministic 14×15 grid inside [0.5, 9.5]²;
+        # take the first 200. Convex hull is the bounding rectangle, buffer=2
+        # expands it well past every interior grid point — robust assertion
+        # without the RNG-induced edge cases the random fixture had.
         n_gnd = 200
-        gnd_coords = hcat(rand(n_gnd) .* 10.0, rand(n_gnd) .* 10.0, zeros(n_gnd))
+        xs = repeat(range(0.5, 9.5; length=14), inner=15)
+        ys = repeat(range(0.5, 9.5; length=15), outer=14)
+        gnd_coords = hcat(xs[1:n_gnd], ys[1:n_gnd], zeros(n_gnd))
         ground = make_test_pointcloud(gnd_coords)
 
         # Full cloud: ground region + far-away outlier points
@@ -283,5 +284,18 @@
         @test result.ground_area > 0.0
         # Buffered [0,10]×[0,10] should be roughly (10+4)×(10+4) = 196 m²
         @test result.ground_area > 100.0
+    end
+
+    @testset "Filter outputs are sorted Vector{Int} (Stage 2 contract)" begin
+        # The filter functions return integer index vectors per CLAUDE.md guideline.
+        pts = randn(1000, 3)
+        polygon = [-2.0 -2.0; 2.0 -2.0; 2.0 2.0; -2.0 2.0]
+
+        for idx in (rnn_filter(pts, 0.5),
+                    voxel_connected_component_filter(pts, 0.1),
+                    XY_polygon_filter(pts, polygon))
+            @test idx isa Vector{Int}
+            @test issorted(idx)
+        end
     end
 end

@@ -43,10 +43,10 @@ neighbor_radius = -1.0         # If <= 0, defaults to 1.5 * pipeline.subsample_r
 frontier_min_cc_size = 3       # Minimum frontier CC size during NBS greedy expansion
 nbs_neighbor_distance = 2      # Hop distance for greedy NBS search
 min_nbs_size = 5               # Minimum points per NBS segment (also min CC size for tree graph)
-nbs_max_iterations = 10000     # Maximum NBS iterations
 linearity_angle_deg = 80.0  # Max angular deviation (degrees) for NBS expansion direction filtering
-assembly_merge_threshold = 0.5  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
+assembly_merge_threshold = 0.8  # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
 assembly_occlusion_tolerance = 0.1  # Max distance (m) to search for nearby assigned points when rescuing orphan NBS
+resolve_isolated_branches = false   # If true, for any connected component where no near-ground NBS was found, seed the single largest NBS as a fresh tree and run iterative growth from it (rescues ground-disconnected branch clusters before orphan rescue)
 
 [qsm]
 nbs_linearity_threshold = 0.5   # Minimum linearity (λ₃-λ₂)/λ₃ for an NBS to be processed by QSM
@@ -58,9 +58,10 @@ surface_res_scalar = 0.5        # Multiplier on subsample_res for surface resolu
 completeness_threshold = 0.25   # Minimum fraction of phi-bins filled to accept node
 breast_height = 1.3             # Reference height (m) for DBH calculation
 spl_z_smoothing = 0.3           # Cross-slice smoothing weight for spline method (0=disabled, 1=max)
-rho_percentile = 1.0            # Rho percentile filter per bin (1.0=mean of all, <1.0=discard outer fraction, shrinks toward inner surface)
+rho_percentile = 1.0            # Per-slice rho-percentile filter applied before 2D surface fit (1.0 = no filtering; <1.0 = drop top fraction of rho per slice, shrinks fit toward inner wood, reduces overestimation from leafy/noisy outer points)
 min_octant_taubin = 3           # Min distinct angular octants (of 8) for a slice to use Taubin circle fit
-min_octant_centroid = 5         # Min distinct angular octants (of 8) for a slice to use centroid fallback; below this the slice is deferred to neighbor interpolation
+qc_enable = true                # Per-slice quality control: drop SOR outliers, keep the dominant CC, then refit centerline. CC link radius and min size reuse pipeline_subsample_res × QC_CC_RADIUS_SCALAR (=2.0) and qsm.min_node_size; SOR reuses statistical_filter.k_neighbors and statistical_filter.n_sigma.
+qc_continuity_ratio = 0.7       # If 2nd-largest CC size ≥ ratio × largest, break the tie by centroid distance to the previous slice's center
 
 [statistical_filter]
 k_neighbors = 6       # Number of nearest neighbors for mean-distance computation

@@ -24,10 +24,10 @@
             coords = rand(Float64, 150, 3)
             pc = make_test_pointcloud(coords)
             agh = rand(Float64, length(pc))
-            pc_agh = setattribute!(pc, :AGH, agh)
+            setattribute!(pc, :AGH, agh)
 
             output_path = joinpath(test_dir, "test_agh_output.las")
-            write_las(output_path, pc_agh)
+            write_las(output_path, pc)
             @test isfile(output_path)
 
             pc2 = read_las(output_path)
@@ -38,7 +38,7 @@
         @testset "Subsample and save" begin
             coords = rand(Float64, 500, 3)
             pc = make_test_pointcloud(coords)
-            pc_sub = distance_subsample(pc, 0.1)
+            pc_sub = pc[distance_subsample(coordinates(pc), 0.1)]
             @test length(pc_sub) <= length(pc)
 
             output_path = joinpath(test_dir, "test_subsampled.las")
@@ -194,6 +194,22 @@
             merged = FLiP._merge_scan_attrs([a1, a2])
             @test merged[:color_red] == UInt16[1, 2, 3, 4]
             @test merged[:color_green] == UInt16[10, 20, 30, 40]
+        end
+    end
+
+    @testset "find_scan_outputs handles prefixes containing _S\\d+" begin
+        # Regression test for Stage 6.4: anchored regex prevents a prefix
+        # like "site_S03_" from causing the index extractor to capture "03"
+        # instead of the real scan suffix.
+        mktempdir() do d
+            for i in 0:2
+                touch(joinpath(d, "site_S03_preprocess_S$(i).las"))
+            end
+            out = FLiP.find_scan_outputs(d, "site_S03_", "preprocess", "las")
+            @test length(out) == 3
+            @test endswith(out[1], "_S0.las")
+            @test endswith(out[2], "_S1.las")
+            @test endswith(out[3], "_S2.las")
         end
     end
 
