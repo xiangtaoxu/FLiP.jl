@@ -170,6 +170,7 @@ end
     c1, a1 = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c1, 1) <= 500
     @test length(a1[:intensity]) == size(c1, 1)
+    @test a1 isa Dict{Symbol,Vector}
 
     # Stat-filter only (the previously-broken E57 case)
     cfg.pipeline.enable_subsample = false
@@ -180,6 +181,7 @@ end
     @test size(c2, 1) < 500            # outliers removed
     @test size(c2, 1) >= 490           # most clean points kept
     @test length(a2[:intensity]) == size(c2, 1)
+    @test a2 isa Dict{Symbol,Vector}
 
     # Both on
     cfg.pipeline.enable_subsample = true
@@ -187,9 +189,23 @@ end
     c3, a3 = FLiP._apply_preprocess_filters(coords, attrs; cfg=cfg)
     @test size(c3, 1) <= size(c1, 1)
     @test length(a3[:intensity]) == size(c3, 1)
+    @test a3 isa Dict{Symbol,Vector}
 
     # Helper does not mutate its inputs
     @test length(attrs[:intensity]) == 500
+
+    # Regression: a filtered cloud with NO attributes (e.g. an E57 with neither
+    # intensity nor color) must still yield a Dict{Symbol,Vector}, so the
+    # downstream `PointCloud(coords, attrs)` constructor accepts it. Previously
+    # the untyped comprehension produced a Dict{Any,Any} here and threw a
+    # MethodError at construction time.
+    empty_attrs = Dict{Symbol,Vector}()
+    cfg.pipeline.enable_subsample = false
+    cfg.preprocess.enable_statistical_filter = true
+    c4, a4 = FLiP._apply_preprocess_filters(Float32.(coords), empty_attrs; cfg=cfg)
+    @test a4 isa Dict{Symbol,Vector}
+    @test isempty(a4)
+    @test FLiP.PointCloud(c4, a4) isa FLiP.PointCloud   # the real call site
 end
 
 @testset "Main pipeline aborts when upstream data missing" begin

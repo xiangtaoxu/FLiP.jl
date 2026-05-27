@@ -103,14 +103,14 @@ function _apply_preprocess_filters(coords::AbstractMatrix, attrs::Dict; cfg::FLi
     if cfg.pipeline.enable_subsample
         keep = distance_subsample(coords, cfg.pipeline.subsample_res)
         coords = coords[keep, :]
-        attrs = Dict(k => v[keep] for (k, v) in attrs)
+        attrs = Dict{Symbol,Vector}(k => v[keep] for (k, v) in attrs)
     end
     if cfg.preprocess.enable_statistical_filter
         keep = statistical_filter(coords,
                                   cfg.statistical_filter.k_neighbors,
                                   cfg.statistical_filter.n_sigma)
         coords = coords[keep, :]
-        attrs = Dict(k => v[keep] for (k, v) in attrs)
+        attrs = Dict{Symbol,Vector}(k => v[keep] for (k, v) in attrs)
     end
     return coords, attrs
 end
