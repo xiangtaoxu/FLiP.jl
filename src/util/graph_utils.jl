@@ -1,34 +1,31 @@
 """
 Graph algorithms used by tree segmentation. Most functions either operate on
-`SimpleGraph` + weight matrices, or build such a graph from a point-cloud
-N×3 coordinate matrix.
+`SimpleGraph` + sparse weight matrices, or build such a graph from a point
+cloud N×3 coordinate matrix.
 
-Functions:
-- `build_radius_graph(points, radius)`               — KDTree-radius graph + weights
-- `build_graph(graph, points, comp_idx, vidx)`       — induce subgraph for a component
-- `quotient_graph(points, graph, labels)`            — collapse vertices by label
-- `shortest_path_distances(points, graph, weights, target)` — Dijkstra from a target
-- `shortest_path_subset!(ws, graph, weights, subset, target)`
-                                                     — Dijkstra restricted to a vertex subset
-- `connected_component_subset!(ws, graph, subset; min_cc_size)`
-                                                     — subset-restricted CC via BFS
-- `slice_by_shortest_path(points, graph, weights, target, slice_len)`
-                                                     — bucket vertices by SP distance
-- `generate_proto_nodes_from_slice_label(points, slice_labels, max_dist; min_cc_size)`
-                                                     — proto-node labels from slices
-- `greedy_neighborhood_search(graph, starts, dist; …)`
-                                                     — NBS-style frontier expansion
-- `longest_linear_path(graph, points, root; edge_vectors)`
-                                                     — root-origin angular linear path
-- `graph_connected_component_labels(graph, min_cc_size=1)`
-                                                     — vertex labels ranked by component size
+File layout (in order):
+  1. Graph construction              — build_radius_graph, build_graph
+  2. Subset-aware connected components — connected_component_subset!
+  3. Shortest-path traversal & quotient — shortest_path_subset!,
+                                          shortest_path_distances, quotient_graph
+  4. Slice & proto-node generation   — slice_by_shortest_path,
+                                       generate_proto_nodes_from_slice_label
+  5. Linear path extraction          — longest_linear_path
+  6. Greedy neighborhood search      — greedy_neighborhood_search (NBS expansion)
+  7. BFS-based CC + branching        — _cc_diameter_hops, _refine_branching
+  8. Internal helpers                — validation, KDTree, heap, traversal selectors
+  9. Public: graph CC labels         — graph_connected_component_labels
 
-Workspaces (pre-allocated buffers for repeated calls; each is defined
-immediately above the function that uses it):
-- `ConnectedComponentSubsetWorkspace`
-- `ShortestPathSubsetWorkspace`
-- `GreedySearchWorkspace`
+Workspaces (pre-allocated buffers, each colocated with its consumer):
+- `ConnectedComponentSubsetWorkspace`, `ShortestPathSubsetWorkspace`,
+  `GreedySearchWorkspace`, `_BFSWorkspace` (internal).
 """
+
+# ════════════════════════════════════════════════════════════════════════════
+# Graph construction
+# Build a SimpleGraph (+ optional sparse weights) from an N×3 point cloud,
+# and induce subgraphs over connected components.
+# ════════════════════════════════════════════════════════════════════════════
 
 """
     build_radius_graph(points::AbstractMatrix{<:Real}, radius::Real; weights::Bool=true)
@@ -233,6 +230,11 @@ function build_graph(graph::SimpleGraph{Int}, points::AbstractMatrix{<:Real},
     return (graph=comp_graph, weights=sparse(rows, cols, vals, n_local, n_local))
 end
 
+# ════════════════════════════════════════════════════════════════════════════
+# Subset-aware connected components
+# Reusable workspace + BFS-based CC labelling restricted to a vertex subset.
+# ════════════════════════════════════════════════════════════════════════════
+
 """
     ConnectedComponentSubsetWorkspace(n_vertices)
 
@@ -339,6 +341,12 @@ function connected_component_subset!(graph::SimpleGraph{Int},
     workspace = ConnectedComponentSubsetWorkspace(nv(graph))
     return connected_component_subset!(workspace, graph, subset, min_cc_size)
 end
+
+# ════════════════════════════════════════════════════════════════════════════
+# Shortest-path traversal & quotient graph
+# Dijkstra (full + subset-restricted), with reusable workspace; plus the
+# quotient_graph that collapses vertices by label and reuses the same Dijkstra.
+# ════════════════════════════════════════════════════════════════════════════
 
 """
     ShortestPathSubsetWorkspace(n_vertices)
@@ -586,6 +594,12 @@ function shortest_path_distances(points::AbstractMatrix{<:Real}, graph::SimpleGr
     return shortest_path_distances(points, graph, weights, target_idx)
 end
 
+# ════════════════════════════════════════════════════════════════════════════
+# Slice & proto-node generation
+# Bucket vertices by shortest-path distance, then split each slice into
+# proto-node CC labels.
+# ════════════════════════════════════════════════════════════════════════════
+
 """
     slice_by_shortest_path(points, graph, weights, target, slice_length::Real) -> NamedTuple
 
@@ -718,6 +732,11 @@ function generate_proto_nodes_from_slice_label(points::AbstractMatrix{<:Real},
     return proto_nodes
 end
 
+# ════════════════════════════════════════════════════════════════════════════
+# Linear path extraction
+# Angle-first traversal from a root vertex for skeleton extraction.
+# ════════════════════════════════════════════════════════════════════════════
+
 """
     longest_linear_path(graph::SimpleGraph{Int}, points::AbstractMatrix{<:Real}, root::Integer;
                         edge_vectors=nothing)
@@ -764,6 +783,13 @@ function longest_linear_path(graph::SimpleGraph{Int}, points::AbstractMatrix{<:R
 
     return (vertices=path, length=total_length)
 end
+
+# ════════════════════════════════════════════════════════════════════════════
+# Greedy neighborhood search (NBS frontier expansion)
+# Workspace-backed BFS that grows linear, locally-coherent segments.
+# Largest block: ~500 lines including direction-fit and frontier-selection
+# helpers.
+# ════════════════════════════════════════════════════════════════════════════
 
 """
     GreedySearchWorkspace(n_vertices)
@@ -1276,6 +1302,12 @@ function _find_best_frontier(
     return best_cc
 end
 
+# ════════════════════════════════════════════════════════════════════════════
+# BFS-based CC analysis & branching refinement
+# Subset-restricted multi-source BFS with touched-vertex cleanup; used by
+# `_cc_diameter_hops` and `_refine_branching`.
+# ════════════════════════════════════════════════════════════════════════════
+
 """
 Lightweight BFS workspace with touched-vertex cleanup for subset-restricted
 multi-source BFS. Vectors are sized to `nv(graph)` but only touched entries
@@ -1547,6 +1579,12 @@ function _refine_branching(graph::SimpleGraph{Int},
 
     return n_reassigned
 end
+
+# ════════════════════════════════════════════════════════════════════════════
+# Internal helpers
+# BFS run/cleanup, validation, KDTree construction, heap ops, path traversal
+# sub-selectors. Not exported; called from the public functions above.
+# ════════════════════════════════════════════════════════════════════════════
 
 # Run BFS without cleanup (caller reads distances then calls _bfs_cleanup!)
 function _bfs_run_and_read!(bfs_ws::_BFSWorkspace,
@@ -1887,6 +1925,12 @@ function _select_linear_neighbor(previous::Int, current::Int, candidates::Vector
 
     return best
 end
+
+# ════════════════════════════════════════════════════════════════════════════
+# Public: graph-only connected component labels
+# Whole-graph CC labelling (size-ranked); distinct from the subset-restricted
+# version above and from the XYZ-based labeller in pointcloud_utils.jl.
+# ════════════════════════════════════════════════════════════════════════════
 
 """
     graph_connected_component_labels(graph::SimpleGraph{Int},

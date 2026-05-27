@@ -298,7 +298,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               agh_values::AbstractVector{<:Real},
                               cfg::FLiPConfig,
                               next_node_id::Int)
-    slice_res = cfg.qsm.slice_height_scalar * cfg.pipeline.subsample_res
+    qsm = cfg.qsm                                          # local alias for terseness
+    slice_res = qsm.slice_height_scalar * cfg.pipeline.subsample_res
 
     # 2a: Slice, fit centers, interpolate, smooth. Per-slice QC inside
     # _slice_and_fit_centers may drop points; `indices` is rebound here to the
@@ -308,8 +309,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     # (both done inside `_finalize_centerline!`). Dropped points keep
     # qsm_node_id = 0 by default.
     centers, slice_point_indices, _, _, pt_slice_ids, e1, e2, indices =
-        _slice_and_fit_centers(coords, info, slice_res, cfg.qsm.min_node_size,
-                               cfg.qsm.min_octant_taubin, cfg)
+        _slice_and_fit_centers(coords, info, slice_res, qsm.min_node_size,
+                               qsm.min_octant_taubin, cfg)
 
     # 2b: Unroll points to (rho, phi)
     rho, phi = _unroll_points(coords, indices, centers, pt_slice_ids, e1, e2)
@@ -319,7 +320,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     n_slices = size(centers, 1)
     rho, phi, pt_slice_ids, slice_point_indices, indices =
         _filter_rho_outliers(rho, phi, pt_slice_ids, slice_point_indices, indices,
-                             n_slices, cfg.qsm.rho_percentile)
+                             n_slices, qsm.rho_percentile)
 
     # All points in an NBS share the same tree_id (tree_segmentation assigns per-NBS),
     # so a single lookup suffices instead of an argmax over a histogram.
@@ -334,7 +335,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     for s in 1:n_slices
         local_js = slice_point_indices[s]
         n_pts = length(local_js)
-        n_pts < cfg.qsm.min_node_size && continue
+        n_pts < qsm.min_node_size && continue
 
         # Mean AGH for this slice
         mean_agh = 0.0
@@ -347,7 +348,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
         ca = spl_results[s].cross_area
         circ = spl_results[s].circumference
         completeness = spl_results[s].completeness
-        completeness < cfg.qsm.completeness_threshold && continue
+        completeness < qsm.completeness_threshold && continue
 
         push!(nodes, QSMNode(
             next_node_id, nbs_id, dominant_tree, dominant_tree_nbs,
@@ -894,17 +895,18 @@ have zeros. The angular bin count adapts to NBS size via the median of `rho`.
 function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
                            pt_slice_ids::Vector{Int}, n_slices::Int,
                            cfg::FLiPConfig)
+    qsm = cfg.qsm                                          # local alias
     T = NamedTuple{(:cross_area, :circumference, :completeness), Tuple{Float64, Float64, Float64}}
     results = Vector{T}(undef, n_slices)
     fill!(results, (cross_area=0.0, circumference=0.0, completeness=0.0))
 
     rho_median_global = isempty(rho) ? 0.01 : median(rho)
-    surface_res = cfg.qsm.surface_res_scalar * cfg.pipeline.subsample_res
+    surface_res = qsm.surface_res_scalar * cfg.pipeline.subsample_res
     phi_bin_num = clamp(ceil(Int, 2π * rho_median_global / surface_res),
-                        cfg.qsm.phi_bin_min, cfg.qsm.phi_bin_max)
+                        qsm.phi_bin_min, qsm.phi_bin_max)
     dphi = 2π / phi_bin_num
 
-    # Build 2D surface (rho already pre-filtered upstream via cfg.qsm.rho_percentile)
+    # Build 2D surface (rho already pre-filtered upstream via qsm.rho_percentile)
     surface = _build_rho_surface(rho, phi, pt_slice_ids, n_slices, phi_bin_num)
 
     # Compute completeness per slice before gap-filling
@@ -916,7 +918,7 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
 
     # Fill gaps and smooth
     _fill_gaps_2d!(surface)
-    _smooth_surface_2d!(surface, 0.5, cfg.qsm.spl_z_smoothing)
+    _smooth_surface_2d!(surface, 0.5, qsm.spl_z_smoothing)
 
     # Extract per-slice metrics
     @inbounds for s in 1:n_slices
