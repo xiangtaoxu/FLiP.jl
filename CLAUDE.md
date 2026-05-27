@@ -17,7 +17,7 @@ Approach every task as a Julia expert: write idiomatic, type-stable, allocation-
 4. Extract individual trees and their skeletons via NBS extraction + assembly
 5. Fit Quantitative Structural Models (QSM) — per-branch cross-sections, per-tree DBH / volume / surface area
 
-**Current status:** v0.1.0, 515/515 tests passing. Target: Julia ≥ 1.9.
+**Current status:** v0.6.1, 526/526 tests passing. Target: Julia ≥ 1.9.
 
 ---
 
@@ -140,7 +140,7 @@ julia --project=. test/test_graph.jl
 - **Always run affected tests** after any change.
 - When adding a function, add a corresponding `@test` block in the appropriate `test/test_*.jl` file.
 - Use real LAS/LAZ test data from `test/` where available; generate synthetic data with `StaticArrays` / `rand` for unit tests.
-- Current baseline: **515/515 tests passing**. Do not regress below this.
+- Current baseline: **526/526 tests passing**. Do not regress below this.
 
 ---
 
