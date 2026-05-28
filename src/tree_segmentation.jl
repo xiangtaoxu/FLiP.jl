@@ -122,7 +122,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
 
     # Per-CC progress reported as % of cumulative points processed. The reporter
     # is thread-safe (atomic CAS); the counter is a shared `Threads.Atomic{Int}`
-    # so it remains correct under `parallel_for`.
+    # so it remains correct under `_parallel_for`.
     progress = ProgressReporter("processing components", N)
     processed_points = Threads.Atomic{Int}(0)
 
@@ -142,7 +142,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     # `Vector{Any}` retention of all results). Writes target this component's
     # `gi ∈ cc_indices`; those index sets are disjoint across components, so the
     # shared `global_*` arrays are written race-free.
-    parallel_for(n_components, effective_nthreads(cfg)) do ci
+    _parallel_for(n_components, effective_nthreads(cfg)) do ci
         @inbounds begin
             cc_indices = cc_indices_by_id[ci]
             cc_coords  = coords_filtered[cc_indices, :]
@@ -1074,47 +1074,6 @@ end
 # ── Step 5: occlusion-gap rescue of orphan branches ──────────────
 
 """
-    _parallel_findall(pred, N, n_thread) -> Vector{Int}
-
-Collect, in ascending order, every `i in 1:N` for which `pred(i)` is true, scanning the
-range in up to `n_thread` contiguous chunks concurrently. Each task fills its own buffer
-and the buffers are concatenated in chunk order, so the result is deterministic and
-independent of thread scheduling. Falls back to a serial scan for small `N` or one thread.
-"""
-function _parallel_findall(pred::F, N::Integer, n_thread::Integer) where {F}
-    n = Int(N)
-    n <= 0 && return Int[]
-    nt = min(Int(n_thread), n)
-    if nt <= 1 || Threads.nthreads() == 1
-        out = Int[]
-        @inbounds for i in 1:n
-            pred(i) && push!(out, i)
-        end
-        return out
-    end
-    chunk   = cld(n, nt)
-    nchunks = cld(n, chunk)
-    parts   = Vector{Vector{Int}}(undef, nchunks)
-    @sync for c in 1:nchunks
-        lo = (c - 1) * chunk + 1
-        hi = min(c * chunk, n)
-        Threads.@spawn begin
-            buf = Int[]
-            @inbounds for i in lo:hi
-                pred(i) && push!(buf, i)
-            end
-            parts[c] = buf
-        end
-    end
-    out = Int[]
-    sizehint!(out, sum(length, parts))
-    for p in parts
-        append!(out, p)
-    end
-    return out
-end
-
-"""
     _occluded_round_votes(frontier, coords, tree_id, tree_nbs_id, orphan_voxel_index,
                           assigned, inv_vs, link_tol2, n_thread)
         -> Dict{Tuple{Int32,Int32}, Int}
@@ -1165,10 +1124,10 @@ function _occluded_round_votes(frontier::Vector{Int}, coords::AbstractMatrix{<:R
     chunk   = cld(M, nt)
     nchunks = cld(M, chunk)
     parts   = Vector{Dict{Tuple{Int32,Int32}, Int}}(undef, nchunks)
-    @sync for c in 1:nchunks
+    _parallel_for(nchunks, nt) do c
         lo = (c - 1) * chunk + 1
         hi = min(c * chunk, M)
-        Threads.@spawn parts[c] = count_chunk(lo, hi)
+        parts[c] = count_chunk(lo, hi)   # distinct slot per chunk → race-free
     end
     votes = Dict{Tuple{Int32,Int32}, Int}()
     for d in parts, (k, v) in d

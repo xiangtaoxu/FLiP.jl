@@ -50,6 +50,7 @@ function ground_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
             xy_resolution=cfg.pipeline.xy_resolution,
             idw_k=cfg.pipeline.idw_k,
             idw_power=cfg.pipeline.idw_power,
+            n_thread=effective_nthreads(cfg),
         )
         # addattribute returns a new PointCloud sharing pc_use.coords — avoids
         # leaking :AGH onto the caller's input cloud when crop is disabled.
@@ -181,7 +182,8 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
                                       xy_resolution::Real,
                                       idw_k::Int=8,
                                       idw_power::Real=2.0,
-                                      ground_polygon::Union{Nothing,AbstractMatrix}=nothing)
+                                      ground_polygon::Union{Nothing,AbstractMatrix}=nothing,
+                                      n_thread::Integer=effective_nthreads())
     npoints(ground_points) >= 3 || throw(ArgumentError(
         "ground_points must contain at least 3 points for interpolation; got $(npoints(ground_points))"))
     xy_resolution > 0 || throw(ArgumentError("xy_resolution must be > 0"))
@@ -235,21 +237,19 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     grid_tree = KDTree(grid_xy_t)
     max_d = sqrt(2.0) * step
 
-    # 5. Snap each query to its nearest grid cell (threaded)
+    # 5. Snap each query to its nearest grid cell (threaded; writes disjoint agh[i])
     agh = Vector{Float64}(undef, n)
-    @inbounds Threads.@threads for i in 1:n
-        xq = float(points[i, 1])
-        yq = float(points[i, 2])
-        zq = float(points[i, 3])
-        if !(isfinite(xq) && isfinite(yq) && isfinite(zq))
-            agh[i] = NaN
-            continue
-        end
-        idxs, dists = knn(grid_tree, SVector(xq, yq), 1, true)
-        if dists[1] > max_d
-            agh[i] = NaN
-        else
-            agh[i] = zq - grid_z[idxs[1]]
+    _parallel_for(n, n_thread) do i
+        @inbounds begin
+            xq = float(points[i, 1])
+            yq = float(points[i, 2])
+            zq = float(points[i, 3])
+            if !(isfinite(xq) && isfinite(yq) && isfinite(zq))
+                agh[i] = NaN
+                return
+            end
+            idxs, dists = knn(grid_tree, SVector(xq, yq), 1, true)
+            agh[i] = dists[1] > max_d ? NaN : zq - grid_z[idxs[1]]
         end
     end
 

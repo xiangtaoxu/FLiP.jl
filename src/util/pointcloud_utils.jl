@@ -135,7 +135,7 @@ function statistical_filter(points::AbstractMatrix{<:Real},
     # are disjoint per iteration.
     mean_dists = Vector{Float64}(undef, n)
 
-    parallel_for(n, n_thread) do i
+    _parallel_for(n, n_thread) do i
         @inbounds begin
             q = SVector(points[i, 1], points[i, 2], points[i, 3])
             _, dists = knn(tree, q, k_neighbors + 1)

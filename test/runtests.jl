@@ -18,6 +18,7 @@ end
 @testset "FLiP.jl" begin
     include("test_types.jl")
     include("test_logging.jl")
+    include("test_parallelization.jl")
     include("test_io.jl")
     include("test_subsampling.jl")
     include("test_filtering.jl")

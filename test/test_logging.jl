@@ -42,39 +42,4 @@
     @testset "_LOG_PREFIX constant defined" begin
         @test FLiP._LOG_PREFIX == "[FLiP]"
     end
-
-    @testset "parallel_for — dynamic scheduling" begin
-        # Empty / degenerate ranges.
-        let hits = Threads.Atomic{Int}(0)
-            FLiP.parallel_for(0, 4) do _; Threads.atomic_add!(hits, 1); end
-            @test hits[] == 0
-        end
-        let hits = Threads.Atomic{Int}(0)
-            FLiP.parallel_for(1, 4) do _; Threads.atomic_add!(hits, 1); end
-            @test hits[] == 1
-        end
-
-        # Every index 1:n is visited exactly once, across thread budgets and for
-        # n both smaller than and much larger than the budget. Each worker writes
-        # its own disjoint slot, so no atomics are needed for correctness.
-        for nt in (1, 3), n in (2, 1000)
-            visited = zeros(Int, n)
-            FLiP.parallel_for(n, nt) do i
-                visited[i] += 1
-            end
-            @test all(==(1), visited)
-        end
-
-        # Skewed per-index cost (early indices sleep longer) must not change the
-        # result: dynamic scheduling reorders execution but the per-slot output
-        # matches the serial computation.
-        let n = 200
-            out = Vector{Int}(undef, n)
-            FLiP.parallel_for(n, 3) do i
-                i <= 5 && sleep(0.005)   # heavy items concentrated at the front
-                out[i] = i * i
-            end
-            @test out == [i * i for i in 1:n]
-        end
-    end
 end

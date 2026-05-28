@@ -49,6 +49,7 @@ using Rotations
 include("types/pointcloud.jl")
 include("config.jl")
 include("util/logging.jl")
+include("util/parallelization.jl")
 include("io.jl")
 include("util/array_utils.jl")
 include("util/geometry_utils.jl")

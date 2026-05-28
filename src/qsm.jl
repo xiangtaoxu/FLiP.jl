@@ -253,7 +253,7 @@ function _filter_linear_nbs(coords::AbstractMatrix{<:Real},
     # Embarrassingly parallel by NBS id: writes to distinct `result[nid]`.
     # `pca_linearity` allocates a local 3×3 covariance per call; no shared
     # mutable state. `nbs_groups` is fully populated above and read-only here.
-    parallel_for(K, effective_nthreads(cfg)) do nid
+    _parallel_for(K, effective_nthreads(cfg)) do nid
         indices = nbs_groups[nid]
         isempty(indices) && return
         pca = pca_linearity(coords, indices, cfg.qsm.nbs_linearity_threshold)
@@ -1304,7 +1304,7 @@ function _build_tree_table(nodes::Vector{QSMNode},
 
     # Embarrassingly parallel: each tree writes a distinct row of every column.
     # `tree_groups`, `nodes`, `vol`, `sa` are read-only here.
-    parallel_for(n_trees, effective_nthreads(cfg)) do ti
+    _parallel_for(n_trees, effective_nthreads(cfg)) do ti
         idxs = tree_groups[ti]
         total_vol = sum(i -> vol[i], idxs)
         total_sa  = sum(i -> sa[i],  idxs)
