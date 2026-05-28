@@ -194,124 +194,101 @@
         @test all(tree_id  .== Int32(1))               # every point assigned
     end
 
-    @testset "resolve_isolated_branches via assemble_segments" begin
+    @testset "assemble_segments: ungrounded components become orphans" begin
         f = _make_chain_fixture()
 
-        # CC-B: no near-ground NBS. Even the lowest AGH is above the ceiling
-        # (default threshold 0.3 + 2 * subsample_res 0.05 = 0.4).
+        # No near-ground NBS (lowest AGH above the ceiling 0.3 + 2*0.05 = 0.4): the
+        # largest NBS is seeded and the component is grown so branches get a
+        # `tree_nbs_id`, but the temporary `tree_id` is zeroed → every point becomes an
+        # orphan (tree_id==0, tree_nbs_id>0) for the occlusion rescue.
         agh_no_ground = fill(1.0, 12)
+        res_ung = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                         agh_no_ground, f.graph_skeleton, f.skel_pc)
+        @test all(==(Int32(0)), res_ung.tree_id)       # no positive tree_id
+        @test all(>(Int32(0)), res_ung.tree_nbs_id)    # branches kept
 
-        cfg_off = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_off.tree_segmentation.resolve_isolated_branches = false
-        res_off = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
-                                         agh_no_ground, f.graph_skeleton, f.skel_pc;
-                                         cfg=cfg_off)
-        @test all(==(Int32(0)), res_off.tree_id)       # nothing assigned without the flag
-
-        cfg_on = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_on.tree_segmentation.resolve_isolated_branches = true
-        res_on = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
-                                        agh_no_ground, f.graph_skeleton, f.skel_pc;
-                                        cfg=cfg_on)
-        @test all(>(Int32(0)), res_on.tree_id)         # every point now has a tree id
-        @test length(unique(res_on.tree_id)) == 1      # all merged into one tree
-
-        # CC-A regression: with a near-ground NBS, the fallback must NOT fire,
-        # so the result with the flag on equals the result with it off.
+        # With a near-ground NBS: grounded → positive tree_id, one tree.
         agh_with_ground = vcat(fill(0.1, 4), fill(1.0, 4), fill(2.0, 4))
+        res_g = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
+                                       agh_with_ground, f.graph_skeleton, f.skel_pc)
+        @test all(>(Int32(0)), res_g.tree_id)
+        @test length(unique(res_g.tree_id[res_g.tree_id .> 0])) == 1
 
-        res_gate_off = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
-                                              agh_with_ground, f.graph_skeleton, f.skel_pc;
-                                              cfg=cfg_off)
-        res_gate_on  = FLiP.assemble_segments(f.graph, f.coords, f.nbs_id, f.node_id,
-                                              agh_with_ground, f.graph_skeleton, f.skel_pc;
-                                              cfg=cfg_on)
-        @test res_gate_off.tree_id == res_gate_on.tree_id
-        @test length(unique(res_gate_on.tree_id[res_gate_on.tree_id .> 0])) == 1
+        # K_nbs == 0 (all NBS discarded): nothing assigned.
+        nbs_none = zeros(Int, 12)
+        res_none = FLiP.assemble_segments(f.graph, f.coords, nbs_none, f.node_id,
+                                          agh_no_ground, f.graph_skeleton, f.skel_pc)
+        @test all(==(Int32(0)), res_none.tree_id)
+        @test all(==(Int32(0)), res_none.tree_nbs_id)
     end
 
-    @testset "_propagate_orphan_labels" begin
-        # 3 orphan NBS:
-        #  orphan 1: directly connected to tree 7 via KDTree pass
-        #  orphan 2: orphan-orphan edge to orphan 1 only (no direct tree edge)
-        #  orphan 3: no edges at all → stays unrescued
-        coarse_o2o = [
-            Dict{Int,Int}(2 => 5),    # orphan 1 ↔ orphan 2 (count 5)
-            Dict{Int,Int}(1 => 5),
-            Dict{Int,Int}(),          # orphan 3 isolated
-        ]
-        coarse_o2t = [
-            Dict{Int32,Int}(Int32(7) => 10),   # orphan 1 → tree 7
-            Dict{Int32,Int}(),
-            Dict{Int32,Int}(),
-        ]
-        orphan_nbs_points = [[1, 2], [3, 4, 5], [6]]
-
-        result = FLiP._propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points)
-
-        @test result[1] == Int32(7)   # rescued via direct tree edge
-        @test result[2] == Int32(7)   # rescued via orphan 1 (after orphan 1 is in)
-        @test result[3] == Int32(0)   # never rescued — no edges
-
-        # Tie-breaking: most-voted tree wins
-        coarse_o2o2 = [Dict{Int,Int}()]
-        coarse_o2t2 = [Dict{Int32,Int}(Int32(3) => 1, Int32(9) => 7)]
-        @test FLiP._propagate_orphan_labels(coarse_o2o2, coarse_o2t2, [[1]])[1] == Int32(9)
-
-        # Empty input
-        @test FLiP._propagate_orphan_labels(Dict{Int,Int}[], Dict{Int32,Int}[],
-                                            Vector{Int}[]) == Int32[]
-    end
-
-    @testset "process_orphan_segments merge_threshold" begin
-        # Pre-assigned tree 1: 4 points along the z-axis at x=y=0, NBS 1, node 1.
-        # Orphan NBS 2 has 4 points spanning 2 distinct node_ids:
-        #   node 2 (close, within occlusion_tol of tree):  pts 5,6
-        #   node 3 (far from any assigned pt):              pts 7,8
-        # Node-based frac_connected = 1 connected node of 2 total = 0.5.
+    # Defaults: occlusion_tol=0.1, sub_res=0.05 → exact link distance 0.15, voxel 0.2.
+    @testset "assemble_occluded_segments: orphan branch adjacent to grounded tree" begin
         coords = Float64[
-            0.00 0.0 0.0;
-            0.00 0.0 1.0;
-            0.00 0.0 2.0;
-            0.00 0.0 3.0;
-            0.05 0.0 0.0;
-            0.05 0.0 1.0;
-            10.0 0.0 0.0;
-            10.0 0.0 1.0;
+            0.00 0.0 0.0; 0.00 0.0 1.0; 0.00 0.0 2.0; 0.00 0.0 3.0;  # grounded tree 1
+            0.05 0.0 0.0; 0.05 0.0 1.0;                              # orphan branch 5
         ]
-        nbs_id  = Int32[1, 1, 1, 1, 2, 2, 2, 2]
-        node_id = Int32[1, 1, 1, 1, 2, 2, 3, 3]
+        tree_id     = Int32[1, 1, 1, 1, 0, 0]
+        tree_nbs_id = Int32[1, 1, 1, 1, 5, 5]
+        cfg = FLiP.FLiPConfig(Dict{String,Any}())
+        FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
+        @test tree_id[5:6]     == Int32[1, 1]   # adopted the grounded tree
+        @test tree_nbs_id[5:6] == Int32[5, 5]   # kept its own branch id
+    end
 
-        _initial_state() = (
-            tree_id     = Int32[1, 1, 1, 1, 0, 0, 0, 0],
-            tree_nbs_id = Int32[1, 1, 1, 1, 0, 0, 0, 0],
-        )
+    @testset "assemble_occluded_segments: bridges orphan→orphan→grounded chain" begin
+        # pt2 (0.1 from grounded pt1) links directly; pt3 (0.2 from pt1) only reaches
+        # ground through pt2 once pt2 is itself assigned.
+        coords = Float64[0.0 0.0 0.0; 0.1 0.0 0.0; 0.2 0.0 0.0]
+        tree_id     = Int32[1, 0, 0]
+        tree_nbs_id = Int32[1, 5, 6]
+        cfg = FLiP.FLiPConfig(Dict{String,Any}())
+        FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
+        @test tree_id     == Int32[1, 1, 1]   # whole chain grounded
+        @test tree_nbs_id == Int32[1, 5, 6]   # branch ids preserved
+    end
 
-        # Rule B: frac=0.5 > 0.0 → orphan merges into existing tree_nbs_id 1.
-        cfg_b = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_b.tree_segmentation.assembly_merge_threshold = 0.0
-        s_b = _initial_state()
-        FLiP.process_orphan_segments(coords, nbs_id, node_id,
-                                     s_b.tree_id, s_b.tree_nbs_id; cfg=cfg_b)
-        @test s_b.tree_id[5:8]     == Int32[1, 1, 1, 1]   # orphan joins tree 1
-        @test s_b.tree_nbs_id[5:8] == Int32[1, 1, 1, 1]   # merged into existing tnid
+    @testset "assemble_occluded_segments: branches migrate to nearest grounded tree" begin
+        coords = Float64[0.0 0.0 0.0; 10.0 0.0 0.0; 0.1 0.0 0.0; 10.1 0.0 0.0]
+        tree_id     = Int32[1, 2, 0, 0]
+        tree_nbs_id = Int32[1, 2, 5, 6]
+        cfg = FLiP.FLiPConfig(Dict{String,Any}())
+        FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
+        @test tree_id[3] == Int32(1)            # branch 5 → tree 1
+        @test tree_id[4] == Int32(2)            # branch 6 → tree 2 (separately)
+        @test tree_nbs_id == Int32[1, 2, 5, 6]
+    end
 
-        # Rule A: frac=0.5 ≤ 0.5 → orphan keeps tree 1 but gets a fresh tnid (> 1).
-        cfg_a = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_a.tree_segmentation.assembly_merge_threshold = 0.5
-        s_a = _initial_state()
-        FLiP.process_orphan_segments(coords, nbs_id, node_id,
-                                     s_a.tree_id, s_a.tree_nbs_id; cfg=cfg_a)
-        @test s_a.tree_id[5:8]                == Int32[1, 1, 1, 1]   # same tree_id
-        @test all(>(Int32(1)), s_a.tree_nbs_id[5:8])                 # not merged into tnid 1
-        @test length(unique(s_a.tree_nbs_id[5:8])) == 1              # all share one fresh tnid
+    @testset "assemble_occluded_segments: isolated orphan stays ungrounded" begin
+        coords = Float64[0.0 0.0 0.0; 100.0 0.0 0.0]
+        tree_id     = Int32[1, 0]
+        tree_nbs_id = Int32[1, 5]
+        cfg = FLiP.FLiPConfig(Dict{String,Any}())
+        FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
+        @test tree_id     == Int32[1, 0]   # not rescued
+        @test tree_nbs_id == Int32[1, 5]   # branch id kept
+    end
 
-        # merge_threshold = 1.0 fully suppresses orphan→tnid merging.
-        cfg_strict = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg_strict.tree_segmentation.assembly_merge_threshold = 1.0
-        s_strict = _initial_state()
-        FLiP.process_orphan_segments(coords, nbs_id, node_id,
-                                     s_strict.tree_id, s_strict.tree_nbs_id; cfg=cfg_strict)
-        @test all(>(Int32(1)), s_strict.tree_nbs_id[5:8])
+    @testset "assemble_occluded_segments: disabled when occlusion_tol ≤ 0" begin
+        coords = Float64[0.0 0.0 0.0; 0.05 0.0 0.0]
+        tree_id     = Int32[1, 0]
+        tree_nbs_id = Int32[1, 5]
+        cfg = FLiP.FLiPConfig(Dict{String,Any}())
+        cfg.tree_segmentation.assembly_occlusion_tolerance = 0.0
+        FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
+        @test tree_id     == Int32[1, 0]   # untouched
+        @test tree_nbs_id == Int32[1, 5]
+    end
+
+    @testset "_relabel_tree_nbs_within_trees!" begin
+        # tree 1:{10×2, 20×2}, tree 2:{7}, tree 0:{99}; tnbs 0 stays 0.
+        tree_id     = Int32[1, 1, 1, 1, 2, 0, 0]
+        tree_nbs_id = Int32[10, 10, 20, 20, 7, 99, 0]
+        FLiP._relabel_tree_nbs_within_trees!(tree_id, tree_nbs_id)
+        # Valid trees first (tree_id asc, count desc, tnbs asc); the tree_id==0 group LAST:
+        # (1,10)→1, (1,20)→2, (2,7)→3, then (0,99)→4.
+        @test tree_nbs_id == Int32[1, 1, 2, 2, 3, 4, 0]
+        # globally unique: each new tnbs maps to exactly one tree.
+        @test length(unique(tree_nbs_id[tree_nbs_id .> 0])) == 4
     end
 end

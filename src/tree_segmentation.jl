@@ -22,9 +22,10 @@ orchestrator-first, helpers below in call order.
        near-ground NBS along the skeleton graph using Rule A (new branch)
        or Rule B (merge into existing NBS).
 4. Concatenate per-component skeletons into one cloud + graph.
-5. Cross-component orphan-NBS rescue
-   ([`process_orphan_segments`](@ref)).
-6. Re-order tree IDs by descending point count (largest tree → 1).
+5. Rescue orphan branches (`tree_id==0 && tree_nbs_id>0`) into neighboring grounded
+   trees across occlusion gaps ([`assemble_occluded_segments`](@ref)).
+6. Re-order tree IDs by descending point count (largest tree → 1), then make
+   `tree_nbs_id` contiguous within each tree.
 7. Stamp `:nbs_id`, `:node_id`, `:tree_id`, `:tree_nbs_id` onto the cloud
    and optionally write a CloudCompare-readable skeleton OBJ.
 """
@@ -105,18 +106,19 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     n_components == 0 && return empty_result
 
     # ── Step 3: process each component independently ──────────────
+    want_skeleton = cfg.pipeline.enable_skeleton_output
+
     global_nbs_id      = zeros(Int32, N)
     global_node_id     = zeros(Int32, N)
     global_tree_id     = zeros(Int32, N)
     global_tree_nbs_id = zeros(Int32, N)
 
-    all_skel_coords    = Matrix{eltype(coords_filtered)}[]
-    all_skel_attrs     = Dict{Symbol,Vector}[]
-    all_skel_edges     = Tuple{Int,Int}[]
-    skel_vertex_offset = 0
-    nbs_offset         = Int32(0)
-    node_offset        = Int32(0)
-    tree_offset        = Int32(0)
+    # Per-component skeleton holders — only allocated/populated when skeleton
+    # output is requested. The per-component skeleton is always computed inside
+    # `_process_single_connected_component` (it drives assembly); these slots
+    # just retain it for the cross-component merge below.
+    skel_clouds = want_skeleton ? Vector{PointCloud}(undef, n_components) : PointCloud[]
+    skel_graphs = want_skeleton ? Vector{SimpleGraph{Int}}(undef, n_components) : SimpleGraph{Int}[]
 
     # Per-CC progress reported as % of cumulative points processed. The reporter
     # is thread-safe (atomic CAS); the counter is a shared `Threads.Atomic{Int}`
@@ -124,87 +126,106 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     progress = ProgressReporter("processing components", N)
     processed_points = Threads.Atomic{Int}(0)
 
-    # Phase 2a (parallel): run the per-component pipeline. Each call to
-    # `_process_single_connected_component` is fully self-contained — its
-    # workspace structs and intermediate arrays are allocated per-call. Results
-    # are stored at distinct `results[ci]` slots; nothing else mutates here.
-    # Peak memory grows by up to T × per-component intermediates (see plan).
-    results = Vector{Any}(undef, n_components)
+    # Global id-range allocators. Each component reserves a contiguous, gap-free
+    # block via `atomic_add!` (which returns the pre-increment value), then remaps
+    # its local 1..local_max ids into that block. Reservation order is completion
+    # order under threads — harmless because every downstream consumer groups by
+    # label *value* (and `tree_id` is relabelled by point count in Step 6): the
+    # point→group partition is identical regardless of which component owns which
+    # block. `tree_nbs_id` shares the nbs block (same offset as `nbs_id`).
+    nbs_counter  = Threads.Atomic{Int}(0)
+    node_counter = Threads.Atomic{Int}(0)
+    tree_counter = Threads.Atomic{Int}(0)
+
+    # Phase 2 (parallel): run the per-component pipeline AND remap local→global ids
+    # within the same task, then drop the per-point arrays immediately (no
+    # `Vector{Any}` retention of all results). Writes target this component's
+    # `gi ∈ cc_indices`; those index sets are disjoint across components, so the
+    # shared `global_*` arrays are written race-free.
     parallel_for(n_components, effective_nthreads(cfg)) do ci
         @inbounds begin
             cc_indices = cc_indices_by_id[ci]
             cc_coords  = coords_filtered[cc_indices, :]
             cc_agh     = agh_filtered[cc_indices]
-            results[ci] = _process_single_connected_component(cc_coords, cc_agh,
-                                                              neighbor_radius; cfg=cfg)
+            res = _process_single_connected_component(cc_coords, cc_agh,
+                                                      neighbor_radius; cfg=cfg)
+
+            local_nbs_max  = Int(maximum(res.nbs_id;  init=Int32(0)))
+            local_node_max = Int(maximum(res.node_id; init=Int32(0)))
+            local_tree_max = Int(maximum(res.tree_id; init=Int32(0)))
+            my_nbs_off  = Int32(Threads.atomic_add!(nbs_counter,  local_nbs_max))
+            my_node_off = Int32(Threads.atomic_add!(node_counter, local_node_max))
+            my_tree_off = Int32(Threads.atomic_add!(tree_counter, local_tree_max))
+
+            for (li, gi) in enumerate(cc_indices)
+                nid  = res.nbs_id[li]
+                global_nbs_id[gi]      = nid  > 0 ? nid  + my_nbs_off  : Int32(0)
+                noid = res.node_id[li]
+                global_node_id[gi]     = noid > 0 ? noid + my_node_off : Int32(0)
+                tid  = res.tree_id[li]
+                global_tree_id[gi]     = tid  > 0 ? tid  + my_tree_off : Int32(0)
+                tnid = res.tree_nbs_id[li]
+                global_tree_nbs_id[gi] = tnid > 0 ? tnid + my_nbs_off  : Int32(0)
+            end
+
+            if want_skeleton
+                skel_clouds[ci] = res.skeleton_cloud
+                skel_graphs[ci] = res.graph_skeleton
+            end
+
             n_now = Threads.atomic_add!(processed_points, length(cc_indices)) +
                     length(cc_indices)
             report!(progress, n_now; extra="$ci/$n_components")
         end
     end
 
-    # Phase 2b (serial): prefix-sum offsets and apply local → global remapping +
-    # skeleton accumulation. Order-dependent (offsets carry forward) so kept
-    # serial; per-CC work here is just index arithmetic.
-    for ci in 1:n_components
-        cc_indices = cc_indices_by_id[ci]
-        res = results[ci]
+    empty!(cc_indices_by_id)   # release after per-component loop
+    nbs_offset = Int32(nbs_counter[])
 
-        local_nbs_max  = Int32(maximum(res.nbs_id;  init=0))
-        local_node_max = Int32(maximum(res.node_id; init=0))
-        local_tree_max = Int32(maximum(res.tree_id; init=0))
-        @inbounds for (li, gi) in enumerate(cc_indices)
-            nid  = res.nbs_id[li]
-            global_nbs_id[gi]     = nid  > 0 ? nid  + nbs_offset  : Int32(0)
-            noid = res.node_id[li]
-            global_node_id[gi]    = noid > 0 ? noid + node_offset : Int32(0)
-            tid  = res.tree_id[li]
-            global_tree_id[gi]    = tid  > 0 ? tid  + tree_offset : Int32(0)
-            tnid = res.tree_nbs_id[li]
-            global_tree_nbs_id[gi] = tnid > 0 ? tnid + nbs_offset  : Int32(0)
-        end
-
-        skel_cloud = res.skeleton_cloud
-        if npoints(skel_cloud) > 0
+    # ── Step 4: merge skeletons across components (only when requested) ──
+    # Kept serial: skeletons are tiny (≈ one vertex per NBS node ≪ N) so the
+    # merge is cheap, and the merged buffers cannot be presized before the loop.
+    if want_skeleton
+        all_skel_coords    = Matrix{eltype(coords_filtered)}[]
+        all_skel_attrs     = Dict{Symbol,Vector}[]
+        all_skel_edges     = Tuple{Int,Int}[]
+        skel_vertex_offset = 0
+        for ci in 1:n_components
+            skel_cloud = skel_clouds[ci]
+            npoints(skel_cloud) > 0 || continue
             push!(all_skel_coords, coordinates(skel_cloud))
             push!(all_skel_attrs, _all_attributes(skel_cloud))
-            for e in Graphs.edges(res.graph_skeleton)
+            for e in Graphs.edges(skel_graphs[ci])
                 push!(all_skel_edges, (src(e) + skel_vertex_offset,
                                        dst(e) + skel_vertex_offset))
             end
             skel_vertex_offset += npoints(skel_cloud)
         end
-
-        nbs_offset  += local_nbs_max
-        node_offset += local_node_max
-        tree_offset += local_tree_max
-    end
-
-    empty!(cc_indices_by_id)   # release after per-component loop
-    empty!(results)             # release per-component result holders
-
-    # ── Step 4: merge skeletons across components ─────────────────
-    if isempty(all_skel_coords)
+        if isempty(all_skel_coords)
+            merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
+            merged_skel_graph = SimpleGraph{Int}(0)
+        else
+            merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs;
+                                                  verbose=cfg.pipeline.enable_debug_info)
+            merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
+            for (u, v) in all_skel_edges
+                add_edge!(merged_skel_graph, u, v)
+            end
+        end
+    else
         merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
         merged_skel_graph = SimpleGraph{Int}(0)
-    else
-        merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs;
-                                              verbose=cfg.pipeline.enable_debug_info)
-        merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
-        for (u, v) in all_skel_edges
-            add_edge!(merged_skel_graph, u, v)
-        end
     end
-    # Release per-component skeleton accumulators before orphan rescue allocates
-    empty!(all_skel_coords); empty!(all_skel_attrs); empty!(all_skel_edges)
 
-    # ── Step 5: cross-component orphan-NBS rescue ─────────────────
-    process_orphan_segments(coords_filtered, global_nbs_id, global_node_id,
-                            global_tree_id, global_tree_nbs_id; cfg=cfg)
+    # ── Step 5: rescue orphan branches into neighboring grounded trees across
+    # occlusion gaps (orphan ⟺ tree_id==0 && tree_nbs_id>0) ──
+    assemble_occluded_segments(coords_filtered, global_tree_id, global_tree_nbs_id; cfg=cfg)
 
-    # ── Step 6: reorder tree_id by descending point count ─────────
+    # ── Step 6: reorder tree_id by descending point count, then make tree_nbs_id
+    # contiguous within each tree (globally-unique sequential blocks) ──
     global_tree_id = relabel_by_occurrence(global_tree_id; positive_only=true, T_out=Int32)
     tree_offset    = Int32(maximum(global_tree_id; init=0))
+    _relabel_tree_nbs_within_trees!(global_tree_id, global_tree_nbs_id)
 
     # ── Step 7: attach attributes + write skeleton OBJ ────────────
     setattribute!(pc_filtered, :nbs_id,      global_nbs_id)
@@ -212,7 +233,7 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     setattribute!(pc_filtered, :tree_id,     global_tree_id)
     setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
 
-    if !isempty(cfg.pipeline.output_dir)
+    if want_skeleton && !isempty(cfg.pipeline.output_dir)
         obj_path = joinpath(expanduser(cfg.pipeline.output_dir),
                             "$(cfg.pipeline.output_prefix)skeleton_graph.obj")
         _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
@@ -239,6 +260,8 @@ end
 Run the NBS → skeleton → assembly chain for one component. All four sub-stages
 share the same per-component radius graph. Returns NamedTuple fields:
 `nbs_id`, `node_id`, `tree_id`, `tree_nbs_id`, `skeleton_cloud`, `graph_skeleton`.
+A ground-disconnected component yields `tree_id == 0` everywhere (its branches keep
+`tree_nbs_id`), so its points are orphans for the occlusion rescue.
 """
 function _process_single_connected_component(cc_coords::AbstractMatrix{<:Real},
                                              cc_agh::AbstractVector{<:Real},
@@ -617,13 +640,16 @@ function assemble_segments(
 
     cfg.pipeline.enable_debug_info && @info "Assembly: seeded $(next_tree_id - 1) trees from near-ground NBS"
 
-    # ── Step 4.1b: optional fallback seed for ground-disconnected CCs ────
-    # If this connected component contains no near-ground NBS, the iterative
-    # growth would leave every NBS unassigned and rely on the cross-component
-    # orphan rescue. When `tree_resolve_isolated_branches` is set, we instead
-    # seed the largest NBS in the CC as a fresh tree so step 4.2 can grow
-    # through it deterministically.
-    if cfg.tree_segmentation.resolve_isolated_branches && next_tree_id == Int32(1)
+    # A component is "grounded" iff it had at least one near-ground seed. An ungrounded
+    # component is still grown (so its branches get `tree_nbs_id` labels) but its
+    # `tree_id` is zeroed below, so its points become orphans for the occlusion rescue.
+    had_nearground = next_tree_id > Int32(1)
+
+    # ── Step 4.1b: fallback seed for ground-disconnected CCs ────
+    # If this component has no near-ground NBS, iterative growth would leave every
+    # NBS unassigned. We always seed the largest NBS as a fresh tree so step 4.2 can
+    # grow through it and assign branch labels; the temporary `tree_id` is zeroed below.
+    if next_tree_id == Int32(1)
         assigned_tid = _seed_largest_nbs!(tree_id, nbs_tree, assigned_nbs,
                                           nbs_points, next_tree_id; cfg=cfg)
         if assigned_tid > 0
@@ -647,6 +673,11 @@ function assemble_segments(
         tree_id[i] == 0 && (tree_nbs_id[i] = Int32(0))
     end
     tree_nbs_id = relabel_by_occurrence(tree_nbs_id; positive_only=true, T_out=Int32)
+
+    # Ground-disconnected component: keep the branch labels (`tree_nbs_id`) but drop the
+    # temporary `tree_id` so every point becomes an orphan (`tree_id==0 && tree_nbs_id>0`)
+    # for `assemble_occluded_segments` to rescue.
+    had_nearground || fill!(tree_id, Int32(0))
 
     n_trees = length(unique(tid for tid in tree_id if tid > 0))
     n_assigned_pts = count(>(Int32(0)), tree_id)
@@ -811,7 +842,7 @@ function _seed_largest_nbs!(tree_id::AbstractVector{Int32},
     @inbounds for i in nbs_points[best_k]
         tree_id[i] = next_tree_id
     end
-    cfg.pipeline.enable_debug_info && @info "Assembly: resolve_isolated_branches — seeded NBS $best_k ($best_n points) as tree $next_tree_id (no near-ground seed in this CC)"
+    cfg.pipeline.enable_debug_info && @info "Assembly: seeded largest NBS $best_k ($best_n points) as ungrounded tree $next_tree_id (no near-ground seed in this CC)"
     return next_tree_id
 end
 
@@ -829,8 +860,8 @@ Apply the Rule A / Rule B merge decision to every index in `point_idxs`.
   `tree_id[i] = tid_if_branch`, `tree_nbs_id[i] = tnid_if_branch` — the NBS is
   preserved as its own branch.
 
-Returns `:rule_a` or `:rule_b`. Shared by `_iterative_tree_growth!` and
-`process_orphan_segments` so the merge rule has a single implementation.
+Returns `:rule_a` or `:rule_b`. Used by `_iterative_tree_growth!` so the merge rule
+has a single implementation.
 """
 @inline function _check_merge_and_update_nbs!(
     point_idxs::AbstractVector{Int},
@@ -1040,317 +1071,248 @@ function _update_frontier_after_assign!(frontier_info::Dict{Int,Dict{Int32,Int}}
     return nothing
 end
 
-# ── Step 5: orphan NBS rescue ─────────────────────────────────────
+# ── Step 5: occlusion-gap rescue of orphan branches ──────────────
 
 """
-    process_orphan_segments(coords, nbs_id, node_id, tree_id, tree_nbs_id; cfg) -> nothing
+    _parallel_findall(pred, N, n_thread) -> Vector{Int}
 
-Rescue orphan NBS that the per-component assembly never assigned to a tree.
-Builds a coarse NBS-level graph from two sources:
-  1. Radius graph among orphan points (`tree_assembly_occlusion_tolerance`)
-     — orphan↔orphan edges
-  2. KDTree search from orphan points to already-assigned points
-     — orphan↔tree edges
-
-then iteratively propagates `tree_id` through the coarse graph. The `tree_nbs_id`
-assignment for each rescued orphan is gated by the same Rule A / Rule B logic
-as `_iterative_tree_growth!`, using a node-based `frac_connected =
-n_orphan_nodes_with_tree_conn / n_orphan_nodes_total`. When `frac >
-cfg.tree_segmentation.assembly_merge_threshold` AND a candidate `tree_nbs_id` exists, the
-orphan merges into that existing tnid (Rule B). Otherwise it inherits only the
-winning `tree_id` and is given a fresh `tree_nbs_id` (Rule A), preserving the
-orphan as its own NBS. Mutates `tree_id` and `tree_nbs_id` in place.
-
-`node_id` is the per-point, globally-unique NBS-node label produced by
-[`label_non_branching_segments`](@ref) (offset across components by
-`tree_segmentation`); it provides the same structural granularity as the
-intra-component skeleton graph without requiring a cross-component skeleton.
+Collect, in ascending order, every `i in 1:N` for which `pred(i)` is true, scanning the
+range in up to `n_thread` contiguous chunks concurrently. Each task fills its own buffer
+and the buffers are concatenated in chunk order, so the result is deterministic and
+independent of thread scheduling. Falls back to a serial scan for small `N` or one thread.
 """
-function process_orphan_segments(
+function _parallel_findall(pred::F, N::Integer, n_thread::Integer) where {F}
+    n = Int(N)
+    n <= 0 && return Int[]
+    nt = min(Int(n_thread), n)
+    if nt <= 1 || Threads.nthreads() == 1
+        out = Int[]
+        @inbounds for i in 1:n
+            pred(i) && push!(out, i)
+        end
+        return out
+    end
+    chunk   = cld(n, nt)
+    nchunks = cld(n, chunk)
+    parts   = Vector{Vector{Int}}(undef, nchunks)
+    @sync for c in 1:nchunks
+        lo = (c - 1) * chunk + 1
+        hi = min(c * chunk, n)
+        Threads.@spawn begin
+            buf = Int[]
+            @inbounds for i in lo:hi
+                pred(i) && push!(buf, i)
+            end
+            parts[c] = buf
+        end
+    end
+    out = Int[]
+    sizehint!(out, sum(length, parts))
+    for p in parts
+        append!(out, p)
+    end
+    return out
+end
+
+"""
+    _occluded_round_votes(frontier, coords, tree_id, tree_nbs_id, orphan_voxel_index,
+                          assigned, inv_vs, link_tol2, n_thread)
+        -> Dict{Tuple{Int32,Int32}, Int}
+
+Count, for one wavefront round, the point-level links between frontier points and
+still-unassigned orphan points: `(orphan tree_nbs_id, frontier tree_id) → link count`.
+Each frontier point is matched against orphan points in its own voxel ±1 (the voxel size
+guarantees a `≤ √link_tol2` link spans at most one voxel) under an exact squared-distance
+test. Frontier points are scanned in contiguous chunks; per-chunk dicts are summed
+(order-independent), so the result is deterministic.
+"""
+function _occluded_round_votes(frontier::Vector{Int}, coords::AbstractMatrix{<:Real},
+                               tree_id::AbstractVector{Int32}, tree_nbs_id::AbstractVector{Int32},
+                               orphan_voxel_index::Dict{NTuple{3,Int}, Vector{Int}},
+                               assigned::Set{Int32}, inv_vs::Float64, link_tol2::Float64,
+                               n_thread::Integer)
+    M = length(frontier)
+    M == 0 && return Dict{Tuple{Int32,Int32}, Int}()
+
+    function count_chunk(lo, hi)
+        d = Dict{Tuple{Int32,Int32}, Int}()
+        @inbounds for fi in lo:hi
+            f    = frontier[fi]
+            ftid = tree_id[f]
+            fx = float(coords[f, 1]); fy = float(coords[f, 2]); fz = float(coords[f, 3])
+            vx = floor(Int, fx * inv_vs); vy = floor(Int, fy * inv_vs); vz = floor(Int, fz * inv_vs)
+            for dz in -1:1, dy in -1:1, dx in -1:1
+                bucket = get(orphan_voxel_index, (vx + dx, vy + dy, vz + dz), nothing)
+                bucket === nothing && continue
+                for c in bucket
+                    branch = tree_nbs_id[c]
+                    branch in assigned && continue
+                    ddx = float(coords[c, 1]) - fx
+                    ddy = float(coords[c, 2]) - fy
+                    ddz = float(coords[c, 3]) - fz
+                    (ddx * ddx + ddy * ddy + ddz * ddz) <= link_tol2 || continue
+                    key = (branch, ftid)
+                    d[key] = get(d, key, 0) + 1
+                end
+            end
+        end
+        return d
+    end
+
+    nt = min(Int(n_thread), M)
+    (nt <= 1 || Threads.nthreads() == 1) && return count_chunk(1, M)
+
+    chunk   = cld(M, nt)
+    nchunks = cld(M, chunk)
+    parts   = Vector{Dict{Tuple{Int32,Int32}, Int}}(undef, nchunks)
+    @sync for c in 1:nchunks
+        lo = (c - 1) * chunk + 1
+        hi = min(c * chunk, M)
+        Threads.@spawn parts[c] = count_chunk(lo, hi)
+    end
+    votes = Dict{Tuple{Int32,Int32}, Int}()
+    for d in parts, (k, v) in d
+        votes[k] = get(votes, k, 0) + v
+    end
+    return votes
+end
+
+"""
+    assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg) -> nothing
+
+Rescue *orphan branches* (points with `tree_id == 0 && tree_nbs_id > 0`) into neighboring
+grounded trees across occlusion gaps, via a multi-source wavefront that grows outward from
+the grounded points (`tree_id > 0`).
+
+A compact voxel index is built over the orphan points only and reused across rounds. Each
+round, every current frontier point votes for the orphan branches it links to (exact point
+distance `≤ occlusion_tol + sub_res`); each still-unassigned branch is then assigned, as a
+whole, to the grounded `tree_id` with the most point-level links (ties broken by smaller
+id), keeping its already globally-unique `tree_nbs_id`. The newly assigned points form the
+next frontier, so chains of occluded segments are bridged progressively. Branches never
+reached stay orphans (`tree_id == 0`). No-op when `occlusion_tol ≤ 0`.
+
+Mutates `tree_id` in place.
+"""
+function assemble_occluded_segments(
     coords::AbstractMatrix{<:Real},
-    nbs_id::AbstractVector{<:Integer},
-    node_id::AbstractVector{<:Integer},
     tree_id::AbstractVector{Int32},
     tree_nbs_id::AbstractVector{Int32};
     cfg::FLiPConfig = _CFG,
 )
-    N = size(coords, 1)
-    occlusion_tol   = cfg.tree_segmentation.assembly_occlusion_tolerance
-    merge_threshold = Float64(cfg.tree_segmentation.assembly_merge_threshold)
+    occlusion_tol = cfg.tree_segmentation.assembly_occlusion_tolerance
     occlusion_tol > 0 || return nothing
+    N         = size(coords, 1)
+    sub_res   = cfg.pipeline.subsample_res
+    link_tol2 = (occlusion_tol + sub_res)^2
+    inv_vs    = 1.0 / (occlusion_tol + 2.0 * sub_res)   # voxel ≥ link distance ⇒ ±1 covers a link
+    nt        = effective_nthreads(cfg)
+    VK        = NTuple{3, Int}
 
-    K_nbs_global = Int(maximum(nbs_id; init=0))
-    K_nbs_global == 0 && return nothing
+    voxel_of(i) = (floor(Int, float(coords[i, 1]) * inv_vs),
+                   floor(Int, float(coords[i, 2]) * inv_vs),
+                   floor(Int, float(coords[i, 3]) * inv_vs))
 
-    # ── Step 5.0: identify orphan NBS in a single pass ──────────
-    # An NBS is "orphan" iff at least one point belongs to it AND none of its
-    # points has been assigned a tree. One O(N) sweep collects candidate points
-    # per NBS and flags any NBS that has at least one already-assigned point.
-    has_assigned = falses(K_nbs_global)
-    cand_points  = [Int[] for _ in 1:K_nbs_global]
-    @inbounds for i in 1:N
-        nid = Int(nbs_id[i])
-        nid > 0 || continue
-        if tree_id[i] > 0
-            has_assigned[nid] = true
-        else
-            push!(cand_points[nid], i)
+    # ── orphan points (parallel scan) → voxel index + branch→points map ──
+    orphan_idx = _parallel_findall(N, nt) do i
+        @inbounds tree_id[i] == 0 && tree_nbs_id[i] > 0
+    end
+    isempty(orphan_idx) && return nothing
+
+    orphan_voxel_index = Dict{VK, Vector{Int}}()
+    orphan_pts         = Dict{Int32, Vector{Int}}()   # tree_nbs_id → point idxs (atomic unit)
+    @inbounds for i in orphan_idx
+        push!(get!(orphan_voxel_index, voxel_of(i), Int[]), i)
+        push!(get!(orphan_pts, tree_nbs_id[i], Int[]), i)
+    end
+    @info "$_LOG_PREFIX   assemble_occluded_segments: $(length(orphan_pts)) orphan branches (occlusion_tol=$occlusion_tol)"
+
+    # ── contact voxels: orphan voxels expanded by ±1 (where a grounded point may link) ──
+    contact_voxels = Set{VK}()
+    for vk in keys(orphan_voxel_index)
+        for dz in -1:1, dy in -1:1, dx in -1:1
+            push!(contact_voxels, (vk[1] + dx, vk[2] + dy, vk[3] + dz))
         end
     end
 
-    # Build dense orphan index 1..K_orphan, keeping only NBS that survived the
-    # "any-assigned" filter and have at least one candidate point.
-    orphan_nbs_ids    = Int[]
-    orphan_nbs_points = Vector{Vector{Int}}()
-    for nid in 1:K_nbs_global
-        (has_assigned[nid] || isempty(cand_points[nid])) && continue
-        push!(orphan_nbs_ids, nid)
-        push!(orphan_nbs_points, cand_points[nid])
-    end
-    K_orphan = length(orphan_nbs_ids)
-    K_orphan == 0 && return nothing
-
-    # Reverse map: NBS id → orphan_idx (0 = not an orphan)
-    orphan_idx_of_nbs = zeros(Int, K_nbs_global)
-    @inbounds for (idx, nid) in enumerate(orphan_nbs_ids)
-        orphan_idx_of_nbs[nid] = idx
+    # ── seed frontier: grounded points sitting in a contact voxel (parallel scan) ──
+    frontier = _parallel_findall(N, nt) do i
+        @inbounds tree_id[i] > 0 && (voxel_of(i) in contact_voxels)
     end
 
-    # Per-orphan distinct-node sets — drive the same node-based `frac_connected`
-    # metric that `_iterative_tree_growth!` uses. `orphan_all_nodes[i]` is the
-    # full set of node_ids the orphan NBS owns; `orphan_conn_nodes[i]` is the
-    # subset whose points have at least one tree-connected KDTree hit (filled
-    # during the KDTree loop below). node_id is globally unique post-component
-    # offsetting so Set membership is safe.
-    orphan_all_nodes  = [Set{Int}() for _ in 1:K_orphan]
-    orphan_conn_nodes = [Set{Int}() for _ in 1:K_orphan]
-    @inbounds for orph_idx in 1:K_orphan
-        for i in orphan_nbs_points[orph_idx]
-            push!(orphan_all_nodes[orph_idx], Int(node_id[i]))
-        end
-    end
+    assigned = Set{Int32}()   # orphan branch ids already rescued
+    while !isempty(frontier)
+        votes = _occluded_round_votes(frontier, coords, tree_id, tree_nbs_id,
+                                      orphan_voxel_index, assigned, inv_vs, link_tol2, nt)
+        isempty(votes) && break
 
-    # Pre-sized orphan point index vector
-    n_orphan_pts  = sum(length, orphan_nbs_points; init=0)
-    orphan_pt_idx = Vector{Int}(undef, n_orphan_pts)
-    pt_pos = 0
-    @inbounds for pts in orphan_nbs_points
-        for i in pts
-            pt_pos += 1
-            orphan_pt_idx[pt_pos] = i
-        end
-    end
-
-    # ── Source 1: radius graph among orphan points ───────────────
-    cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue: building radius graph for $n_orphan_pts orphan points (r=$occlusion_tol m)"
-    orphan_coords = coords[orphan_pt_idx, :]
-    orphan_graph  = build_radius_graph(orphan_coords, occlusion_tol; weights=false).graph
-
-    # Map orphan-graph vertex → orphan_idx (dense 1..K_orphan).
-    orphan_idx_of_pt = zeros(Int, n_orphan_pts)
-    @inbounds for j in 1:n_orphan_pts
-        nid = Int(nbs_id[orphan_pt_idx[j]])
-        orphan_idx_of_pt[j] = orphan_idx_of_nbs[nid]
-    end
-
-    # coarse_o2o[idx] = Dict(neighbor_idx → connection_count). Dense outer Vector,
-    # inner stays as a Dict (orphan neighborhood degrees are typically small).
-    coarse_o2o = [Dict{Int,Int}() for _ in 1:K_orphan]
-    @inbounds for e in Graphs.edges(orphan_graph)
-        ia = orphan_idx_of_pt[src(e)]
-        ib = orphan_idx_of_pt[dst(e)]
-        (ia > 0 && ib > 0 && ia != ib) || continue
-        coarse_o2o[ia][ib] = get(coarse_o2o[ia], ib, 0) + 1
-        coarse_o2o[ib][ia] = get(coarse_o2o[ib], ia, 0) + 1
-    end
-
-    # ── Source 2: KDTree search from orphan points to assigned points ─
-    # Separate orphan→tree (votes) and orphan→(tree, tnid) (apply-step tnid
-    # selection). Replaces the prior triple-nested Dict and the `-tid` sentinel
-    # mixed-namespace hack.
-    coarse_o2t            = [Dict{Int32,Int}()              for _ in 1:K_orphan]
-    orphan_to_tree_nbs_v  = [Dict{Tuple{Int32,Int32},Int}() for _ in 1:K_orphan]
-
-    assigned_idx = Int[]
-    @inbounds for i in 1:N
-        tree_id[i] > 0 && push!(assigned_idx, i)
-    end
-
-    if !isempty(assigned_idx)
-        assigned_3xM = Matrix{eltype(coords)}(undef, 3, length(assigned_idx))
-        @inbounds for (j, i) in enumerate(assigned_idx)
-            assigned_3xM[1, j] = coords[i, 1]
-            assigned_3xM[2, j] = coords[i, 2]
-            assigned_3xM[3, j] = coords[i, 3]
-        end
-        kdtree = KDTree(assigned_3xM)
-        cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue: KDTree query for orphan→tree connections"
-
-        # Single pass populates coarse_o2t, orphan_to_tree_nbs_v, and the
-        # `orphan_conn_nodes` set used by the node-based frac_connected metric.
-        # Embarrassingly parallel by orphan index: every container written below
-        # (`o2t`, `o2tn`, `conn_nset`) is the per-orphan element of an
-        # already-allocated per-orphan vector; `kdtree` is read-only.
-        parallel_for(K_orphan, effective_nthreads(cfg)) do orph_idx
-            @inbounds begin
-                orph_pts  = orphan_nbs_points[orph_idx]
-                o2t       = coarse_o2t[orph_idx]
-                o2tn      = orphan_to_tree_nbs_v[orph_idx]
-                conn_nset = orphan_conn_nodes[orph_idx]
-                for i in orph_pts
-                    query = SVector{3, Float64}(coords[i, 1], coords[i, 2], coords[i, 3])
-                    hits = inrange(kdtree, query, occlusion_tol)
-                    point_has_tree_conn = false
-                    for j in hits
-                        aid  = assigned_idx[j]
-                        tid  = tree_id[aid]
-                        tnid = tree_nbs_id[aid]
-                        tid > 0 || continue
-                        point_has_tree_conn = true
-                        o2t[tid] = get(o2t, tid, 0) + 1
-                        tnid > 0 || continue
-                        key = (tid, tnid)
-                        o2tn[key] = get(o2tn, key, 0) + 1
-                    end
-                    if point_has_tree_conn
-                        push!(conn_nset, Int(node_id[i]))
-                    end
-                end
+        # per-branch argmax frontier tree_id (tie → smaller id)
+        best  = Dict{Int32, Int32}()
+        bestc = Dict{Int32, Int}()
+        for ((branch, tid), c) in votes
+            cur    = get(bestc, branch, 0)
+            curtid = get(best,  branch, typemax(Int32))
+            if c > cur || (c == cur && tid < curtid)
+                best[branch]  = tid
+                bestc[branch] = c
             end
         end
-        # kdtree, assigned_3xM go out of scope at end of this `if`.
-    end
+        isempty(best) && break
 
-    # Release Step-5 intermediates before the propagation loop allocates new dicts.
-    orphan_graph  = SimpleGraph{Int}(0)
-    orphan_coords = zeros(eltype(coords), 0, 3)
-    empty!(orphan_idx_of_pt)
-    empty!(orphan_pt_idx)
-    empty!(assigned_idx)
-    empty!(has_assigned)
-    empty!(cand_points)
-    empty!(orphan_idx_of_nbs)
-
-    # ── Iterative propagation on coarse graph ─────────────────────
-    orphan_tree_id = _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points; cfg=cfg)
-
-    # ── Apply orphan assignments ─────────────────────────────────
-    # `next_fresh_tnbs` allocates globally-unique labels for orphans that take
-    # the Rule-A path (no merge): either no nearby NBS exists (rescued purely
-    # via orphan→orphan propagation) or the node-based `frac_connected` is at
-    # or below `merge_threshold`. Tnid is consumed only when Rule A actually
-    # fires; the helper signals which rule was applied.
-    next_fresh_tnbs = Int32(maximum(tree_nbs_id; init = Int32(0))) + Int32(1)
-    n_rule_a = 0
-    n_rule_b = 0
-
-    for orph_idx in 1:K_orphan
-        best_tid = orphan_tree_id[orph_idx]
-        best_tid > 0 || continue
-
-        # Best existing tnid within best_tid (filter the flattened (tid, tnid) → count dict)
-        best_tnbs     = Int32(0)
-        best_tnbs_cnt = 0
-        for ((tid, tnid), cnt) in orphan_to_tree_nbs_v[orph_idx]
-            tid == best_tid || continue
-            if cnt > best_tnbs_cnt
-                best_tnbs_cnt = cnt
-                best_tnbs     = tnid
+        newly = Int[]
+        for branch in sort!(collect(keys(best)))
+            tid = best[branch]
+            pts = orphan_pts[branch]
+            @inbounds for i in pts
+                tree_id[i] = tid          # keep tree_nbs_id (already globally unique)
             end
+            push!(assigned, branch)
+            append!(newly, pts)
         end
-
-        # Node-based frac_connected (same semantics as _iterative_tree_growth!)
-        n_total = length(orphan_all_nodes[orph_idx])
-        n_conn  = length(orphan_conn_nodes[orph_idx])
-        frac    = n_total > 0 ? n_conn / n_total : 0.0
-
-        # Tentative fresh tnid for Rule A; only consumed if helper actually fires Rule A
-        branch_tnid = next_fresh_tnbs
-        rule = _check_merge_and_update_nbs!(
-            orphan_nbs_points[orph_idx], tree_id, tree_nbs_id,
-            frac, merge_threshold,
-            best_tid, branch_tnid,    # Rule A: new branch
-            best_tid, best_tnbs,      # Rule B: merge target (best_tnbs == 0 ⇒ helper falls back to Rule A)
-        )
-        if rule === :rule_a
-            next_fresh_tnbs += Int32(1)
-            n_rule_a += 1
-        else
-            n_rule_b += 1
-        end
+        frontier = newly
     end
-    cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue apply: Rule A=$n_rule_a (new tnid), Rule B=$n_rule_b (merged tnid), threshold=$merge_threshold"
-
     return nothing
 end
 
 """
-    _propagate_orphan_labels(coarse_o2o, coarse_o2t, orphan_nbs_points; cfg=_CFG)
-        -> Vector{Int32}
+    _relabel_tree_nbs_within_trees!(tree_id, tree_nbs_id) -> nothing
 
-Run the iterative tree-id propagation on the coarse orphan graph. At each
-iteration every still-unassigned orphan votes by summing connections to
-(a) directly-known trees via `coarse_o2t[idx] :: Dict(tid → count)` and
-(b) already-rescued orphans via `coarse_o2o[idx] :: Dict(neighbor_idx → count)`.
-The most-voted tree id wins. Iteration stops when a round rescues nothing.
-
-Returns a `Vector{Int32}` of length `K_orphan` where entry `i` is the assigned
-tree id for orphan index `i` (0 = never rescued).
+Relabel `tree_nbs_id` so that within each `tree_id` group the non-zero values form a
+contiguous block ranked by descending occurrence, with the blocks laid out sequentially by
+ascending `tree_id`. The `tree_id == 0` (orphan) group sorts **last**, so valid-tree
+`tree_nbs_id` occupy the low labels and orphan labels are the largest. The result is
+per-tree contiguous AND globally unique (each new `tree_nbs_id` maps to exactly one
+`tree_id`), keeping QSM's group-by-`tree_nbs_id` correct. `tree_nbs_id == 0` stays 0.
 """
-function _propagate_orphan_labels(coarse_o2o::Vector{Dict{Int,Int}},
-                                  coarse_o2t::Vector{Dict{Int32,Int}},
-                                  orphan_nbs_points::Vector{Vector{Int}};
-                                  cfg::FLiPConfig=_CFG)
-    K_orphan = length(coarse_o2o)
-    orphan_tree_id  = zeros(Int32, K_orphan)
-    orphan_assigned = falses(K_orphan)
-    work_buf        = Vector{Int}(undef, K_orphan)
-
-    iteration = 0
-    while true
-        iteration += 1
-        # Snapshot unassigned orphans into work_buf, sort by descending point count
-        n = 0
-        @inbounds for i in 1:K_orphan
-            if !orphan_assigned[i]
-                n += 1; work_buf[n] = i
-            end
-        end
-        n == 0 && break
-        unassigned = view(work_buf, 1:n)
-        sort!(unassigned; by = i -> -length(orphan_nbs_points[i]))
-
-        n_rescued = 0
-        for orph_idx in unassigned
-            votes = Dict{Int32, Int}()
-            # Direct tree edges (always counted)
-            for (tid, cnt) in coarse_o2t[orph_idx]
-                votes[tid] = get(votes, tid, 0) + cnt
-            end
-            # Orphan-orphan edges contribute only via rescued neighbors
-            for (nbr_idx, cnt) in coarse_o2o[orph_idx]
-                orphan_assigned[nbr_idx] || continue
-                tid = orphan_tree_id[nbr_idx]
-                tid > 0 || continue
-                votes[tid] = get(votes, tid, 0) + cnt
-            end
-            isempty(votes) && continue
-
-            best_tid = Int32(0); best_cnt = 0
-            for (tid, cnt) in votes
-                if cnt > best_cnt
-                    best_cnt = cnt
-                    best_tid = tid
-                end
-            end
-            orphan_tree_id[orph_idx]  = best_tid
-            orphan_assigned[orph_idx] = true
-            n_rescued += 1
-        end
-        n_rescued == 0 && break
-        cfg.pipeline.enable_debug_info && @info "[tree_segmentation] orphan rescue iteration $iteration: rescued $n_rescued NBS"
+function _relabel_tree_nbs_within_trees!(tree_id::AbstractVector{Int32},
+                                         tree_nbs_id::AbstractVector{Int32})
+    N = length(tree_id)
+    pair_count = Dict{Tuple{Int32, Int32}, Int}()
+    @inbounds for i in 1:N
+        tn = tree_nbs_id[i]
+        tn > 0 || continue
+        key = (tree_id[i], tn)
+        pair_count[key] = get(pair_count, key, 0) + 1
     end
-    return orphan_tree_id
+    isempty(pair_count) && return nothing
+
+    pairs = collect(keys(pair_count))
+    # tree_id asc but the orphan group (tree_id==0) sorts LAST, then count desc, tnbs asc.
+    sort!(pairs; by = p -> (p[1] == 0 ? typemax(Int32) : p[1], -pair_count[p], p[2]))
+
+    new_label = Dict{Tuple{Int32, Int32}, Int32}()
+    sizehint!(new_label, length(pairs))
+    next = Int32(1)
+    for p in pairs
+        new_label[p] = next
+        next += Int32(1)
+    end
+    @inbounds for i in 1:N
+        tn = tree_nbs_id[i]
+        tn > 0 || continue
+        tree_nbs_id[i] = new_label[(tree_id[i], tn)]
+    end
+    return nothing
 end
 
 # ── Step 7: skeleton OBJ writer ───────────────────────────────────

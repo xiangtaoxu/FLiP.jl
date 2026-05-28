@@ -38,6 +38,7 @@ enable_agh                 = true     # Above-ground-height attribute via IDW in
 enable_tree_segmentation   = true     # Stage 3: per-tree clustering
 enable_qsm                 = true     # Stage 4: quantitative structural modeling
 enable_generate_report     = true     # Optional summary report (currently placeholder)
+enable_skeleton_output     = false    # If true, build the cross-component merged skeleton cloud + write the skeleton graph .obj; default false
 
 # --- Logging ---
 enable_debug_info = false             # If true, show low-level helper @info logs (assembly iteration, orphan rescue, etc.); default false silences them
@@ -99,7 +100,6 @@ min_nbs_size                 = 5      # Minimum points per NBS segment (also min
 linearity_angle_deg          = 80.0   # Max angular deviation (degrees) for NBS expansion direction filtering
 assembly_merge_threshold     = 0.8    # Fraction of nodes connected to tree NBS required to merge (0.0–1.0)
 assembly_occlusion_tolerance = 0.1    # Max distance (m) when rescuing orphan NBS via occlusion gap
-resolve_isolated_branches    = false  # Seed largest NBS as a fresh tree in CCs with no near-ground seed (rescues ground-disconnected branch clusters; only enable for branch-level data)
 
 
 # ════════════════════════════════════════════════════════════════════════════

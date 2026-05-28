@@ -57,7 +57,6 @@ mutable struct TreeSegmentationCfg
     linearity_angle_deg::Float64
     assembly_merge_threshold::Float64
     assembly_occlusion_tolerance::Float64
-    resolve_isolated_branches::Bool
 end
 TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
     Float64(get(d, "nearground_agh_threshold",     0.3)),
@@ -68,7 +67,6 @@ TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
     Float64(get(d, "linearity_angle_deg",          80.0)),
     Float64(get(d, "assembly_merge_threshold",     0.5)),
     Float64(get(d, "assembly_occlusion_tolerance", 0.1)),
-    Bool(   get(d, "resolve_isolated_branches",    false)),
 )
 
 mutable struct QSMCfg
@@ -126,6 +124,7 @@ mutable struct PipelineCfg
     enable_tree_segmentation::Bool
     enable_qsm::Bool
     enable_generate_report::Bool
+    enable_skeleton_output::Bool
 
     # Logging
     enable_debug_info::Bool
@@ -156,6 +155,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
+    Bool(get(d, "enable_skeleton_output",     false)),
     Bool(get(d, "enable_debug_info",          false)),
     Int( get(d, "n_thread",                   1)),
 )

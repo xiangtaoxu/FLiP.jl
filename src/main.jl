@@ -150,12 +150,15 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
         res = tree_segmentation(tree_input; cfg=cfg)
         tree_input = nothing  # release input
 
-        write_pc(tree_path,     res.pc_output);      @info "$_LOG_PREFIX   wrote: $tree_path"
-        write_pc(skeleton_path, res.skeleton_cloud); @info "$_LOG_PREFIX   wrote: $skeleton_path"
+        write_pc(tree_path, res.pc_output); @info "$_LOG_PREFIX   wrote: $tree_path"
+        skel_written = cfg.pipeline.enable_skeleton_output
+        if skel_written
+            write_pc(skeleton_path, res.skeleton_cloud); @info "$_LOG_PREFIX   wrote: $skeleton_path"
+        end
 
         (result=res,
          tree_path=tree_path, skeleton_path=skeleton_path,
-         tree_written=true, skeleton_written=true,
+         tree_written=true, skeleton_written=skel_written,
          n_components=res.n_components)
     end
 end
