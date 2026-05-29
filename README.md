@@ -92,7 +92,7 @@ min_node_size  = 5
 rho_percentile = 0.85
 ```
 
-See [`flip_config.toml`](flip_config.toml) for the full annotated template, and [`demo.jl`](demo.jl) for a stage-by-stage walkthrough.
+See [`flip_config.toml`](flip_config.toml) for the full annotated template.
 
 ## Performance & Threading
 
