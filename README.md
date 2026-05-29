@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/xiangtaoxu/FLiP.jl/workflows/CI/badge.svg)](https://github.com/xiangtaoxu/FLiP.jl/actions)
 [![Coverage](https://codecov.io/gh/xiangtaoxu/FLiP.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/xiangtaoxu/FLiP.jl)
+[![Julia](https://img.shields.io/badge/Julia-≥1.12-blue.svg)](https://julialang.org/downloads/)
 
 **FLiP.jl** is a high-performance Julia package that takes a raw forest LiDAR point cloud all the way to
 **individually segmented trees** and **branch-level Quantitative Structure Models (QSM)** — ground separation,
@@ -32,6 +33,8 @@ Inner loops are **multi-threaded** for speed on large clouds.
 Under the hood: radius graphs, connected components, quotient graphs, and shortest-path slicing (Graphs.jl); Delaunay triangulation and cloud-to-mesh distance; and a full suite of point-cloud transformations — all exposed as building blocks (see [Advanced](#advanced--building-blocks)).
 
 ## Installation
+
+> **Requirements:** Julia **v1.12 or newer**. FLiP.jl is built and tested against Julia ≥ 1.12; earlier versions are not supported.
 
 ```julia
 using Pkg

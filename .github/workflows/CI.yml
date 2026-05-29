@@ -24,9 +24,8 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.9'
-          - '1.10'
-          - '1'
+          - '1.12'   # minimum supported Julia
+          - '1'      # latest stable 1.x
         os:
           - ubuntu-latest
           - macOS-latest
