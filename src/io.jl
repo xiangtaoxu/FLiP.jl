@@ -54,9 +54,18 @@ function _numpy_to_jl(py_arr, ::Type{T}) where T
     return out
 end
 
-"""Convert a Julia Vector to a numpy array."""
-function _jl_to_numpy(vec::Vector{T}) where T
-    return _np.array(Py(vec), copy=true)
+"""
+Convert a Julia vector to a numpy array.
+
+`copy=true` (default) forces an independent numpy buffer — required by any caller
+whose numpy array must outlive the Julia source. `copy=false` returns a zero-copy
+view (`np.asarray`, which under numpy ≥2.0 does not error like `np.array(copy=False)`),
+safe only when the consumer reads the array synchronously before the Julia buffer
+can be collected — e.g. laspy's `las.x = …` / `pysetattr`, which immediately
+re-encode into laspy's own point record.
+"""
+function _jl_to_numpy(vec::AbstractVector; copy::Bool=true)
+    return copy ? _np.array(Py(vec), copy=true) : _np.asarray(Py(vec))
 end
 
 # ── Input/output file-path helpers ────────────────────────────────
@@ -258,25 +267,29 @@ function write_las(path::AbstractString, pc::PointCloud)
 
     # Compute offsets from data to keep (coord - offset) / scale within Int32 range.
     # Using coordinate minima as offsets ensures stored integers start near zero.
+    # Column views (N×3 is column-major, so each column is a contiguous block) feed
+    # both the offset minima and the zero-copy numpy wrap without materializing copies.
     coords = coordinates(pc)
-    x_vals = Vector{Float64}(coords[:, 1])
-    y_vals = Vector{Float64}(coords[:, 2])
-    z_vals = Vector{Float64}(coords[:, 3])
+    x_vals = @view coords[:, 1]
+    y_vals = @view coords[:, 2]
+    z_vals = @view coords[:, 3]
     header.offsets = _np.array(Py([minimum(x_vals), minimum(y_vals), minimum(z_vals)]))
     header.scales  = _np.array(Py([1e-6, 1e-6, 1e-6]))
 
     las = _laspy.LasData(header)
-    # Coordinates (reuse vectors extracted above for offsets)
-    las.x = _jl_to_numpy(x_vals)
-    las.y = _jl_to_numpy(y_vals)
-    las.z = _jl_to_numpy(z_vals)
+    # laspy re-encodes x/y/z into its own scaled-int32 point record synchronously,
+    # so a zero-copy view is safe here (`coords` outlives the assignment).
+    las.x = _jl_to_numpy(x_vals; copy=false)
+    las.y = _jl_to_numpy(y_vals; copy=false)
+    las.z = _jl_to_numpy(z_vals; copy=false)
 
     # Standard LAS fields
     std_laspy_names = Set(v[1] for v in values(_LAS_STD_FIELDS))
     for (flip_name, (laspy_name, T)) in _LAS_STD_FIELDS
         if haskey(pc.attrs, flip_name)
             vals = pc.attrs[flip_name]
-            pysetattr(las, laspy_name, _jl_to_numpy(Vector{T}(vals)))
+            arr = eltype(vals) === T ? vals : Vector{T}(vals)
+            pysetattr(las, laspy_name, _jl_to_numpy(arr; copy=false))
         end
     end
 
@@ -288,7 +301,7 @@ function write_las(path::AbstractString, pc::PointCloud)
         isnothing(dtype_str) && continue
         np_dtype = _np.dtype(pystr(dtype_str))
         las.add_extra_dim(_laspy.ExtraBytesParams(name=string(name), type=np_dtype))
-        pysetattr(las, string(name), _jl_to_numpy(Vector{T}(vals)))
+        pysetattr(las, string(name), _jl_to_numpy(vals; copy=false))
     end
 
     las.write(path)

@@ -132,9 +132,12 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     next_node_id = 1
 
     qsm_node_ids = zeros(Int32, N)
-    surface_parts = Matrix{Float64}[]
+    # Surface cloud is stored at the cloud's own coordinate precision (Float32 by
+    # default per cfg.pipeline.coordinate_precision); QSM math stays in Float64.
+    Tc = eltype(coords)
+    surface_parts = Matrix{Tc}[]
     surface_nbs_parts = Vector{Int32}[]
-    surface_rho_parts = Vector{Float64}[]
+    surface_rho_parts = Vector{Tc}[]
 
     # Per-NBS progress (counted over all linear_nbs slots; reporter handles
     # the throttle and is thread-safe for future Threads.@threads adoption).
@@ -188,13 +191,28 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     # Build QSM surface point cloud
     surf_cloud_path = joinpath(output_dir, "$(output_prefix)qsm_surface.laz")
     if !isempty(surface_parts)
-        surf_coords = vcat(surface_parts...)
-        surf_nbs = vcat(surface_nbs_parts...)
-        surf_rho = vcat(surface_rho_parts...)
+        # Merge per-NBS parts without the vcat 2× peak: pre-size once, copy each
+        # part in at a running offset, and release each part right after copying so
+        # the parts and the merged arrays never both hold the full set.
+        S = sum(p -> size(p, 1), surface_parts)
+        surf_coords = Matrix{Tc}(undef, S, 3)
+        surf_nbs    = Vector{Int32}(undef, S)
+        surf_rho    = Vector{Tc}(undef, S)
+        off = 0
+        @inbounds for k in eachindex(surface_parts)
+            m = size(surface_parts[k], 1)
+            copyto!(view(surf_coords, off+1:off+m, :), surface_parts[k])
+            copyto!(view(surf_nbs,    off+1:off+m),    surface_nbs_parts[k])
+            copyto!(view(surf_rho,    off+1:off+m),    surface_rho_parts[k])
+            off += m
+            surface_parts[k]     = Matrix{Tc}(undef, 0, 0)
+            surface_nbs_parts[k] = Int32[]
+            surface_rho_parts[k] = Tc[]
+        end
         qsm_surface_cloud = PointCloud(surf_coords, Dict{Symbol,Vector}(:tree_nbs_id => surf_nbs, :rho => surf_rho))
         cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     generated QSM surface cloud ($(npoints(qsm_surface_cloud)) points)"
     else
-        qsm_surface_cloud = PointCloud(Matrix{Float64}(undef, 0, 3), Dict{Symbol,Vector}())
+        qsm_surface_cloud = PointCloud(Matrix{Tc}(undef, 0, 3), Dict{Symbol,Vector}())
     end
 
     if !isempty(output_dir) && npoints(qsm_surface_cloud) > 0
@@ -202,9 +220,15 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         @info "$_LOG_PREFIX   wrote QSM surface cloud: $surf_cloud_path"
     end
 
-    # Add QSM node IDs to point cloud and overwrite tree cloud on disk
+    # Add QSM node IDs to point cloud and overwrite tree cloud on disk. setattribute!
+    # copies qsm_node_ids into pc, so the local copy can be released; also drop the
+    # now-empty surface part containers and GC before the full-cloud rewrite so the
+    # surface-merge and tree-rewrite working sets don't stack.
     setattribute!(pc, :qsm_node_id, qsm_node_ids)
     if !isempty(tree_cloud_path)
+        empty!(surface_parts); empty!(surface_nbs_parts); empty!(surface_rho_parts)
+        qsm_node_ids = Int32[]
+        GC.gc()
         write_pc(tree_cloud_path, pc)
         cfg.pipeline.enable_debug_info && @info "$_LOG_PREFIX     overwrote tree cloud with qsm_node_id: $tree_cloud_path"
     end
@@ -382,7 +406,7 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     # 2d: Generate surface point cloud from the smoothed 2D surface, emitting
     # the per-point surface radius as an attribute alongside coordinates.
     gen_res = cfg.pipeline.subsample_res
-    surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res)
+    surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res, eltype(coords))
 
     return (next_node_id, surface_pts, surface_rho)
 end
@@ -1095,30 +1119,47 @@ end
 # ───────────────────────────────────────────────────────────────────────────────
 
 """
-    _generate_surface_points(surface, centers, e1, e2, slice_res, gen_res)
-        -> (Matrix{Float64}, Vector{Float64})  # (M×3 coords, M surface rho values)
+    _generate_surface_points(surface, centers, e1, e2, slice_res, gen_res, T=Float64)
+        -> (Matrix{T}, Vector{T})  # (M×3 coords, M surface rho values)
 
 Convert a smoothed 2D rho surface (phi × z-slice) to 3D xyz points.
 Linearly interpolates between z-slices to achieve approximately `gen_res`
 axial spacing. Returns coordinates and the per-point surface radius (rho),
 which equals the smoothed surface value at each generated point (slice points
 take `surface[b, s]`; inter-slice points take the linear blend between
-slices s and s+1).
+slices s and s+1). Geometry is computed in Float64 and stored as `T` (the
+cloud's coordinate precision), so the surface cloud matches the input cloud.
 """
 function _generate_surface_points(surface::Matrix{Float64},
                                    centers::Matrix{Float64},
                                    e1::NTuple{3,Float64},
                                    e2::NTuple{3,Float64},
                                    slice_res::Float64,
-                                   gen_res::Float64)
+                                   gen_res::Float64,
+                                   ::Type{T}=Float64) where {T}
     nphi, nslices = size(surface)
     dphi = 2π / nphi
     n_zsub = max(1, ceil(Int, slice_res / gen_res))
 
-    # Upper bound for pre-allocation
-    n_est = nphi * (nslices + max(0, nslices - 1) * (n_zsub - 1))
-    pts = Matrix{Float64}(undef, n_est, 3)
-    rho_vals = Vector{Float64}(undef, n_est)
+    # Pass 1: count emitted points exactly (predicates mirror the emission below),
+    # so we allocate the precise output size — no upper-bound over-allocation and
+    # no trailing slice-copy to trim it.
+    n_count = 0
+    @inbounds for s in 1:nslices
+        for b in 1:nphi
+            r = surface[b, s]
+            (isfinite(r) && r > 0) && (n_count += 1)
+        end
+        if s < nslices && n_zsub > 1
+            for _ in 1:(n_zsub - 1), b in 1:nphi
+                r1 = surface[b, s]; r2 = surface[b, s+1]
+                (isfinite(r1) && isfinite(r2) && r1 > 0 && r2 > 0) && (n_count += 1)
+            end
+        end
+    end
+
+    pts = Matrix{T}(undef, n_count, 3)
+    rho_vals = Vector{T}(undef, n_count)
     idx = 0
 
     @inbounds for s in 1:nslices
@@ -1130,10 +1171,10 @@ function _generate_surface_points(surface::Matrix{Float64},
             u = rho * cos(phi_val)
             v = rho * sin(phi_val)
             idx += 1
-            pts[idx, 1] = centers[s, 1] + u * e1[1] + v * e2[1]
-            pts[idx, 2] = centers[s, 2] + u * e1[2] + v * e2[2]
-            pts[idx, 3] = centers[s, 3] + u * e1[3] + v * e2[3]
-            rho_vals[idx] = rho
+            pts[idx, 1] = T(centers[s, 1] + u * e1[1] + v * e2[1])
+            pts[idx, 2] = T(centers[s, 2] + u * e1[2] + v * e2[2])
+            pts[idx, 3] = T(centers[s, 3] + u * e1[3] + v * e2[3])
+            rho_vals[idx] = T(rho)
         end
 
         # Interpolated points between slice s and s+1
@@ -1152,20 +1193,16 @@ function _generate_surface_points(surface::Matrix{Float64},
                     u = rho * cos(phi_val)
                     v = rho * sin(phi_val)
                     idx += 1
-                    pts[idx, 1] = icx + u * e1[1] + v * e2[1]
-                    pts[idx, 2] = icy + u * e1[2] + v * e2[2]
-                    pts[idx, 3] = icz + u * e1[3] + v * e2[3]
-                    rho_vals[idx] = rho
+                    pts[idx, 1] = T(icx + u * e1[1] + v * e2[1])
+                    pts[idx, 2] = T(icy + u * e1[2] + v * e2[2])
+                    pts[idx, 3] = T(icz + u * e1[3] + v * e2[3])
+                    rho_vals[idx] = T(rho)
                 end
             end
         end
     end
 
-    if idx > 0
-        return (pts[1:idx, :], rho_vals[1:idx])
-    else
-        return (Matrix{Float64}(undef, 0, 3), Float64[])
-    end
+    return (pts, rho_vals)
 end
 
 # ───────────────────────────────────────────────────────────────────────────────
