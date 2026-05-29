@@ -1,6 +1,6 @@
 name = "FLiP"
 uuid = "8c8f5e7d-3b4a-4f2e-9c8d-1f5a6b7c8d9e"
-version = "0.1.0"
+version = "0.7.2"
 authors = ["Xiangtao Xu <xiangtaoxu@gmail.com>"]
 
 [deps]
