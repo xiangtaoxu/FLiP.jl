@@ -117,7 +117,7 @@ buffered polygon.
 # Arguments
 - `pc`: Point cloud to crop
 - `ground_points`: Ground points used to define the cropping polygon
-- `buffer`: Outward buffer distance in meters (default: 5.0)
+- `buffer`: Outward buffer distance in meters (default: 0.0)
 - `k_neighbors`: K for statistical filter on ground points (default from config)
 - `n_sigma`: Sigma threshold for statistical filter (default from config)
 

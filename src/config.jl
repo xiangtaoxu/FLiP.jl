@@ -37,7 +37,7 @@ SegmentGroundCfg(d::Dict) = SegmentGroundCfg(
     Int(    get(d, "min_cc_size",        50)),
     Float64(get(d, "grid_size",          0.5)),
     Float64(get(d, "cone_theta_deg",     60.0)),
-    Float64(get(d, "polygon_buffer",     5.0)),
+    Float64(get(d, "polygon_buffer",     0.0)),
     Bool(   get(d, "enable_ground_crop", true)),
 )
 

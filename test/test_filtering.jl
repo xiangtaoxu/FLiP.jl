@@ -176,6 +176,10 @@
         @test minimum(buffered[:, 2]) < minimum(poly[:, 2])
         @test maximum(buffered[:, 2]) > maximum(poly[:, 2])
 
+        # Zero buffer is a no-op: returns the original polygon (no expansion)
+        unbuffered = buffer_polygon(poly, 0.0)
+        @test unbuffered ≈ poly
+
         # Error cases
         @test_throws ArgumentError buffer_polygon(poly, -1.0)
         @test_throws ArgumentError buffer_polygon(rand(2, 2), 1.0)

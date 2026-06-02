@@ -62,13 +62,13 @@ scaled so that every edge is displaced by exactly `buffer`.
 
 # Arguments
 - `polygon`: M×2 matrix of vertices (ordered, not closed)
-- `buffer`: offset distance in meters (must be > 0)
+- `buffer`: offset distance in meters (must be ≥ 0; 0 = no expansion)
 
 # Returns
 - `Matrix{Float64}`: M×2 matrix of buffered polygon vertices
 """
 function buffer_polygon(polygon::AbstractMatrix{<:Real}, buffer::Real)
-    buffer > 0 || throw(ArgumentError("buffer must be > 0"))
+    buffer >= 0 || throw(ArgumentError("buffer must be ≥ 0"))
     m = size(polygon, 1)
     m >= 3 || throw(ArgumentError("polygon must have at least 3 vertices"))
 
