@@ -130,20 +130,19 @@ qc_continuity_ratio = 0.7             # If 2nd-largest CC size ≥ ratio × larg
 
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 4b: QSM refinement (post-QSM, only if enable_qsm_refinement = true)
-# Detects tree_nbs segments whose fitted QSM cylinders overlap in 3-D, merges
-# them (union-find over overlapping pairs), relabels ids, then re-runs QSM so
-# each merged segment is re-fit as one continuous NBS. Deterministic: overlap is
-# estimated on a fixed global voxel lattice (no Monte-Carlo). Outputs land under
-# the "{prefix}refined_qsm_*" names; the pre-merge "{prefix}qsm_*" are preserved.
+# Works at the NODE level: NBS are processed largest→smallest, and each focal NBS
+# claims the individual nodes of smaller NBS whose fitted cylinder overlaps it (so
+# a partial overlap reassigns only the overlapping nodes, not the whole NBS). QSM
+# is then re-run on the relabeled cloud. Deterministic: per-node overlap is
+# estimated on a fixed global voxel lattice (no Monte-Carlo). Final outputs land
+# under "{prefix}refined_qsm_*"; the pre-refinement "{prefix}qsm_*" are preserved.
 # ════════════════════════════════════════════════════════════════════════════
 [qsm_refinement]
-overlap_threshold       = 0.2     # Merge when intersection_volume / min(V_A,V_B) exceeds this
+overlap_threshold       = 0.2     # Claim a node when inter_vol(node, focal) / vol(node) exceeds this
 voxel_res_scalar        = 1.0     # × subsample_res → voxel edge for the overlap estimator (≈ point spacing)
-completeness_gate       = 0.25    # Both segments need mean node completeness ≥ this to be merge-eligible
-min_points_gate         = 20      # Both segments need ≥ this many points
+completeness_gate       = 0.25    # Both the moving node and the focal NBS need completeness ≥ this
+min_points_gate         = 20      # The focal NBS needs ≥ this many points (per-focal)
 candidate_radius_scalar = 1.0     # Extra KDTree candidate-search margin (× subsample_res)
-cross_tree              = true    # Allow merges that join segments from different trees
-protect_grounded_trunks = true    # Block a cross-tree merge when BOTH segments reach the ground
-absorb_min_point_ratio  = 0.5     # Block a sparse (large fitted-radius) segment from absorbing a denser one
-max_group_size          = 0       # Max segments per merge group (0 = unlimited)
-mode                    = "apply" # "apply" (merge + re-QSM) | "flag_only" (report only) | "iterate" (reserved)
+cross_tree              = true    # Allow claiming a node from a different tree
+protect_grounded_trunks = true    # Block a cross-tree claim when BOTH node and focal reach the ground
+mode                    = "apply" # "apply" (relabel + re-QSM) | "flag_only" (report only) | "iterate" (reserved)

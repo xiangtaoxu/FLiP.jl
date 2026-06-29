@@ -100,20 +100,19 @@ QSMCfg(d::Dict) = QSMCfg(
     Float64(get(d, "qc_continuity_ratio",     0.7)),
 )
 
-# Post-QSM refinement (umbrella for QSM-quality improvements). The current
-# method, `nbs_merge_by_volume_overlap`, merges Non-Branching Segments whose
-# fitted QSM cylinders overlap in 3-D; QSM is then re-run on the merged cloud.
+# Post-QSM refinement (umbrella for QSM-quality improvements). The current method,
+# `nbs_merge_by_volume_overlap`, works at the NODE level: NBS are processed as
+# focals largest→smallest, and a focal claims the individual nodes of smaller NBS
+# whose fitted cylinder overlaps it; QSM is then re-run on the relabeled cloud.
 mutable struct QSMRefinementCfg
-    overlap_threshold::Float64        # merge when inter_vol / min(V_A,V_B) exceeds this
+    overlap_threshold::Float64        # claim a node when inter_vol(node, focal) / vol(node) exceeds this
     voxel_res_scalar::Float64         # voxel edge = voxel_res_scalar × pipeline.subsample_res
-    completeness_gate::Float64        # both segments need mean node completeness ≥ this
-    min_points_gate::Int              # both segments need total points ≥ this
+    completeness_gate::Float64        # both the moving node and the focal need completeness ≥ this
+    min_points_gate::Int              # the focal NBS needs total points ≥ this (per-focal)
     candidate_radius_scalar::Float64  # extra KDTree candidate-search margin (× subsample_res)
-    cross_tree::Bool                  # allow merges that join segments from different trees
-    protect_grounded_trunks::Bool     # block a cross-tree merge when BOTH segments reach the ground
-    absorb_min_point_ratio::Float64   # block a sparse (large-volume) segment from absorbing a denser one
-    max_group_size::Int               # max segments per merge group (0 = unlimited)
-    mode::String                      # "apply" (merge + relabel) | "flag_only" (report only) | "iterate" (reserved)
+    cross_tree::Bool                  # allow claiming a node from a different tree
+    protect_grounded_trunks::Bool     # block a cross-tree claim when BOTH node and focal reach the ground
+    mode::String                      # "apply" (relabel + re-QSM) | "flag_only" (report only) | "iterate" (reserved)
 end
 QSMRefinementCfg(d::Dict) = QSMRefinementCfg(
     Float64(get(d, "overlap_threshold",       0.2)),
@@ -123,8 +122,6 @@ QSMRefinementCfg(d::Dict) = QSMRefinementCfg(
     Float64(get(d, "candidate_radius_scalar", 1.0)),
     Bool(   get(d, "cross_tree",              true)),
     Bool(   get(d, "protect_grounded_trunks", true)),
-    Float64(get(d, "absorb_min_point_ratio",  0.5)),
-    Int(    get(d, "max_group_size",          0)),
     String( get(d, "mode",                    "apply")),
 )
 

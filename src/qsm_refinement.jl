@@ -2,24 +2,32 @@
 Post-QSM refinement for FLiP.jl.
 
 Umbrella for methods that improve QSM results after a first QSM pass. The current
-(and only) method is [`nbs_merge_by_volume_overlap`](@ref): it detects
-Non-Branching Segments (NBS, keyed by `tree_nbs_id`) whose fitted QSM cylinders
-overlap in 3-D and merges them by rewriting `:tree_nbs_id` / `:tree_id` on the
-cloud. The pipeline then re-runs QSM on the relabeled cloud so each merged
-segment is re-fit (re-PCA, re-sliced) as one continuous NBS.
+(and only) method is [`nbs_merge_by_volume_overlap`](@ref): it works at the
+**node (QSM-slice) level**. Each Non-Branching Segment (NBS, keyed by
+`tree_nbs_id`) is processed as a "focal" in descending-size order (largest first);
+a focal **claims the individual nodes** of smaller NBS whose fitted cylinder
+overlaps the focal's cylinder-union. Only the points of claimed nodes are
+relabeled (via the per-point `:qsm_node_id` attribute) — so a partial overlap
+reassigns just the overlapping nodes, never the whole NBS. The pipeline then
+re-runs QSM on the relabeled cloud so each segment is re-fit.
 
-Determinism: overlap volume is estimated on a FIXED global voxel lattice (see
-`voxelized_cylinder_volume`), candidate pairs are deduplicated in a sorted set,
-and merge edges are applied in sorted order — so a single in-session run is
-reproducible and independent of thread scheduling, matching FLiP's no-random-seed
-guarantee. (Resuming refinement purely from disk is best-effort: the tree cloud
-and node CSV are quantized on write — see `_read_qsm_nodes_csv` — so a borderline
-pair near a gate threshold could resolve differently than the in-session run. Run
-refinement in the same session as QSM, the default, for exact reproducibility.)
+Each node ends up in the largest NBS that overlaps it. Note this does NOT collapse
+transitive chains: if A–B overlap and B–C overlap but A–C are tangent, C's node
+joins B (not A) — by design, since a node joins the largest NBS overlapping *it*.
 
-Known limitation: pure volume overlap cannot bridge *gap-separated collinear*
-segments (no shared volume ⇒ no merge). A future endpoint-proximity /
-axis-collinearity method could live here under the same umbrella.
+Determinism: per-node overlap is estimated on a FIXED global voxel lattice (see
+`voxelized_cylinder_volume`); NBS are processed in a fixed `(-n_points, seg_id)`
+order, candidate nodes are gathered deterministically, the parallel ratio pass
+writes disjoint slots, and claims are applied in ascending node-index order — so a
+single in-session run is reproducible and thread-order independent, matching
+FLiP's no-random-seed guarantee. (Resuming refinement purely from disk is
+best-effort: the tree cloud and node CSV are quantized on write — see
+`_read_qsm_nodes_csv` — so a borderline node near a gate threshold could resolve
+differently than the in-session run. Run refinement in the same session as QSM,
+the default, for exact reproducibility.)
+
+Known limitation (out of scope): pure volume overlap cannot bridge gap-separated
+collinear segments (no shared volume ⇒ no claim).
 """
 
 using NearestNeighbors: KDTree, inrange
@@ -28,16 +36,42 @@ using NearestNeighbors: KDTree, inrange
 const Cyl = NamedTuple{(:center, :axis, :radius, :half_height),
                        Tuple{NTuple{3,Float64}, NTuple{3,Float64}, Float64, Float64}}
 
-"""Per-segment (tree_nbs) cylinder model assembled from its QSM nodes."""
+"""Per-node cylinder model (one QSM slice). `qsm_node_id` links to per-point `:qsm_node_id`."""
+struct NodeModel
+    qsm_node_id::Int
+    seg_id::Int32                 # owning tree_nbs_id (original)
+    tree_id::Int32
+    cyl::Cyl
+    aabb::NTuple{6,Float64}
+    vol_vox::Float64             # deterministic per-node self-volume (global lattice)
+    n_points::Int
+    completeness::Float64
+    agh::Float64
+end
+
+"""Per-NBS focal anchor: union of the NBS's original node cylinders + aggregates."""
 struct SegModel
-    seg_id::Int32                 # tree_nbs_id (== QSMNode.nbs_id in QSM output)
+    seg_id::Int32
     tree_id::Int32
     cyls::Vector{Cyl}
-    aabb::NTuple{6,Float64}       # union of cylinder AABBs
-    vol_vox::Float64             # deterministic self-volume on the global lattice
-    n_points::Int                # Σ node n_points
+    aabb::NTuple{6,Float64}       # union of node AABBs
+    n_points::Int                # Σ node n_points (size for ordering)
     completeness::Float64        # mean node completeness
-    min_agh::Float64             # min node AGH (for grounded-trunk detection)
+    min_agh::Float64             # min node AGH (grounded-trunk detection)
+end
+
+"""One reassignment for the merged-only report (a node moved into a focal NBS)."""
+struct NodeMove
+    qsm_node_id::Int
+    from_tree_nbs::Int32
+    to_tree_nbs::Int32
+    from_tree_id::Int32
+    to_tree_id::Int32
+    overlap_ratio::Float64
+    n_points::Int
+    completeness::Float64
+    agh::Float64
+    cross_tree::Bool
 end
 
 @inline function _unit3(x::Float64, y::Float64, z::Float64)
@@ -60,11 +94,12 @@ end
 """
     _voxel_intersection_volume(cyls_a, cyls_b, box, voxel_res) -> Float64
 
-Deterministic volume of the 3-D intersection of two cylinder unions, restricted
-to `box`, on the same global lattice as `voxelized_cylinder_volume` (a voxel
-counts iff its center is inside some cylinder of `cyls_a` AND some cylinder of
-`cyls_b`). Because the lattice is shared, the result is ≤ each segment's
-self-volume, so the overlap ratio is ≤ 1.
+Deterministic volume of the 3-D intersection of two cylinder unions, restricted to
+`box`, on the same global lattice as `voxelized_cylinder_volume` (a voxel counts
+iff its center is inside some cylinder of `cyls_a` AND some cylinder of `cyls_b`).
+Because the lattice is shared, the result is ≤ each side's self-volume, so the
+per-node overlap ratio is ≤ 1. Used here with `cyls_a = [node.cyl]` and
+`cyls_b = focal.cyls`.
 """
 function _voxel_intersection_volume(cyls_a::Vector{Cyl}, cyls_b::Vector{Cyl},
                                     box::NTuple{6,Float64}, voxel_res::Float64)
@@ -88,172 +123,117 @@ function _voxel_intersection_volume(cyls_a::Vector{Cyl}, cyls_b::Vector{Cyl},
 end
 
 """
-    _build_seg_models(nodes, voxel_res, nthread) -> Vector{SegModel}
+    _build_node_models(nodes, voxel_res, nthread) -> Vector{NodeModel}
 
-Group QSM nodes by `tree_nbs_id` and build one `SegModel` per segment: a finite
-cylinder per node (`radius_area`, axis = normalized PC1 direction, half-height =
-node height / 2), the union AABB, the deterministic self-volume, total points,
-mean completeness, and min AGH. Nodes with non-finite/≤0 radius are skipped;
-segments with no valid cylinders or zero volume are dropped.
+One `NodeModel` per QSM node with finite `radius_area > 0` (cylinder: axis =
+normalized PC1 direction, radius = `radius_area`, half-height = node height / 2).
+Per-node self-volume is computed on the global lattice (parallel, disjoint slots);
+zero-volume nodes are dropped. Returns nodes in input order (ascending `qsm_node_id`).
 """
-function _build_seg_models(nodes::Vector{QSMNode}, voxel_res::Float64, nthread::Integer)
-    isempty(nodes) && return SegModel[]
-    groups = Dict{Int32,Vector{Int}}()
-    @inbounds for (i, nd) in enumerate(nodes)
+function _build_node_models(nodes::Vector{QSMNode}, voxel_res::Float64, nthread::Integer)
+    isempty(nodes) && return NodeModel[]
+    raw = Vector{Tuple{Int,Int32,Int32,Cyl,NTuple{6,Float64},Int,Float64,Float64}}()
+    for nd in nodes
         nd.nbs_id > 0 || continue
-        push!(get!(groups, nd.nbs_id, Int[]), i)
+        r = nd.radius_area
+        (isfinite(r) && r > 0) || continue
+        ax = _unit3(nd.direction_x, nd.direction_y, nd.direction_z)
+        cyl = (center = (nd.center_x, nd.center_y, nd.center_z),
+               axis = ax, radius = r, half_height = nd.height / 2)::Cyl
+        bb = cylinder_aabb(cyl.center, cyl.axis, cyl.radius, cyl.half_height)
+        push!(raw, (nd.qsm_node_id, nd.nbs_id, nd.tree_id, cyl, bb, nd.n_points, nd.completeness, nd.agh))
     end
-    seg_ids = sort!(collect(keys(groups)))
-
-    # Assemble cylinders + aggregates serially (cheap), defer volume to a parallel pass.
-    raw = Vector{Tuple{Int32,Int32,Vector{Cyl},NTuple{6,Float64},Int,Float64,Float64}}()
-    for sid in seg_ids
-        idxs = groups[sid]
-        cyls = Cyl[]
-        tot_pts = 0
-        sum_comp = 0.0
-        min_agh = Inf
-        tid = nodes[idxs[1]].tree_id
-        bb = (Inf, -Inf, Inf, -Inf, Inf, -Inf)
-        for ix in idxs
-            nd = nodes[ix]
-            tot_pts += nd.n_points
-            sum_comp += nd.completeness
-            min_agh = min(min_agh, nd.agh)
-            r = nd.radius_area
-            (isfinite(r) && r > 0) || continue
-            ax = _unit3(nd.direction_x, nd.direction_y, nd.direction_z)
-            c = (center = (nd.center_x, nd.center_y, nd.center_z),
-                 axis = ax, radius = r, half_height = nd.height / 2)::Cyl
-            push!(cyls, c)
-            cb = cylinder_aabb(c.center, c.axis, c.radius, c.half_height)
-            bb = (min(bb[1], cb[1]), max(bb[2], cb[2]),
-                  min(bb[3], cb[3]), max(bb[4], cb[4]),
-                  min(bb[5], cb[5]), max(bb[6], cb[6]))
-        end
-        isempty(cyls) && continue
-        push!(raw, (sid, tid, cyls, bb, tot_pts, sum_comp / length(idxs), min_agh))
-    end
-    isempty(raw) && return SegModel[]
+    isempty(raw) && return NodeModel[]
 
     vols = zeros(Float64, length(raw))
     _parallel_for(length(raw), nthread) do i
         r = raw[i]
-        vols[i] = voxelized_cylinder_volume(r[3], r[4], voxel_res)
+        vols[i] = voxelized_cylinder_volume([r[4]], r[5], voxel_res)
     end
 
-    models = SegModel[]
+    models = NodeModel[]
     for (i, r) in enumerate(raw)
         vols[i] > 0 || continue
-        push!(models, SegModel(r[1], r[2], r[3], r[4], vols[i], r[5], r[6], r[7]))
+        push!(models, NodeModel(r[1], r[2], r[3], r[4], r[5], vols[i], r[6], r[7], r[8]))
     end
     return models
 end
 
 """
-    _candidate_pairs(models, cfg) -> Vector{Tuple{Int32,Int32}}
+    _build_focal_models(nodemodels) -> (Vector{SegModel}, Dict{Int32,Vector{Int}})
 
-Generate cross-segment candidate pairs whose cylinders could overlap, via a
-KDTree over all node centers. For node `i` (reach `rᵢ + hᵢ/2`), any node `j` of a
-different segment that could belong to an overlapping cylinder satisfies
-`‖cᵢ−cⱼ‖ ≤ reachᵢ + Rmax`, where `Rmax = max reach`. Returns sorted unique
-unordered pairs. O(M·k), avoiding the O(K²) all-pairs scan.
+Group node-model indices by `seg_id` (tree_nbs_id) and build a focal `SegModel` per
+NBS (union cylinders + AABB, Σ points, mean completeness, min AGH). Returns the
+seg models (ordered by `seg_id`) and the `seg_id → node-index` map.
 """
-function _candidate_pairs(models::Vector{SegModel}, cfg::FLiPConfig)
-    M = sum(m -> length(m.cyls), models; init=0)
-    M == 0 && return Tuple{Int32,Int32}[]
-    centers = Matrix{Float64}(undef, 3, M)
-    owner = Vector{Int32}(undef, M)
-    reach = Vector{Float64}(undef, M)
-    k = 0
-    for m in models
-        for c in m.cyls
-            k += 1
-            centers[1, k] = c.center[1]; centers[2, k] = c.center[2]; centers[3, k] = c.center[3]
-            owner[k] = m.seg_id
-            reach[k] = c.radius + c.half_height
-        end
+function _build_focal_models(nodemodels::Vector{NodeModel})
+    seg_nodes = Dict{Int32,Vector{Int}}()
+    for (i, nm) in enumerate(nodemodels)
+        push!(get!(seg_nodes, nm.seg_id, Int[]), i)
     end
-    Rmax = maximum(reach)
-    margin = cfg.qsm_refinement.candidate_radius_scalar * cfg.pipeline.subsample_res
-    tree = KDTree(centers)
-    pairset = Set{Tuple{Int32,Int32}}()
-    q = Vector{Float64}(undef, 3)
-    @inbounds for i in 1:M
-        q[1] = centers[1, i]; q[2] = centers[2, i]; q[3] = centers[3, i]
-        idxs = inrange(tree, q, reach[i] + Rmax + margin)
-        oi = owner[i]
-        for j in idxs
-            oj = owner[j]
-            oj == oi && continue
-            lo = oi < oj ? oi : oj
-            hi = oi < oj ? oj : oi
-            push!(pairset, (lo, hi))
+    seg_ids = sort!(collect(keys(seg_nodes)))
+    segs = SegModel[]
+    for sid in seg_ids
+        idxs = seg_nodes[sid]
+        cyls = Cyl[nodemodels[i].cyl for i in idxs]
+        bb = nodemodels[idxs[1]].aabb
+        tot = 0; sc = 0.0; magh = Inf
+        for i in idxs
+            nm = nodemodels[i]
+            a = nm.aabb
+            bb = (min(bb[1], a[1]), max(bb[2], a[2]),
+                  min(bb[3], a[3]), max(bb[4], a[4]),
+                  min(bb[5], a[5]), max(bb[6], a[6]))
+            tot += nm.n_points; sc += nm.completeness; magh = min(magh, nm.agh)
         end
+        push!(segs, SegModel(sid, nodemodels[idxs[1]].tree_id, cyls, bb, tot, sc / length(idxs), magh))
     end
-    pairs = collect(pairset)
-    sort!(pairs)
-    return pairs
+    return segs, seg_nodes
 end
 
 """
-    _merge_reason(A, B, ratio, cfg) -> Symbol
+    _node_merge_reason(focal, node, ratio, cfg) -> Symbol
 
-Decide whether segments `A` and `B` are merge-eligible. Returns `:ok`, or the
-first failing gate: `:below_overlap_threshold`, `:completeness_gate`,
-`:min_points_gate`, `:absorb_guard` (the larger-volume "absorber" is too sparse
-relative to the segment it would swallow), `:cross_tree_disabled`, or
-`:grounded_trunk_guard` (both segments reach the ground).
+Whether `node` (from a smaller NBS) may be claimed by `focal`. Returns `:ok` or the
+first failing gate: `:below_overlap_threshold`, `:node_completeness_gate`,
+`:focal_completeness_gate`, `:min_points_gate` (per-focal), `:cross_tree_disabled`,
+`:grounded_trunk_guard`.
 """
-function _merge_reason(A::SegModel, B::SegModel, ratio::Float64, cfg::FLiPConfig)
+function _node_merge_reason(F::SegModel, n::NodeModel, ratio::Float64, cfg::FLiPConfig)
     rc = cfg.qsm_refinement
     ratio > rc.overlap_threshold || return :below_overlap_threshold
-    (A.completeness >= rc.completeness_gate && B.completeness >= rc.completeness_gate) ||
-        return :completeness_gate
-    (A.n_points >= rc.min_points_gate && B.n_points >= rc.min_points_gate) ||
-        return :min_points_gate
-    absorber, absorbed = A.vol_vox >= B.vol_vox ? (A, B) : (B, A)
-    absorber.n_points >= rc.absorb_min_point_ratio * absorbed.n_points || return :absorb_guard
-    if A.tree_id != B.tree_id
+    n.completeness >= rc.completeness_gate || return :node_completeness_gate
+    F.completeness >= rc.completeness_gate || return :focal_completeness_gate
+    F.n_points >= rc.min_points_gate || return :min_points_gate
+    if n.tree_id != F.tree_id
         rc.cross_tree || return :cross_tree_disabled
         if rc.protect_grounded_trunks
             ground = cfg.tree_segmentation.nearground_agh_threshold
-            (A.min_agh <= ground && B.min_agh <= ground) && return :grounded_trunk_guard
+            (n.agh <= ground && F.min_agh <= ground) && return :grounded_trunk_guard
         end
     end
     return :ok
 end
 
-function _write_merge_report(path::String, pairs::Vector{Tuple{Int32,Int32}},
-                             models::Vector{SegModel}, segidx::Dict{Int32,Int},
-                             inter::Vector{Float64}, ratio::Vector{Float64},
-                             reasons::Vector{Symbol}, merged_flag::BitVector)
-    np = length(pairs)
-    tnbs_a = Vector{Int32}(undef, np); tnbs_b = Vector{Int32}(undef, np)
-    tid_a  = Vector{Int32}(undef, np); tid_b  = Vector{Int32}(undef, np)
-    vol_a  = Vector{Float64}(undef, np); vol_b = Vector{Float64}(undef, np)
-    npa    = Vector{Int}(undef, np); npb = Vector{Int}(undef, np)
-    cmpa   = Vector{Float64}(undef, np); cmpb = Vector{Float64}(undef, np)
-    cross  = Vector{Int}(undef, np)
-    decision = Vector{String}(undef, np); reason = Vector{String}(undef, np)
-    for pi in 1:np
-        (a, b) = pairs[pi]
-        A = models[segidx[a]]; B = models[segidx[b]]
-        tnbs_a[pi] = A.seg_id; tnbs_b[pi] = B.seg_id
-        tid_a[pi] = A.tree_id; tid_b[pi] = B.tree_id
-        vol_a[pi] = A.vol_vox; vol_b[pi] = B.vol_vox
-        npa[pi] = A.n_points; npb[pi] = B.n_points
-        cmpa[pi] = A.completeness; cmpb[pi] = B.completeness
-        cross[pi] = A.tree_id != B.tree_id ? 1 : 0
-        decision[pi] = merged_flag[pi] ? "merged" : "rejected"
-        reason[pi] = String(reasons[pi])
+function _write_node_merge_report(path::String, moves::Vector{NodeMove})
+    n = length(moves)
+    qid = Vector{Int}(undef, n)
+    fnb = Vector{Int32}(undef, n); tnb = Vector{Int32}(undef, n)
+    ftd = Vector{Int32}(undef, n); ttd = Vector{Int32}(undef, n)
+    rat = Vector{Float64}(undef, n); npt = Vector{Int}(undef, n)
+    cmp = Vector{Float64}(undef, n); agv = Vector{Float64}(undef, n)
+    crs = Vector{Int}(undef, n)
+    ord = sortperm(moves; by = mv -> mv.qsm_node_id)   # deterministic: ascending node id
+    for (k, j) in enumerate(ord)
+        mv = moves[j]
+        qid[k] = mv.qsm_node_id; fnb[k] = mv.from_tree_nbs; tnb[k] = mv.to_tree_nbs
+        ftd[k] = mv.from_tree_id; ttd[k] = mv.to_tree_id; rat[k] = mv.overlap_ratio
+        npt[k] = mv.n_points; cmp[k] = mv.completeness; agv[k] = mv.agh
+        crs[k] = mv.cross_tree ? 1 : 0
     end
-    headers = ["tree_nbs_a", "tree_nbs_b", "tree_id_a", "tree_id_b",
-               "vol_a", "vol_b", "inter_vol", "overlap_ratio",
-               "n_points_a", "n_points_b", "completeness_a", "completeness_b",
-               "cross_tree", "decision", "reason"]
-    columns = AbstractVector[tnbs_a, tnbs_b, tid_a, tid_b, vol_a, vol_b, inter, ratio,
-                             npa, npb, cmpa, cmpb, cross, decision, reason]
+    headers = ["qsm_node_id", "from_tree_nbs", "to_tree_nbs", "from_tree_id", "to_tree_id",
+               "node_overlap_ratio", "node_n_points", "node_completeness", "node_agh", "cross_tree"]
+    columns = AbstractVector[qid, fnb, tnb, ftd, ttd, rat, npt, cmp, agv, crs]
     _write_csv(path, columns, headers)
 end
 
@@ -261,16 +241,19 @@ end
     nbs_merge_by_volume_overlap(; pc, nodes, cfg=_CFG, output_dir="", output_prefix="output")
         -> NamedTuple
 
-Detect tree_nbs segments whose fitted QSM cylinders overlap in 3-D and merge them
-via union-find. In `mode == "apply"` the merge is applied to `pc` IN PLACE by
-rewriting `:tree_nbs_id` / `:tree_id` (then re-densifying with
-`relabel_by_occurrence` + `_relabel_tree_nbs_within_trees!`); in `"flag_only"`
-the cloud is left untouched. A per-candidate-pair report CSV is always written
-(when `output_dir` is set). Does NOT re-run QSM — the pipeline stage does that.
+Node-level refinement: process NBS as focals in descending-size order; each focal
+claims the individual nodes of smaller NBS whose cylinder overlaps the focal's
+cylinder-union (per-node ratio = `inter_vol(node, focal_union) / vol(node)` >
+`overlap_threshold`, gates pass). In `mode == "apply"` the claimed nodes' points
+(matched by `:qsm_node_id`) are relabeled IN PLACE — `:tree_nbs_id` ← focal,
+`:tree_id` ← focal's tree — then re-densified with `relabel_by_occurrence` +
+`_relabel_tree_nbs_within_trees!`; in `"flag_only"` the cloud is untouched. A
+report listing ONLY the reassignments is written when `output_dir` is set. Does NOT
+re-run QSM — the pipeline stage does that.
 
-Returns `(status, n_segments_in, n_segments_out, n_groups_merged,
-n_cross_tree_merges, pc_output, report_csv_path, merged)`, where `merged` is
-`true` only when the cloud was actually relabeled (drives the second QSM pass).
+Returns `(status, n_segments_in, n_segments_out, n_nodes_moved, n_focal_nbs,
+n_cross_tree_moves, pc_output, report_csv_path, merged)`; `merged` is `true` only
+when the cloud was actually relabeled (drives the second QSM pass).
 """
 function nbs_merge_by_volume_overlap(; pc::PointCloud, nodes::Vector{QSMNode},
                                      cfg::FLiPConfig = _CFG,
@@ -281,11 +264,11 @@ function nbs_merge_by_volume_overlap(; pc::PointCloud, nodes::Vector{QSMNode},
     nthread = effective_nthreads(cfg)
     report_path = isempty(output_dir) ? "" : joinpath(output_dir, "$(output_prefix)nbs_merge_report.csv")
 
-    nores = (status=:no_nodes, n_segments_in=0, n_segments_out=0, n_groups_merged=0,
-             n_cross_tree_merges=0, pc_output=pc, report_csv_path="", merged=false)
+    nores = (status=:no_nodes, n_segments_in=0, n_segments_out=0, n_nodes_moved=0,
+             n_focal_nbs=0, n_cross_tree_moves=0, pc_output=pc, report_csv_path="", merged=false)
 
-    (hasattribute(pc, :tree_nbs_id) && hasattribute(pc, :tree_id)) || begin
-        @warn "$_LOG_PREFIX qsm_refinement: cloud lacks :tree_nbs_id/:tree_id; skipping"
+    (hasattribute(pc, :tree_nbs_id) && hasattribute(pc, :tree_id) && hasattribute(pc, :qsm_node_id)) || begin
+        @warn "$_LOG_PREFIX qsm_refinement: cloud lacks :tree_nbs_id/:tree_id/:qsm_node_id; skipping"
         return nores
     end
     voxel_res > 0 || begin
@@ -293,110 +276,97 @@ function nbs_merge_by_volume_overlap(; pc::PointCloud, nodes::Vector{QSMNode},
         return nores
     end
 
-    models = _build_seg_models(nodes, voxel_res, nthread)
-    if isempty(models)
-        @info "$_LOG_PREFIX   qsm_refinement: no QSM segments to evaluate"
+    nodemodels = _build_node_models(nodes, voxel_res, nthread)
+    if isempty(nodemodels)
+        @info "$_LOG_PREFIX   qsm_refinement: no QSM node cylinders to evaluate"
         return nores
     end
-    segidx = Dict{Int32,Int}()
-    for (i, m) in enumerate(models)
-        segidx[m.seg_id] = i
+    segmodels, seg_nodes = _build_focal_models(nodemodels)
+
+    # KDTree over node centers (column k ↔ nodemodels[k]); adaptive search radius.
+    Nn = length(nodemodels)
+    centers = Matrix{Float64}(undef, 3, Nn)
+    reach = Vector{Float64}(undef, Nn)
+    @inbounds for k in 1:Nn
+        c = nodemodels[k].cyl
+        centers[1, k] = c.center[1]; centers[2, k] = c.center[2]; centers[3, k] = c.center[3]
+        reach[k] = c.radius + c.half_height
+    end
+    Rmax = maximum(reach)
+    # `margin ≥ 0` keeps the search radius (reach + Rmax + margin) a provable upper
+    # bound on any overlapping-node distance, so a negative config scalar can't
+    # introduce false-negative candidates.
+    margin = max(0.0, rc.candidate_radius_scalar * cfg.pipeline.subsample_res)
+    tree = KDTree(centers)
+
+    # Focal processing order: largest first (by point count), ties by seg_id.
+    order = sortperm(segmodels; by = m -> (-m.n_points, m.seg_id))
+    rank_of = Dict{Int32,Int}()
+    for (r, oi) in enumerate(order)
+        rank_of[segmodels[oi].seg_id] = r
     end
 
-    pairs = _candidate_pairs(models, cfg)
-    npairs = length(pairs)
+    claimed_by = Int32[nm.seg_id for nm in nodemodels]
+    last_focal = zeros(Int, Nn)
+    moves = NodeMove[]
+    q = Vector{Float64}(undef, 3)
 
-    # Overlap volume + ratio per candidate pair (parallel, disjoint slots).
-    inter = zeros(Float64, npairs)
-    ratio = zeros(Float64, npairs)
-    _parallel_for(npairs, nthread) do pi
-        (a, b) = pairs[pi]
-        A = models[segidx[a]]; B = models[segidx[b]]
-        if aabbs_overlap(A.aabb, B.aabb)
-            box = _aabb_intersection(A.aabb, B.aabb)
-            iv = _voxel_intersection_volume(A.cyls, B.cyls, box, voxel_res)
-            mn = min(A.vol_vox, B.vol_vox)
-            inter[pi] = iv
-            ratio[pi] = mn > 0 ? iv / mn : 0.0
+    for (r, oi) in enumerate(order)
+        F = segmodels[oi]
+        cand = Int[]
+        for ni in seg_nodes[F.seg_id]
+            c = nodemodels[ni].cyl.center
+            q[1] = c[1]; q[2] = c[2]; q[3] = c[3]
+            for nj in inrange(tree, q, reach[ni] + Rmax + margin)
+                nm = nodemodels[nj]
+                nm.seg_id == F.seg_id && continue       # same NBS
+                last_focal[nj] == r && continue         # dedupe within this focal
+                last_focal[nj] = r
+                rank_of[nm.seg_id] > r || continue      # candidate must be smaller/later
+                claimed_by[nj] == nm.seg_id || continue # not already claimed by a larger focal
+                aabbs_overlap(nm.aabb, F.aabb) || continue
+                push!(cand, nj)
+            end
+        end
+        isempty(cand) && continue
+
+        ratios = zeros(Float64, length(cand))
+        _parallel_for(length(cand), nthread) do t
+            nm = nodemodels[cand[t]]
+            box = _aabb_intersection(nm.aabb, F.aabb)
+            iv = _voxel_intersection_volume([nm.cyl], F.cyls, box, voxel_res)
+            ratios[t] = nm.vol_vox > 0 ? iv / nm.vol_vox : 0.0
+        end
+
+        for t in sortperm(cand)                          # claim in ascending node-index order
+            nj = cand[t]
+            nm = nodemodels[nj]
+            _node_merge_reason(F, nm, ratios[t], cfg) === :ok || continue
+            claimed_by[nj] = F.seg_id
+            push!(moves, NodeMove(nm.qsm_node_id, nm.seg_id, F.seg_id, nm.tree_id, F.tree_id,
+                                  ratios[t], nm.n_points, nm.completeness, nm.agh, nm.tree_id != F.tree_id))
         end
     end
 
-    reasons = Vector{Symbol}(undef, npairs)
-    for pi in 1:npairs
-        (a, b) = pairs[pi]
-        reasons[pi] = _merge_reason(models[segidx[a]], models[segidx[b]], ratio[pi], cfg)
-    end
-
-    # Union-find over the tree_nbs id space (covers cloud ids and model ids).
-    maxseg = 0
-    tnbs_attr = getattribute(pc, :tree_nbs_id)
-    @inbounds for v in tnbs_attr
-        maxseg = max(maxseg, Int(v))
-    end
-    for m in models
-        maxseg = max(maxseg, Int(m.seg_id))
-    end
-    parent = collect(1:maxseg)
-    ranks = zeros(Int, maxseg)
-    compsize = ones(Int, maxseg)
-    merged_flag = falses(npairs)
-    for pi in 1:npairs
-        reasons[pi] === :ok || continue
-        (a, b) = pairs[pi]
-        ai = Int(a); bi = Int(b)
-        ra = _uf_find!(parent, ai); rb = _uf_find!(parent, bi)
-        if ra == rb
-            merged_flag[pi] = true
-            continue
-        end
-        if rc.max_group_size > 0 && compsize[ra] + compsize[rb] > rc.max_group_size
-            reasons[pi] = :group_size_cap
-            continue
-        end
-        _uf_union!(parent, ranks, ai, bi)
-        nr = _uf_find!(parent, ai)
-        compsize[nr] = compsize[ra] + compsize[rb]
-        merged_flag[pi] = true
-    end
-
-    # Representative tree_id per group (densest segment wins) + stats.
-    rep_tree = Dict{Int,Int32}()
-    rep_pts = Dict{Int,Int}()
-    rep_seg = Dict{Int,Int32}()
-    root_members = Dict{Int,Vector{Int}}()
-    for (i, m) in enumerate(models)
-        r = _uf_find!(parent, Int(m.seg_id))
-        push!(get!(root_members, r, Int[]), i)
-        if !haskey(rep_pts, r) || m.n_points > rep_pts[r] ||
-           (m.n_points == rep_pts[r] && m.seg_id < rep_seg[r])
-            rep_pts[r] = m.n_points
-            rep_seg[r] = m.seg_id
-            rep_tree[r] = m.tree_id
-        end
-    end
-    n_groups_merged = 0
-    n_cross = 0
-    for (_, mem) in root_members
-        length(mem) >= 2 || continue
-        n_groups_merged += 1
-        length(unique(models[i].tree_id for i in mem)) > 1 && (n_cross += 1)
-    end
-    n_segments_out = length(root_members)
-
-    do_apply = (rc.mode == "apply") && n_groups_merged > 0
+    n_segments_out = length(unique(claimed_by))
+    do_apply = (rc.mode == "apply") && !isempty(moves)
     if do_apply
-        tid_attr = getattribute(pc, :tree_id)
-        new_tnbs = Vector{Int32}(undef, length(tnbs_attr))
-        new_tid = Vector{Int32}(undef, length(tid_attr))
-        @inbounds for i in eachindex(tnbs_attr)
-            t = Int(tnbs_attr[i])
-            if t > 0
-                r = _uf_find!(parent, t)
-                new_tnbs[i] = Int32(r)
-                new_tid[i] = haskey(rep_tree, r) ? rep_tree[r] : Int32(tid_attr[i])
+        move_map = Dict{Int,Tuple{Int32,Int32}}()
+        for mv in moves
+            move_map[mv.qsm_node_id] = (mv.to_tree_nbs, mv.to_tree_id)
+        end
+        qn = getattribute(pc, :qsm_node_id)
+        tnbs = getattribute(pc, :tree_nbs_id)
+        tid = getattribute(pc, :tree_id)
+        new_tnbs = Vector{Int32}(undef, length(tnbs))
+        new_tid = Vector{Int32}(undef, length(tid))
+        @inbounds for i in eachindex(qn)
+            qv = Int(qn[i])
+            if qv > 0 && haskey(move_map, qv)
+                mt = move_map[qv]
+                new_tnbs[i] = mt[1]; new_tid[i] = mt[2]
             else
-                new_tnbs[i] = Int32(0)
-                new_tid[i] = Int32(tid_attr[i])
+                new_tnbs[i] = Int32(tnbs[i]); new_tid[i] = Int32(tid[i])
             end
         end
         new_tid = relabel_by_occurrence(new_tid; positive_only=true, T_out=Int32)
@@ -405,15 +375,16 @@ function nbs_merge_by_volume_overlap(; pc::PointCloud, nodes::Vector{QSMNode},
         setattribute!(pc, :tree_nbs_id, new_tnbs)
     end
 
-    isempty(report_path) || _write_merge_report(report_path, pairs, models, segidx,
-                                                inter, ratio, reasons, merged_flag)
+    isempty(report_path) || _write_node_merge_report(report_path, moves)
 
-    @info "$_LOG_PREFIX   qsm_refinement: $(length(models)) segments, $npairs candidate pair(s), " *
-          "$n_groups_merged merge group(s) ($n_cross cross-tree)" *
-          (do_apply ? "" : rc.mode == "flag_only" ? " [flag_only: cloud unchanged]" : " [no merges]")
+    n_focal = length(unique(mv.to_tree_nbs for mv in moves))
+    n_cross = count(mv -> mv.cross_tree, moves)
+    @info "$_LOG_PREFIX   qsm_refinement: $(length(segmodels)) NBS / $Nn nodes; " *
+          "$(length(moves)) node(s) moved into $n_focal focal NBS ($n_cross cross-tree)" *
+          (do_apply ? "" : rc.mode == "flag_only" ? " [flag_only: cloud unchanged]" : " [no moves]")
 
-    return (status=:success, n_segments_in=length(models), n_segments_out=n_segments_out,
-            n_groups_merged=n_groups_merged, n_cross_tree_merges=n_cross,
+    return (status=:success, n_segments_in=length(segmodels), n_segments_out=n_segments_out,
+            n_nodes_moved=length(moves), n_focal_nbs=n_focal, n_cross_tree_moves=n_cross,
             pc_output=pc, report_csv_path=report_path, merged=do_apply)
 end
 
@@ -421,9 +392,9 @@ end
     _read_qsm_nodes_csv(path) -> Vector{QSMNode}
 
 Resume fallback: reconstruct the `QSMNode` fields needed for refinement from a
-`{prefix}qsm_nodes.csv` written by a prior QSM pass. Columns are matched by
-header name; unused fields are left at sensible defaults. Returns an empty vector
-if the file is missing or lacks required columns.
+`{prefix}qsm_nodes.csv` written by a prior QSM pass. Columns are matched by header
+name; unused fields are left at sensible defaults. Returns an empty vector if the
+file is missing or lacks required columns.
 
 Note: the CSV stores coordinates at the writer's precision (`_write_csv` rounds to
 8 significant digits), so for large global-CRS coordinates the reconstructed
