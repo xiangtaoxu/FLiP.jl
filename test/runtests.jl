@@ -31,4 +31,5 @@ end
     include("test_main.jl")
     include("test_transformations.jl")
     include("test_qsm.jl")
+    include("test_qsm_refinement.jl")
 end

@@ -39,6 +39,7 @@ enable_tree_segmentation   = true     # Stage 3: per-tree clustering
 enable_qsm                 = true     # Stage 4: quantitative structural modeling
 enable_generate_report     = true     # Optional summary report (currently placeholder)
 enable_skeleton_output     = false    # If true, build the cross-component merged skeleton cloud + write the skeleton graph .obj; default false
+enable_qsm_refinement      = false    # Stage 4b: post-QSM NBS merge by cylinder volume-overlap, then re-run QSM; default false (opt-in)
 
 # --- Logging ---
 enable_debug_info = false             # If true, show low-level helper @info logs (assembly iteration, orphan rescue, etc.); default false silences them
@@ -125,3 +126,24 @@ min_octant_taubin       = 3           # Min distinct angular octants (of 8) for 
 # CC min size    = qsm.min_node_size; SOR uses statistical_filter.k_neighbors / n_sigma.
 qc_enable           = true
 qc_continuity_ratio = 0.7             # If 2nd-largest CC size ≥ ratio × largest, break tie by centroid distance to previous slice's center
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Stage 4b: QSM refinement (post-QSM, only if enable_qsm_refinement = true)
+# Detects tree_nbs segments whose fitted QSM cylinders overlap in 3-D, merges
+# them (union-find over overlapping pairs), relabels ids, then re-runs QSM so
+# each merged segment is re-fit as one continuous NBS. Deterministic: overlap is
+# estimated on a fixed global voxel lattice (no Monte-Carlo). Outputs land under
+# the "{prefix}refined_qsm_*" names; the pre-merge "{prefix}qsm_*" are preserved.
+# ════════════════════════════════════════════════════════════════════════════
+[qsm_refinement]
+overlap_threshold       = 0.2     # Merge when intersection_volume / min(V_A,V_B) exceeds this
+voxel_res_scalar        = 1.0     # × subsample_res → voxel edge for the overlap estimator (≈ point spacing)
+completeness_gate       = 0.25    # Both segments need mean node completeness ≥ this to be merge-eligible
+min_points_gate         = 20      # Both segments need ≥ this many points
+candidate_radius_scalar = 1.0     # Extra KDTree candidate-search margin (× subsample_res)
+cross_tree              = true    # Allow merges that join segments from different trees
+protect_grounded_trunks = true    # Block a cross-tree merge when BOTH segments reach the ground
+absorb_min_point_ratio  = 0.5     # Block a sparse (large fitted-radius) segment from absorbing a denser one
+max_group_size          = 0       # Max segments per merge group (0 = unlimited)
+mode                    = "apply" # "apply" (merge + re-QSM) | "flag_only" (report only) | "iterate" (reserved)

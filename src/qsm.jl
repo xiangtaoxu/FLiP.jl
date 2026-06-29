@@ -93,6 +93,8 @@ NamedTuple with fields:
 - `pc_output`: Point cloud with `:qsm_node_id` attribute added
 - `qsm_surface_cloud`: Point cloud of QSM surface with `:tree_nbs_id` attribute
 - `surface_cloud_path`: Path to surface cloud LAZ file
+- `nodes`: `Vector{QSMNode}` of per-slice cylinder fits (in memory; consumed by
+  the optional QSM-refinement stage). Empty for the early-return statuses.
 """
 function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::AbstractString="",
                output_prefix::AbstractString="output", tree_cloud_path::AbstractString="", kwargs...)
@@ -101,7 +103,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     if isnothing(tree_result) || npoints(tree_result.pc_output) == 0
         @warn "$_LOG_PREFIX qsm: no tree segmentation data available"
         return (status=:no_data, n_nodes=0, n_trees=0,
-                node_csv_path="", tree_csv_path="", pc_output=nothing)
+                node_csv_path="", tree_csv_path="", pc_output=nothing, nodes=QSMNode[])
     end
 
     pc = tree_result.pc_output
@@ -123,7 +125,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     if n_linear == 0
         setattribute!(pc, :qsm_node_id, zeros(Int32, N))
         return (status=:no_linear_nbs, n_nodes=0, n_trees=0,
-                node_csv_path="", tree_csv_path="", pc_output=pc)
+                node_csv_path="", tree_csv_path="", pc_output=pc, nodes=QSMNode[])
     end
 
     # Stage 2: Process each NBS through the slicing / surface-fitting pipeline
@@ -242,6 +244,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         pc_output = pc,
         qsm_surface_cloud = qsm_surface_cloud,
         surface_cloud_path = surf_cloud_path,
+        nodes = nodes,
     )
 end
 

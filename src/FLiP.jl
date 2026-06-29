@@ -61,6 +61,7 @@ include("types/mesh.jl")
 include("util/graph_utils.jl")
 include("tree_segmentation.jl")
 include("qsm.jl")
+include("qsm_refinement.jl")
 include("generate_report.jl")
 include("main.jl")
 include("util/transformations.jl")
@@ -99,6 +100,7 @@ export convex_hull_2d, buffer_polygon, polygon_area
 export crop_by_ground_polygon
 export ground_segmentation
 export interpolate_idw
+export point_in_cylinder, cylinder_aabb, aabbs_overlap, voxelized_cylinder_volume
 
 # Export mesh functions
 export delaunay_triangulation_xy, cloud_to_mesh_distance_z
@@ -128,6 +130,7 @@ export assemble_segments
 export preprocess, find_input_files
 export calculate_aboveground_height
 export qsm
+export nbs_merge_by_volume_overlap
 export generate_report
 export run_pipeline
 

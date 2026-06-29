@@ -100,6 +100,34 @@ QSMCfg(d::Dict) = QSMCfg(
     Float64(get(d, "qc_continuity_ratio",     0.7)),
 )
 
+# Post-QSM refinement (umbrella for QSM-quality improvements). The current
+# method, `nbs_merge_by_volume_overlap`, merges Non-Branching Segments whose
+# fitted QSM cylinders overlap in 3-D; QSM is then re-run on the merged cloud.
+mutable struct QSMRefinementCfg
+    overlap_threshold::Float64        # merge when inter_vol / min(V_A,V_B) exceeds this
+    voxel_res_scalar::Float64         # voxel edge = voxel_res_scalar × pipeline.subsample_res
+    completeness_gate::Float64        # both segments need mean node completeness ≥ this
+    min_points_gate::Int              # both segments need total points ≥ this
+    candidate_radius_scalar::Float64  # extra KDTree candidate-search margin (× subsample_res)
+    cross_tree::Bool                  # allow merges that join segments from different trees
+    protect_grounded_trunks::Bool     # block a cross-tree merge when BOTH segments reach the ground
+    absorb_min_point_ratio::Float64   # block a sparse (large-volume) segment from absorbing a denser one
+    max_group_size::Int               # max segments per merge group (0 = unlimited)
+    mode::String                      # "apply" (merge + relabel) | "flag_only" (report only) | "iterate" (reserved)
+end
+QSMRefinementCfg(d::Dict) = QSMRefinementCfg(
+    Float64(get(d, "overlap_threshold",       0.2)),
+    Float64(get(d, "voxel_res_scalar",        1.0)),
+    Float64(get(d, "completeness_gate",       0.25)),
+    Int(    get(d, "min_points_gate",         20)),
+    Float64(get(d, "candidate_radius_scalar", 1.0)),
+    Bool(   get(d, "cross_tree",              true)),
+    Bool(   get(d, "protect_grounded_trunks", true)),
+    Float64(get(d, "absorb_min_point_ratio",  0.5)),
+    Int(    get(d, "max_group_size",          0)),
+    String( get(d, "mode",                    "apply")),
+)
+
 mutable struct PipelineCfg
     # I/O
     input_path::String
@@ -125,6 +153,7 @@ mutable struct PipelineCfg
     enable_qsm::Bool
     enable_generate_report::Bool
     enable_skeleton_output::Bool
+    enable_qsm_refinement::Bool
 
     # Logging
     enable_debug_info::Bool
@@ -156,6 +185,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
     Bool(get(d, "enable_skeleton_output",     false)),
+    Bool(get(d, "enable_qsm_refinement",      false)),
     Bool(get(d, "enable_debug_info",          false)),
     Int( get(d, "n_thread",                   1)),
 )
@@ -186,6 +216,7 @@ mutable struct FLiPConfig
     segment_ground::SegmentGroundCfg
     tree_segmentation::TreeSegmentationCfg
     qsm::QSMCfg
+    qsm_refinement::QSMRefinementCfg
 end
 
 FLiPConfig(d::Dict) = FLiPConfig(
@@ -195,6 +226,7 @@ FLiPConfig(d::Dict) = FLiPConfig(
     SegmentGroundCfg(    get(d, "segment_ground",     Dict{String,Any}())),
     TreeSegmentationCfg( get(d, "tree_segmentation",  Dict{String,Any}())),
     QSMCfg(              get(d, "qsm",                Dict{String,Any}())),
+    QSMRefinementCfg(    get(d, "qsm_refinement",     Dict{String,Any}())),
 )
 
 # ── Loader + singleton ───────────────────────────────────────────────────────
