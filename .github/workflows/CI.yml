@@ -24,8 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.12'   # minimum supported Julia
-          - '1'      # latest stable 1.x
+          - '1.12'   # minimum (and only) supported Julia — FLiP requires >= 1.12
         os:
           - ubuntu-latest
           - macOS-latest
