@@ -7,3 +7,7 @@
 /docs/build/
 /docs/site/
 .DS_Store
+
+# Local-only working notes (Markdown is otherwise tracked)
+/IMPLEMENTATION_SUMMARY.md
+/tech_notes.md
