@@ -113,9 +113,11 @@
     end
 
     @testset "_assembly_rule (pure Rule A/B predicate)" begin
-        # Rule B only when enabled, frac strictly exceeds threshold, and a target exists.
+        # Rule B only when enabled, frac meets-or-exceeds the threshold, and a target exists.
+        # The boundary is `>=` (frac == threshold merges), matching refine_nbs's Rule B.
         @test FLiP._assembly_rule(0.9, 0.8, Int32(3), true)  === :rule_b
-        @test FLiP._assembly_rule(0.8, 0.8, Int32(3), true)  === :rule_a   # not strictly >
+        @test FLiP._assembly_rule(0.8, 0.8, Int32(3), true)  === :rule_b   # frac == threshold merges
+        @test FLiP._assembly_rule(0.7, 0.8, Int32(3), true)  === :rule_a   # below threshold
         @test FLiP._assembly_rule(0.9, 0.8, Int32(0), true)  === :rule_a   # no valid target
         @test FLiP._assembly_rule(0.9, 0.8, Int32(3), false) === :rule_a   # rule B disabled
     end
@@ -190,10 +192,12 @@
             tree_id[i] = Int32(1)
         end
 
+        # Threshold 0.6 keeps the fixture's frac_connected = 0.5 boundaries on the Rule-A side
+        # (attach-as-branch) under the `>=` merge rule, so the whole chain grows into one tree.
         n_iter = FLiP._iterative_tree_growth!(
             tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
             K_nbs, info.nbs_points, info.nbs_skel_nodes, info.skel_to_nbs,
-            info.nbs_adj, f.graph_skeleton, 0.5,
+            info.nbs_adj, f.graph_skeleton, 0.6,
         )
 
         @test n_iter >= 1

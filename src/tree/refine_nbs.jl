@@ -348,6 +348,12 @@ function refine_nbs(; nbs_id::AbstractVector{<:Integer},
         _snap_to_skeleton_nodes!(new_nbs, node_id)
         # NOTE: labels are merged into existing (receiver) ids — a subset of the input — so
         # they stay globally unique across CCs. The caller does the final dense relabel.
+
+        # Reconcile the reported node moves with the labeling that actually survived the snap:
+        # a move whose node was a minority within its skeleton node is reverted above, so it must
+        # not be reported as applied. (flag_only mode skips this whole block, keeping the intended
+        # moves — that is the point of flag_only.)
+        node_moves = _surviving_node_moves(node_moves, new_nbs, trial_node_id)
     end
 
     n_moved = length(unique(mv.trial_node_id for mv in node_moves))
@@ -382,6 +388,34 @@ function _snap_to_skeleton_nodes!(nbs_id::AbstractVector{Int32}, node_id::Abstra
         end
     end
     return nbs_id
+end
+
+"""
+    _surviving_node_moves(node_moves, nbs_id, trial_node_id) -> Vector{NodeMove}
+
+Filter the *intended* node moves down to those that actually materialized in `nbs_id` after the
+skeleton-node snap. A move for trial node `t` survives iff the plurality of `t`'s points (ties →
+smaller id, matching `_snap_to_skeleton_nodes!`) is labeled its claimed `to_nbs`. The snap can
+revert a move whose node was a minority within its skeleton node; such reverted moves must not be
+reported as applied, so the refine report stays faithful to the final labeling.
+"""
+function _surviving_node_moves(node_moves::Vector{NodeMove}, nbs_id::AbstractVector{Int32},
+                               trial_node_id::AbstractVector{<:Integer})
+    isempty(node_moves) && return node_moves
+    moved = Set{Int}(Int(mv.trial_node_id) for mv in node_moves)
+    counts = Dict{Int, Dict{Int32,Int}}()                  # trial node → (final nbs → point count)
+    @inbounds for i in eachindex(trial_node_id)
+        t = Int(trial_node_id[i])
+        (t > 0 && t in moved) || continue
+        d = get!(() -> Dict{Int32,Int}(), counts, t)
+        d[nbs_id[i]] = get(d, nbs_id[i], 0) + 1
+    end
+    final_nbs = Dict{Int,Int32}()
+    for (t, d) in counts
+        final_nbs[t] = first(sort!(collect(keys(d)); by = v -> (-d[v], v)))
+    end
+    return NodeMove[mv for mv in node_moves
+                    if get(final_nbs, Int(mv.trial_node_id), Int32(0)) == mv.to_nbs]
 end
 
 # ── Report writers (called by the tree-segmentation stage under enable_debug_info) ──

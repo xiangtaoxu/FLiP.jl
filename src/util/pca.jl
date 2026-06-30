@@ -4,6 +4,24 @@ orthonormal basis from a unit direction.
 """
 
 """
+    _pca3_principal(c11, c12, c13, c22, c23, c33)
+        -> (eigenvalues::NTuple{3,Float64}, pc1::NTuple{3,Float64})
+
+Eigen-decompose the symmetric 3×3 covariance whose upper triangle is
+`[c11 c12 c13; · c22 c23; · · c33]`. Returns eigenvalues ascending
+(λ₁ ≤ λ₂ ≤ λ₃) and the unit PC1 (eigenvector of the largest eigenvalue λ₃).
+Shared by every 3×3 PCA in the package so the eigen convention lives in one place.
+"""
+@inline function _pca3_principal(c11::Float64, c12::Float64, c13::Float64,
+                                 c22::Float64, c23::Float64, c33::Float64)
+    C = Symmetric([c11 c12 c13; c12 c22 c23; c13 c23 c33])
+    F = eigen(C)
+    # eigenvalues ascending: F.values[1] ≤ [2] ≤ [3]; PC1 = eigenvector of λ₃ (last column)
+    return ((F.values[1], F.values[2], F.values[3]),
+            (F.vectors[1, 3], F.vectors[2, 3], F.vectors[3, 3]))
+end
+
+"""
     pca_linearity(coords, indices, linearity_threshold) -> NamedTuple or nothing
 
 Compute 3D PCA on the points `coords[indices, :]` (an N×3 matrix). Returns a
@@ -44,19 +62,16 @@ function pca_linearity(coords::AbstractMatrix{<:Real},
         c22 += dy * dy; c23 += dy * dz; c33 += dz * dz
     end
 
-    C = Symmetric([c11 c12 c13; c12 c22 c23; c13 c23 c33])
-    F = eigen(C)
-    # eigenvalues ascending: F.values[1] ≤ [2] ≤ [3]
-    λ3 = F.values[3]
-    λ2 = F.values[2]
+    eigvals, dvec = _pca3_principal(c11, c12, c13, c22, c23, c33)
+    λ3 = eigvals[3]
+    λ2 = eigvals[2]
     λ3 > 0 || return nothing
 
     linearity = (λ3 - λ2) / λ3
     linearity < linearity_threshold && return nothing
 
-    dvec = (F.vectors[1, 3], F.vectors[2, 3], F.vectors[3, 3])
     return (center=(mx, my, mz),
-            eigenvalues=(F.values[1], F.values[2], F.values[3]),
+            eigenvalues=eigvals,
             direction=dvec,
             linearity=linearity)
 end

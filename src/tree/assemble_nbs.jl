@@ -110,9 +110,11 @@ function assemble_segments(
     # for `assemble_occluded_segments` to rescue.
     had_nearground || fill!(tree_id, Int32(0))
 
-    n_trees = length(unique(tid for tid in tree_id if tid > 0))
-    n_assigned_pts = count(>(Int32(0)), tree_id)
-    cfg.pipeline.enable_debug_info && @info "Assembly complete" n_trees n_assigned_points=n_assigned_pts total_points=N iterations=iteration
+    if cfg.pipeline.enable_debug_info
+        n_trees = length(unique(tid for tid in tree_id if tid > 0))
+        n_assigned_pts = count(>(Int32(0)), tree_id)
+        @info "Assembly complete" n_trees n_assigned_points=n_assigned_pts total_points=N iterations=iteration
+    end
 
     return (tree_nbs_id = tree_nbs_id, tree_id = tree_id)
 end
@@ -285,7 +287,7 @@ end
 
 Apply the Rule A / Rule B merge decision to every index in `point_idxs`.
 
-- **Rule B** fires when `frac > merge_threshold` AND `tnid_if_merge > 0`:
+- **Rule B** fires when `frac >= merge_threshold` AND `tnid_if_merge > 0`:
   `tree_id[i] = tid_if_merge`, `tree_nbs_id[i] = tnid_if_merge` for each point.
 - **Rule A** otherwise (frac below threshold OR no valid merge target OR
   `enable_rule_b == false`): `tree_id[i] = tid_if_branch`,
@@ -299,11 +301,12 @@ Returns `:rule_a` or `:rule_b`. Used by `_iterative_tree_growth!` so the merge r
 has a single implementation.
 """
 # Pure Rule A/B decision (no array mutation, table-testable): `:rule_b` (merge into an existing
-# NBS) fires only when connectivity merging is enabled, the connected fraction strictly exceeds
+# NBS) fires only when connectivity merging is enabled, the connected fraction meets or exceeds
 # the threshold, and a valid merge target exists; otherwise `:rule_a` (NBS stays its own branch).
+# The `>=` boundary matches `refine_nbs`'s Rule B so both stages decide identically at frac == threshold.
 @inline _assembly_rule(frac::Float64, merge_threshold::Float64, tnid_if_merge::Integer,
                        enable_rule_b::Bool) =
-    (enable_rule_b && frac > merge_threshold && tnid_if_merge > 0) ? :rule_b : :rule_a
+    (enable_rule_b && frac >= merge_threshold && tnid_if_merge > 0) ? :rule_b : :rule_a
 
 @inline function _check_merge_and_update_nbs!(
     point_idxs::AbstractVector{Int},
@@ -343,10 +346,10 @@ NBS first; each NBS picks the highest-voted tree, then dispatches to
 [`_check_merge_and_update_nbs!`](@ref) which encodes the shared Rule A /
 Rule B decision:
 
-- **Rule A** (`frac_connected ≤ merge_threshold`) — most of the NBS's
+- **Rule A** (`frac_connected < merge_threshold`) — most of the NBS's
   skeleton nodes are internal/unassigned, so it gets attached as a new
   branch of the winning tree; the NBS keeps its own `tree_nbs_id`.
-- **Rule B** (`frac_connected > merge_threshold`) — the NBS straddles an
+- **Rule B** (`frac_connected >= merge_threshold`) — the NBS straddles an
   already-assigned NBS, so it merges into that target's `tree_nbs_id` and
   inherits its `tree_id`.
 

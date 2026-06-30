@@ -18,22 +18,39 @@ function taubin_circle_fit(u::AbstractVector{<:Real}, v::AbstractVector{<:Real})
     n = length(u)
     @assert n == length(v)
 
-    um = mean(u); vm = mean(v)
-    uc = u .- um; vc = v .- vm
+    # Means (one pass), then accumulate the 4×4 Gram matrix M = ZᵀZ/n of
+    # Z = [uc²+vc², uc, vc, 1] (uc=u-um, vc=v-vm) from scalar sums in a single second pass —
+    # no per-call uc/vc/z1/ones/Z arrays (this runs once per slice per NBS, a hot path).
+    su = 0.0; sv = 0.0
+    @inbounds for i in 1:n
+        su += u[i]; sv += v[i]
+    end
+    inv_n = 1.0 / n
+    um = su * inv_n; vm = sv * inv_n
 
-    # Build constraint matrix for Taubin method
-    # Minimize algebraic distance subject to gradient-weighted normalization
-    # Z = [u² + v², u, v, 1]  →  ZᵀZ eigenproblem with constraint matrix M
-    z1 = uc .^ 2 .+ vc .^ 2
-    Z = hcat(z1, uc, vc, ones(n))
-    M = Z' * Z ./ n
+    s_z1z1 = 0.0; s_z1u = 0.0; s_z1v = 0.0; s_z1 = 0.0
+    s_uu = 0.0; s_uv = 0.0; s_u = 0.0
+    s_vv = 0.0; s_v = 0.0
+    @inbounds for i in 1:n
+        uc = u[i] - um; vc = v[i] - vm
+        z1 = uc * uc + vc * vc
+        s_z1z1 += z1 * z1; s_z1u += z1 * uc; s_z1v += z1 * vc; s_z1 += z1
+        s_uu += uc * uc; s_uv += uc * vc; s_u += uc
+        s_vv += vc * vc; s_v += vc
+    end
+
+    # Z = [u² + v², u, v, 1]  →  ZᵀZ eigenproblem with constraint matrix N
+    M = [s_z1z1 s_z1u s_z1v s_z1;
+         s_z1u  s_uu  s_uv  s_u;
+         s_z1v  s_uv  s_vv  s_v;
+         s_z1   s_u   s_v   Float64(n)] .* inv_n
 
     # Constraint matrix N (Taubin normalization)
-    mean_z1 = mean(z1)
+    mean_z1 = s_z1 * inv_n
     N = zeros(4, 4)
     N[1, 1] = 8.0 * mean_z1
-    N[1, 2] = N[2, 1] = 4.0 * mean(uc)   # should be ~0 since centered
-    N[1, 3] = N[3, 1] = 4.0 * mean(vc)
+    N[1, 2] = N[2, 1] = 4.0 * (s_u * inv_n)   # should be ~0 since centered
+    N[1, 3] = N[3, 1] = 4.0 * (s_v * inv_n)
     N[2, 2] = 1.0
     N[3, 3] = 1.0
 
@@ -62,18 +79,25 @@ function taubin_circle_fit(u::AbstractVector{<:Real}, v::AbstractVector{<:Real})
         # Fall through to simple method
     end
 
-    # Fallback: simple algebraic fit (Kasa)
-    A = hcat(2.0 .* uc, 2.0 .* vc, ones(n))
-    b = uc .^ 2 .+ vc .^ 2
+    # Fallback: simple algebraic fit (Kasa) — least-squares of [2uc 2vc 1]·x = uc²+vc² solved via
+    # its 3×3 normal equations, built from the scalar sums already accumulated above (no arrays).
+    AtA = [4.0 * s_uu  4.0 * s_uv  2.0 * s_u;
+           4.0 * s_uv  4.0 * s_vv  2.0 * s_v;
+           2.0 * s_u   2.0 * s_v   Float64(n)]
+    Atb = [2.0 * s_z1u, 2.0 * s_z1v, s_z1]
     try
-        x = A \ b
+        x = AtA \ Atb
         cx_c = x[1]; cy_c = x[2]
         r = sqrt(x[3] + cx_c^2 + cy_c^2)
         return (um + cx_c, vm + cy_c, abs(r))
     catch
         # Ultimate fallback: centroid + mean distance
-        dists = sqrt.(uc .^ 2 .+ vc .^ 2)
-        return (um, vm, mean(dists))
+        sdist = 0.0
+        @inbounds for i in 1:n
+            du = u[i] - um; dv = v[i] - vm
+            sdist += sqrt(du * du + dv * dv)
+        end
+        return (um, vm, sdist * inv_n)
     end
 end
 
@@ -196,8 +220,12 @@ function _method_spline_2d(rho::Vector{Float64}, phi::Vector{Float64},
 
     rho_median_global = isempty(rho) ? 0.01 : median(rho)
     surface_res = qsm.surface_res_scalar * cfg.pipeline.subsample_res
-    phi_bin_num = clamp(ceil(Int, 2π * rho_median_global / surface_res),
-                        qsm.phi_bin_min, qsm.phi_bin_max)
+    # A non-positive surface_res (mis-set scalar / zero subsample_res) would make the bin count
+    # ceil(Int, Inf) and throw InexactError; treat it as the surface_res → 0 limit (finest
+    # binning), so the clamp to phi_bin_max yields a well-defined result instead of a crash.
+    phi_bin_num = surface_res > 0 ?
+        clamp(ceil(Int, 2π * rho_median_global / surface_res), qsm.phi_bin_min, qsm.phi_bin_max) :
+        qsm.phi_bin_max
     dphi = 2π / phi_bin_num
 
     # Build 2D surface (rho already pre-filtered upstream via qsm.rho_percentile)

@@ -1129,11 +1129,8 @@ function _compute_nbs_direction(
         c33 += dz * dz
     end
 
-    # eigen on Symmetric 3×3 — eigenvalues in ascending order
-    C = Symmetric([c11 c12 c13; c12 c22 c23; c13 c23 c33])
-    F = eigen(C)
-    # Largest eigenvalue is last; its eigenvector is PC1
-    dvec = (F.vectors[1, 3], F.vectors[2, 3], F.vectors[3, 3])
+    # eigen on Symmetric 3×3 (shared kernel); PC1 = eigenvector of the largest eigenvalue
+    _, dvec = _pca3_principal(c11, c12, c13, c22, c23, c33)
 
     # Orient: project first and last valid centroids onto PC1;
     # flip if last centroid's projection is smaller (direction should point

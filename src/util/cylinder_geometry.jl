@@ -68,9 +68,13 @@ Each element of `cyls` must expose fields `center::NTuple{3,Float64}`,
 `axis::NTuple{3,Float64}`, `radius::Float64`, `half_height::Float64`. A per-cylinder
 AABB pre-filter skips the radial test for cells a cylinder cannot contain.
 """
-function voxelized_cylinder_volume(cyls, box::NTuple{6,Float64}, voxel_res::Float64)
-    (isempty(cyls) || !(voxel_res > 0)) && return 0.0
-    caabb = NTuple{6,Float64}[cylinder_aabb(c.center, c.axis, c.radius, c.half_height) for c in cyls]
+# Shared deterministic voxel-lattice scan: count the global-lattice cell centers inside `box`
+# for which `pred(center)` is true, × voxel_res³. Centers are anchored globally at
+# `(k + 0.5)·voxel_res` (integer `k`), so the SAME cells are tested for any `box` — the single
+# definition of the load-bearing lattice that keeps a segment's self-volume and a pair's
+# intersection on identical cells (overlap ratios ≤ 1) and the result independent of thread
+# scheduling. `pred` is specialized per call site (function barrier), so the closure is free.
+function _voxel_lattice_volume(pred::F, box::NTuple{6,Float64}, voxel_res::Float64) where {F}
     kx0 = floor(Int, box[1] / voxel_res); kx1 = ceil(Int, box[2] / voxel_res) - 1
     ky0 = floor(Int, box[3] / voxel_res); ky1 = ceil(Int, box[4] / voxel_res) - 1
     kz0 = floor(Int, box[5] / voxel_res); kz1 = ceil(Int, box[6] / voxel_res) - 1
@@ -81,20 +85,25 @@ function voxelized_cylinder_volume(cyls, box::NTuple{6,Float64}, voxel_res::Floa
             cy = (ky + 0.5) * voxel_res
             for kz in kz0:kz1
                 cz = (kz + 0.5) * voxel_res
-                p = (cx, cy, cz)
-                for m in eachindex(cyls)
-                    a = caabb[m]
-                    (cx >= a[1] && cx <= a[2] && cy >= a[3] && cy <= a[4] && cz >= a[5] && cz <= a[6]) || continue
-                    c = cyls[m]
-                    if point_in_cylinder(p, c.center, c.axis, c.radius, c.half_height)
-                        cnt += 1
-                        break
-                    end
-                end
+                pred((cx, cy, cz)) && (cnt += 1)
             end
         end
     end
     return cnt * voxel_res^3
+end
+
+function voxelized_cylinder_volume(cyls, box::NTuple{6,Float64}, voxel_res::Float64)
+    (isempty(cyls) || !(voxel_res > 0)) && return 0.0
+    caabb = NTuple{6,Float64}[cylinder_aabb(c.center, c.axis, c.radius, c.half_height) for c in cyls]
+    return _voxel_lattice_volume(box, voxel_res) do p
+        @inbounds for m in eachindex(cyls)
+            a = caabb[m]
+            (p[1] >= a[1] && p[1] <= a[2] && p[2] >= a[3] && p[2] <= a[4] && p[3] >= a[5] && p[3] <= a[6]) || continue
+            c = cyls[m]
+            point_in_cylinder(p, c.center, c.axis, c.radius, c.half_height) && return true
+        end
+        return false
+    end
 end
 
 
@@ -132,21 +141,8 @@ lattice makes the result ≤ each side's self-volume, so the per-node overlap ra
 function _voxel_intersection_volume(cyls_a::Vector{Cyl}, cyls_b::Vector{Cyl},
                                     box::NTuple{6,Float64}, voxel_res::Float64)
     (!(voxel_res > 0) || isempty(cyls_a) || isempty(cyls_b)) && return 0.0
-    kx0 = floor(Int, box[1] / voxel_res); kx1 = ceil(Int, box[2] / voxel_res) - 1
-    ky0 = floor(Int, box[3] / voxel_res); ky1 = ceil(Int, box[4] / voxel_res) - 1
-    kz0 = floor(Int, box[5] / voxel_res); kz1 = ceil(Int, box[6] / voxel_res) - 1
-    cnt = 0
-    @inbounds for kx in kx0:kx1
-        cx = (kx + 0.5) * voxel_res
-        for ky in ky0:ky1
-            cy = (ky + 0.5) * voxel_res
-            for kz in kz0:kz1
-                cz = (kz + 0.5) * voxel_res
-                p = (cx, cy, cz)
-                (_point_in_any(p, cyls_a) && _point_in_any(p, cyls_b)) && (cnt += 1)
-            end
-        end
+    return _voxel_lattice_volume(box, voxel_res) do p
+        _point_in_any(p, cyls_a) && _point_in_any(p, cyls_b)
     end
-    return cnt * voxel_res^3
 end
 
