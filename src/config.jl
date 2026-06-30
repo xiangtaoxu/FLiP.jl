@@ -2,7 +2,7 @@
 Package-wide configuration for FLiP.jl.
 
 `FLiPConfig` is a wrapper struct whose fields mirror the section structure of
-`flip_config.toml`. Access is hierarchical (e.g. `cfg.qsm.min_node_size`,
+`flip_config.toml`. Access is hierarchical (e.g. `cfg.tree.model.min_node_size`,
 `cfg.pipeline.subsample_res`) and matches the TOML 1:1 — every field lives in
 the section that owns its TOML key.
 
@@ -48,28 +48,65 @@ PreprocessCfg(d::Dict) = PreprocessCfg(
     Bool(get(d, "enable_statistical_filter", false)),
 )
 
-mutable struct TreeSegmentationCfg
-    nearground_agh_threshold::Float64
-    neighbor_radius::Float64
-    frontier_min_cc_size::Int
-    nbs_neighbor_distance::Int
-    min_nbs_size::Int
-    linearity_angle_deg::Float64
-    assembly_merge_threshold::Float64
-    assembly_occlusion_tolerance::Float64
+# ── Tree domain config (merged: extraction + assembly + refine + modeling) ───────────
+# The whole forest-structure pipeline (label → trial model → refine → assemble → model) is
+# one coupled domain, configured under a single nested `[tree]` table:
+#   [tree]            — KEY extraction dials (bare table)
+#   [tree.assembly]   — tree-assembly gates (also used by refine Rule B)
+#   [tree.refine]     — pre-assembly NBS refinement
+#   [tree.model]      — QSM cylinder fitting (drives BOTH trial and final modeling)
+
+mutable struct TreeExtractionCfg
+    neighbor_radius::Float64          # CC/NBS graph radius; if ≤ 0, defaults to 2.0 × subsample_res
+    min_nbs_size::Int                 # min points per NBS (also min CC size)
+    nearground_agh_threshold::Float64 # keep AGH > this before segmentation
+    linearity_angle_deg::Float64      # max NBS expansion direction deviation
+    nbs_neighbor_distance::Int        # hop distance for greedy NBS search
+    frontier_min_cc_size::Int         # min frontier CC during NBS expansion
 end
-TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
-    Float64(get(d, "nearground_agh_threshold",     0.3)),
-    Float64(get(d, "neighbor_radius",              -1.0)),
-    Int(    get(d, "frontier_min_cc_size",         3)),
-    Int(    get(d, "nbs_neighbor_distance",        2)),
-    Int(    get(d, "min_nbs_size",                 5)),
-    Float64(get(d, "linearity_angle_deg",          80.0)),
-    Float64(get(d, "assembly_merge_threshold",     0.5)),
-    Float64(get(d, "assembly_occlusion_tolerance", 0.1)),
+TreeExtractionCfg(d::Dict) = TreeExtractionCfg(
+    Float64(get(d, "neighbor_radius",          -1.0)),
+    Int(    get(d, "min_nbs_size",             5)),
+    Float64(get(d, "nearground_agh_threshold", 0.3)),
+    Float64(get(d, "linearity_angle_deg",      80.0)),
+    Int(    get(d, "nbs_neighbor_distance",    2)),
+    Int(    get(d, "frontier_min_cc_size",     3)),
 )
 
-mutable struct QSMCfg
+mutable struct TreeAssemblyCfg
+    merge_threshold::Float64          # Rule A/B gate: fraction of skeleton nodes connected (assembly + refine Rule B)
+    occlusion_tolerance::Float64      # max distance (m) when rescuing orphan NBS via occlusion gap
+end
+TreeAssemblyCfg(d::Dict) = TreeAssemblyCfg(
+    Float64(get(d, "merge_threshold",     0.8)),
+    Float64(get(d, "occlusion_tolerance", 0.1)),
+)
+
+# Pre-assembly NBS refinement (runs inside tree segmentation, per connected component):
+# (1) whole-NBS Rule B by skeleton connectivity, (2) node-level volume overlap; the
+# larger-volume NBS absorbs in both. No tree/cross-tree gates exist pre-assembly.
+mutable struct TreeRefineCfg
+    enable::Bool                      # run pre-assembly NBS refinement
+    overlap_threshold::Float64        # claim a node when inter_vol(node, focal) / vol(node) exceeds this
+    voxel_res_scalar::Float64         # voxel edge = voxel_res_scalar × pipeline.subsample_res
+    completeness_gate::Float64        # both the moving node and the focal need completeness ≥ this
+    min_points_gate::Int              # the focal NBS needs total points ≥ this (per-focal)
+    candidate_radius_scalar::Float64  # extra KDTree candidate-search margin (× subsample_res)
+    mode::String                      # "apply" (relabel) | "flag_only" (report only)
+end
+TreeRefineCfg(d::Dict) = TreeRefineCfg(
+    Bool(   get(d, "enable",                  true)),
+    Float64(get(d, "overlap_threshold",       0.2)),
+    Float64(get(d, "voxel_res_scalar",        1.0)),
+    Float64(get(d, "completeness_gate",       0.25)),
+    Int(    get(d, "min_points_gate",         20)),
+    Float64(get(d, "candidate_radius_scalar", 1.0)),
+    String( get(d, "mode",                    "apply")),
+)
+
+# QSM cylinder modeling (the per-node geometric fit). Drives both the trial model (inside
+# tree segmentation) and the final model.
+mutable struct NBSModelCfg
     nbs_linearity_threshold::Float64
     slice_height_scalar::Float64
     min_node_size::Int
@@ -84,7 +121,7 @@ mutable struct QSMCfg
     qc_enable::Bool
     qc_continuity_ratio::Float64
 end
-QSMCfg(d::Dict) = QSMCfg(
+NBSModelCfg(d::Dict) = NBSModelCfg(
     Float64(get(d, "nbs_linearity_threshold", 0.5)),
     Float64(get(d, "slice_height_scalar",     3.0)),
     Int(    get(d, "min_node_size",           5)),
@@ -98,6 +135,19 @@ QSMCfg(d::Dict) = QSMCfg(
     Int(    get(d, "min_octant_taubin",       3)),
     Bool(   get(d, "qc_enable",               true)),
     Float64(get(d, "qc_continuity_ratio",     0.7)),
+)
+
+mutable struct TreeCfg
+    extraction::TreeExtractionCfg
+    assembly::TreeAssemblyCfg
+    refine::TreeRefineCfg
+    model::NBSModelCfg
+end
+TreeCfg(d::Dict) = TreeCfg(
+    TreeExtractionCfg(d),                              # KEY dials live in the bare [tree] table
+    TreeAssemblyCfg(get(d, "assembly", Dict{String,Any}())),
+    TreeRefineCfg(  get(d, "refine",   Dict{String,Any}())),
+    NBSModelCfg(    get(d, "model",    Dict{String,Any}())),
 )
 
 mutable struct PipelineCfg
@@ -124,7 +174,6 @@ mutable struct PipelineCfg
     enable_tree_segmentation::Bool
     enable_qsm::Bool
     enable_generate_report::Bool
-    enable_skeleton_output::Bool
 
     # Logging
     enable_debug_info::Bool
@@ -155,7 +204,6 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
-    Bool(get(d, "enable_skeleton_output",     false)),
     Bool(get(d, "enable_debug_info",          false)),
     Int( get(d, "n_thread",                   1)),
 )
@@ -172,8 +220,8 @@ cfg.pipeline.subsample_res
 cfg.preprocess.enable_statistical_filter
 cfg.statistical_filter.k_neighbors
 cfg.segment_ground.voxel_size
-cfg.tree_segmentation.min_nbs_size
-cfg.qsm.min_node_size
+cfg.tree.extraction.min_nbs_size
+cfg.tree.model.min_node_size
 ```
 
 Mutate sub-struct fields directly or reload from a TOML file with
@@ -184,8 +232,7 @@ mutable struct FLiPConfig
     preprocess::PreprocessCfg
     statistical_filter::StatisticalFilterCfg
     segment_ground::SegmentGroundCfg
-    tree_segmentation::TreeSegmentationCfg
-    qsm::QSMCfg
+    tree::TreeCfg
 end
 
 FLiPConfig(d::Dict) = FLiPConfig(
@@ -193,9 +240,54 @@ FLiPConfig(d::Dict) = FLiPConfig(
     PreprocessCfg(       get(d, "preprocess",         Dict{String,Any}())),
     StatisticalFilterCfg(get(d, "statistical_filter", Dict{String,Any}())),
     SegmentGroundCfg(    get(d, "segment_ground",     Dict{String,Any}())),
-    TreeSegmentationCfg( get(d, "tree_segmentation",  Dict{String,Any}())),
-    QSMCfg(              get(d, "qsm",                Dict{String,Any}())),
+    TreeCfg(             get(d, "tree",               Dict{String,Any}())),
 )
+
+"""
+    _migrate_legacy_config(d::Dict) -> Dict
+
+Backward-compat shim: rewrite a config dict that still uses the pre-merge
+`[tree_segmentation]` / `[qsm]` / `[nbs_refine]` sections into the nested `[tree.*]`
+shape, with a one-time deprecation warning. A dict that already has `[tree]` (or none of
+the legacy sections) passes through unchanged.
+"""
+function _migrate_legacy_config(d::Dict)
+    has_legacy = haskey(d, "tree_segmentation") || haskey(d, "qsm") || haskey(d, "nbs_refine")
+    (haskey(d, "tree") || !has_legacy) && return d
+    @warn "FLiP config: [tree_segmentation]/[qsm]/[nbs_refine] are deprecated; migrate to nested [tree.*]"
+    ts = get(d, "tree_segmentation", Dict{String,Any}())
+    tree = Dict{String,Any}()
+    for k in ("neighbor_radius", "min_nbs_size", "nearground_agh_threshold",
+              "linearity_angle_deg", "nbs_neighbor_distance", "frontier_min_cc_size")
+        haskey(ts, k) && (tree[k] = ts[k])
+    end
+    asm = Dict{String,Any}()
+    haskey(ts, "assembly_merge_threshold")     && (asm["merge_threshold"]     = ts["assembly_merge_threshold"])
+    haskey(ts, "assembly_occlusion_tolerance") && (asm["occlusion_tolerance"] = ts["assembly_occlusion_tolerance"])
+    ref = copy(get(d, "nbs_refine", Dict{String,Any}()))
+    haskey(ts, "enable_nbs_refine") && (ref["enable"] = ts["enable_nbs_refine"])
+    tree["assembly"] = asm
+    tree["refine"]   = ref
+    tree["model"]    = get(d, "qsm", Dict{String,Any}())
+    out = copy(d); out["tree"] = tree
+    delete!(out, "tree_segmentation"); delete!(out, "qsm"); delete!(out, "nbs_refine")
+    return out
+end
+
+# Recursively copy `new` into `old`, preserving the identity of every (nested) Cfg
+# sub-struct so external references to `_CFG.tree.refine` etc. stay valid across reloads.
+function _copy_into!(old::T, new::T) where {T}
+    for f in fieldnames(T)
+        ov = getfield(old, f)
+        if ov isa Union{TreeCfg,TreeExtractionCfg,TreeAssemblyCfg,TreeRefineCfg,NBSModelCfg,
+                        PipelineCfg,PreprocessCfg,StatisticalFilterCfg,SegmentGroundCfg}
+            _copy_into!(ov, getfield(new, f))
+        else
+            setfield!(old, f, getfield(new, f))
+        end
+    end
+    return old
+end
 
 # ── Loader + singleton ───────────────────────────────────────────────────────
 
@@ -218,21 +310,15 @@ FLiP.load_config!("my_project/flip_config.toml")
 """
 function load_config!(path::String=_DEFAULT_CONFIG_PATH)
     d = isfile(path) ? TOML.parsefile(path) : Dict{String,Any}()
-    new_cfg = FLiPConfig(d)
-    for section in fieldnames(FLiPConfig)
-        old_sub = getfield(_CFG, section)
-        new_sub = getfield(new_cfg, section)
-        for f in fieldnames(typeof(old_sub))
-            setfield!(old_sub, f, getfield(new_sub, f))
-        end
-    end
+    new_cfg = FLiPConfig(_migrate_legacy_config(d))
+    _copy_into!(_CFG, new_cfg)
     return _CFG
 end
 
 # Module-level singleton — initialized on first load from file (or fallbacks).
-const _CFG = FLiPConfig(
+const _CFG = FLiPConfig(_migrate_legacy_config(
     isfile(_DEFAULT_CONFIG_PATH) ? TOML.parsefile(_DEFAULT_CONFIG_PATH) : Dict{String,Any}()
-)
+))
 
 """
     coord_type(cfg::FLiPConfig=_CFG) -> DataType

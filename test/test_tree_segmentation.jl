@@ -112,6 +112,16 @@
         @test all(==(Int32(0)), nbs_tree3)
     end
 
+    @testset "_assembly_rule (pure Rule A/B predicate)" begin
+        # Rule B only when enabled, frac meets-or-exceeds the threshold, and a target exists.
+        # The boundary is `>=` (frac == threshold merges), matching refine_nbs's Rule B.
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(3), true)  === :rule_b
+        @test FLiP._assembly_rule(0.8, 0.8, Int32(3), true)  === :rule_b   # frac == threshold merges
+        @test FLiP._assembly_rule(0.7, 0.8, Int32(3), true)  === :rule_a   # below threshold
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(0), true)  === :rule_a   # no valid target
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(3), false) === :rule_a   # rule B disabled
+    end
+
     # Shared fixture: a 3-NBS linear chain. Each NBS has 2 skeleton nodes so
     # `frac_connected` can land on the Rule-A side of the merge threshold.
     #
@@ -182,10 +192,12 @@
             tree_id[i] = Int32(1)
         end
 
+        # Threshold 0.6 keeps the fixture's frac_connected = 0.5 boundaries on the Rule-A side
+        # (attach-as-branch) under the `>=` merge rule, so the whole chain grows into one tree.
         n_iter = FLiP._iterative_tree_growth!(
             tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
             K_nbs, info.nbs_points, info.nbs_skel_nodes, info.skel_to_nbs,
-            info.nbs_adj, f.graph_skeleton, 0.5,
+            info.nbs_adj, f.graph_skeleton, 0.6,
         )
 
         @test n_iter >= 1
@@ -220,6 +232,38 @@
                                           agh_no_ground, f.graph_skeleton, f.skel_pc)
         @test all(==(Int32(0)), res_none.tree_id)
         @test all(==(Int32(0)), res_none.tree_nbs_id)
+    end
+
+    @testset "assemble_segments: enable_rule_b toggles connectivity merge" begin
+        # NBS1 (pts 1-2, node 1) grounded; NBS2 (pts 3-6, nodes 2,3) fully straddles
+        # NBS1 — both NBS2 skeleton nodes touch node 1, so frac_connected = 1.0 > 0.5.
+        nbs_id  = Int[1,1, 2,2, 2,2]
+        node_id = Int[1,1, 2,2, 3,3]
+        graph = Graphs.SimpleGraph(6)
+        for (u, v) in [(1,2), (3,4), (5,6), (4,5), (2,3)]   # incl. one cross-NBS edge (2-3)
+            Graphs.add_edge!(graph, u, v)
+        end
+        graph_skeleton = Graphs.SimpleGraph(3)
+        for (u, v) in [(1,2), (1,3), (2,3)]
+            Graphs.add_edge!(graph_skeleton, u, v)
+        end
+        skel_pc = FLiP.PointCloud(Float64[0 0 0; 1 0 0; 1 1 0], Dict{Symbol,Vector}())
+        FLiP.setattribute!(skel_pc, :node_id,  Int32[1, 2, 3])
+        FLiP.setattribute!(skel_pc, :n_points, Int32[2, 2, 2])
+        coords = hcat(collect(1.0:6.0), zeros(6), zeros(6))
+        agh = Float64[0.1, 0.1, 1.0, 1.0, 2.0, 2.0]   # only NBS1 near ground
+
+        # Rule B ON (default): NBS2 merges into NBS1 → a single branch in one tree.
+        res_on = FLiP.assemble_segments(graph, coords, nbs_id, node_id, agh,
+                                        graph_skeleton, skel_pc)
+        @test all(>(Int32(0)), res_on.tree_id)
+        @test length(unique(res_on.tree_nbs_id[res_on.tree_nbs_id .> 0])) == 1
+
+        # Rule B OFF: NBS2 stays its own branch → two branches within the one tree.
+        res_off = FLiP.assemble_segments(graph, coords, nbs_id, node_id, agh,
+                                         graph_skeleton, skel_pc; enable_rule_b=false)
+        @test length(unique(res_off.tree_id[res_off.tree_id .> 0])) == 1      # still one tree
+        @test length(unique(res_off.tree_nbs_id[res_off.tree_nbs_id .> 0])) == 2  # two branches
     end
 
     # Defaults: occlusion_tol=0.1, sub_res=0.05 → exact link distance 0.15, voxel 0.2.
@@ -274,7 +318,7 @@
         tree_id     = Int32[1, 0]
         tree_nbs_id = Int32[1, 5]
         cfg = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg.tree_segmentation.assembly_occlusion_tolerance = 0.0
+        cfg.tree.assembly.occlusion_tolerance = 0.0
         FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
         @test tree_id     == Int32[1, 0]   # untouched
         @test tree_nbs_id == Int32[1, 5]

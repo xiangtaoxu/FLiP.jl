@@ -52,15 +52,26 @@ include("util/logging.jl")
 include("util/parallelization.jl")
 include("io.jl")
 include("util/array_utils.jl")
-include("util/geometry_utils.jl")
+include("util/polygon_geometry.jl")
+include("util/pca.jl")
+include("util/cylinder_geometry.jl")
+include("util/nbs_utils.jl")
 include("util/pointcloud_utils.jl")
 include("util/interpolation.jl")
 include("preprocess.jl")
 include("ground_segmentation.jl")
 include("types/mesh.jl")
 include("util/graph_utils.jl")
-include("tree_segmentation.jl")
-include("qsm.jl")
+include("types/tree_types.jl")
+include("report/refine_report.jl")
+include("tree/label_nbs.jl")
+include("tree/skeleton.jl")
+include("tree/assemble_nbs.jl")
+include("tree/model_nbs.jl")
+include("tree/refine_nbs.jl")
+include("tree/tree_segmentation.jl")
+include("report/biometrics.jl")
+include("report/surface_cloud.jl")
 include("generate_report.jl")
 include("main.jl")
 include("util/transformations.jl")
@@ -99,6 +110,7 @@ export convex_hull_2d, buffer_polygon, polygon_area
 export crop_by_ground_polygon
 export ground_segmentation
 export interpolate_idw
+export point_in_cylinder, cylinder_aabb, aabbs_overlap, voxelized_cylinder_volume
 
 # Export mesh functions
 export delaunay_triangulation_xy, cloud_to_mesh_distance_z
@@ -127,7 +139,9 @@ export assemble_segments
 # Export pipeline functions
 export preprocess, find_input_files
 export calculate_aboveground_height
-export qsm
+export model_nbs
+export write_biometrics, assemble_surface_cloud
+export refine_nbs
 export generate_report
 export run_pipeline
 

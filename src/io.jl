@@ -626,6 +626,7 @@ function read_e57_metadata(path::AbstractString; scan_index::Int=-1)
             return [_read_e57_scan_metadata(e57_obj, path, si, n_scans) for si in 0:(n_scans - 1)]
         end
     finally
+        e57_obj.close()   # release the file handle (Windows can't unlink an open file)
     end
 end
 

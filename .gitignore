@@ -8,6 +8,6 @@
 /docs/site/
 .DS_Store
 
-# Markdown files kept local-only (README.md remains tracked)
-*.md
-!README.md
+# Local-only working notes (Markdown is otherwise tracked)
+/IMPLEMENTATION_SUMMARY.md
+/tech_notes.md

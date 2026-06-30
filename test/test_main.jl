@@ -1,3 +1,9 @@
+# TOML basic strings treat `\` as an escape, so a raw Windows temp path like
+# C:\Users\... interpolated into a "..."-quoted value becomes an invalid escape
+# (\U, \A, ...). Forward slashes are valid in TOML and accepted by Julia file I/O
+# on Windows, so normalize interpolated paths before writing them into configs.
+_toml_path(p::AbstractString) = replace(p, "\\" => "/")
+
 @testset "Main pipeline" begin
     test_dir = mktempdir()
 
@@ -28,8 +34,8 @@
         open(config_path, "w") do io
             write(io, """
 [pipeline]
-input_path = \"$input_path\"
-output_dir = \"$output_dir\"
+input_path = \"$(_toml_path(input_path))\"
+output_dir = \"$(_toml_path(output_dir))\"
 output_prefix = \"test_\"
 
 subsample_res = 0.1
@@ -63,7 +69,6 @@ enable_statistical_filter = false
         @test result.ground.written
         @test result.agh.written
         @test result.tree.written == false
-        @test result.tree.skeleton_written == false
         @test result.qsm.status == :skipped
         @test result.report.status == :skipped
 
@@ -106,8 +111,8 @@ end
         open(config_path, "w") do io
             write(io, """
 [pipeline]
-input_path = \"$input_path\"
-output_dir = \"$output_dir\"
+input_path = \"$(_toml_path(input_path))\"
+output_dir = \"$(_toml_path(output_dir))\"
 output_prefix = \"test_\"
 enable_preprocess = false
 enable_subsample = false
@@ -228,8 +233,8 @@ end
         open(config_path, "w") do io
             write(io, """
 [pipeline]
-input_path = \"$input_path\"
-output_dir = \"$output_dir\"
+input_path = \"$(_toml_path(input_path))\"
+output_dir = \"$(_toml_path(output_dir))\"
 output_prefix = \"test_\"
 
 subsample_res = 0.1

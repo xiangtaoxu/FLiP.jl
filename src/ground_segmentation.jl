@@ -138,6 +138,13 @@ function crop_by_ground_polygon(pc::PointCloud, ground_points::PointCloud;
 
     # Compute buffered convex hull
     hull = convex_hull_2d(coordinates(gnd_clean))
+    if size(hull, 1) < 3
+        # Collinear / near-collinear ground returns (e.g. a single scan line) collapse the
+        # hull to < 3 vertices, which buffer_polygon/polygon_area cannot handle. Skip cropping
+        # rather than aborting the whole ground stage.
+        @warn "$_LOG_PREFIX   polygon crop: degenerate ground hull (< 3 vertices); skipping crop"
+        return (pc_cropped=pc, ground_area=0.0)
+    end
     hull_buffered = buffer_polygon(hull, buffer)
     area = polygon_area(hull_buffered)
 

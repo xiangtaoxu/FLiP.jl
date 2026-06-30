@@ -15,6 +15,8 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
     pp_output = _stage_preprocess(cfg)
     g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)
+    # NBS refinement (lean trial QSM + refine_nbs) now runs INSIDE tree_segmentation,
+    # so the QSM stage is a single final pass over the refined tree cloud.
     t_output  = _stage_tree(cfg, g_output.agh);         g_output  = _drop_ground_clouds(g_output)
     q_output  = _stage_qsm(cfg, t_output.result, config_path)
     r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
@@ -123,25 +125,21 @@ end
 """
     _stage_tree(cfg, pc_agh) -> NamedTuple
 
-Run tree segmentation, write the tree and skeleton outputs, and return the
-full `tree_segmentation` result plus path / written-flag / n_components
-metadata. If `pc_agh` is `nothing`, the input is loaded from disk via
-`_prepare_stage_input`.
+Run tree segmentation (which now internally runs the lean trial QSM + `refine_nbs`
+before assembly), write the tree output, and return the full `tree_segmentation`
+result plus path / written-flag / n_components metadata. If `pc_agh` is `nothing`,
+the input is loaded from disk via `_prepare_stage_input`.
 
-Returns `(result, tree_path, skeleton_path, tree_written, skeleton_written,
-n_components)`. `result` is `nothing` when the stage is disabled.
+Returns `(result, tree_path, tree_written, n_components)`. `result` is `nothing`
+when the stage is disabled.
 """
 function _stage_tree(cfg::FLiPConfig, pc_agh)
     fmt = lowercase(cfg.pipeline.output_format)
-    tree_path     = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree",     fmt)
-    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
+    tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
 
     if !cfg.pipeline.enable_tree_segmentation
         _log_stage_skipped("tree_segmentation")
-        return (result=nothing,
-                tree_path=tree_path, skeleton_path=skeleton_path,
-                tree_written=false, skeleton_written=false,
-                n_components=0)
+        return (result=nothing, tree_path=tree_path, tree_written=false, n_components=0)
     end
 
     return _with_stage_timing("tree_segmentation") do
@@ -151,24 +149,19 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
         tree_input = nothing  # release input
 
         write_pc(tree_path, res.pc_output); @info "$_LOG_PREFIX   wrote: $tree_path"
-        skel_written = cfg.pipeline.enable_skeleton_output
-        if skel_written
-            write_pc(skeleton_path, res.skeleton_cloud); @info "$_LOG_PREFIX   wrote: $skeleton_path"
-        end
 
-        (result=res,
-         tree_path=tree_path, skeleton_path=skeleton_path,
-         tree_written=true, skeleton_written=skel_written,
-         n_components=res.n_components)
+        (result=res, tree_path=tree_path, tree_written=true, n_components=res.n_components)
     end
 end
 
 """
     _stage_qsm(cfg, tree_res, config_path) -> NamedTuple
 
-Run the QSM stage (or `(status=:skipped,)` if disabled). If `tree_res` is
-`nothing` and QSM is enabled, the tree result is reconstructed from disk
-via `_load_tree_result`.
+Run the (single, final) modeling + reporting QSM stage (or `(status=:skipped,)` if
+disabled). NBS refinement already happened inside the tree stage, so this fits the final
+per-node cylinder model (`model_nbs`), stamps `:node_id` onto the tree cloud, and writes the
+biometric CSVs (`report/`) + the surface cloud. If `tree_res` is `nothing`, the tree result is
+reconstructed from disk via `_load_tree_result(cfg)`.
 """
 function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
     if !cfg.pipeline.enable_qsm
@@ -177,13 +170,29 @@ function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
     end
     return _with_stage_timing("qsm") do
         tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+        pc = tr.pc_output
         fmt = lowercase(cfg.pipeline.output_format)
-        tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
-        qsm(tree_result=tr,
-            config_path=String(config_path),
-            output_dir=cfg.pipeline.output_dir,
-            output_prefix=cfg.pipeline.output_prefix,
-            tree_cloud_path=tree_path)
+        dir = cfg.pipeline.output_dir; prefix = cfg.pipeline.output_prefix
+        tree_path = get_output_path(dir, prefix, "tree", fmt)
+
+        m = model_nbs(pc=pc, cfg=cfg, group_attr=:tree_nbs_id, node_id_attr=:node_id, emit_surface=true)
+        surf = assemble_surface_cloud(m.surface_parts)
+        surf_path = joinpath(dir, "$(prefix)qsm_surface.laz")
+        # Only the :success path writes outputs (matches the original early-return behavior on
+        # :no_data / :no_linear_nbs, which left the tree-stage file untouched).
+        bm = (n_trees=0, node_csv_path=joinpath(dir, "$(prefix)qsm_nodes.csv"),
+              tree_csv_path=joinpath(dir, "$(prefix)qsm_trees.csv"))
+        if m.status == :success
+            bm = write_biometrics(m.nodes, cfg; output_dir=dir, output_prefix=prefix)
+            if !isempty(dir)
+                write_pc(tree_path, pc)                              # tree cloud now carrying :node_id
+                npoints(surf) > 0 && write_pc(surf_path, surf)
+            end
+        end
+
+        (status=m.status, n_nodes=length(m.nodes), n_trees=bm.n_trees,
+         node_csv_path=bm.node_csv_path, tree_csv_path=bm.tree_csv_path,
+         pc_output=pc, qsm_surface_cloud=surf, surface_cloud_path=surf_path, nodes=m.nodes)
     end
 end
 
@@ -255,19 +264,15 @@ end
     _load_tree_result(cfg) -> NamedTuple
 
 Reconstruct a tree-segmentation result NamedTuple from disk (used by stages
-4 and 5 when stage 3 was disabled or skipped). Loads the tree output and the
-optional skeleton; fills `filtered_cloud`, `n_components`, `neighbor_radius`
-with empty / zero defaults. Throws if the tree output is not on disk.
+4 and 5 when stage 3 was disabled or skipped). Loads the tree output and fills
+`filtered_cloud`, `n_components`, `neighbor_radius` with empty / zero defaults.
+Throws if the tree output is not on disk.
 """
-function _load_tree_result(cfg::FLiPConfig)
-    pc_tree = _prepare_stage_input(nothing, cfg, "tree",
+function _load_tree_result(cfg::FLiPConfig; stem::AbstractString="tree")
+    pc_tree = _prepare_stage_input(nothing, cfg, stem,
                                    "tree output", "qsm/report stage")
-    fmt = lowercase(cfg.pipeline.output_format)
-    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
-    pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
     return (
         pc_output=pc_tree,
-        skeleton_cloud=pc_skeleton,
         filtered_cloud=pc_tree[1:0],
         n_components=0,
         neighbor_radius=0.0,
@@ -287,10 +292,10 @@ _drop_tree_clouds(t)        = merge(t,  (result=nothing,))
 """
     _summarize(cfg, pp_output, g_output, t_output, q_output, r_output) -> NamedTuple
 
-Build the stage-grouped summary returned by `run_pipeline`. Each stage's
-paths, written-flags, and counts live in their own sub-NamedTuple
-(`preprocess`, `ground`, `agh`, `tree`); the raw `qsm` and `report` stage
-outputs are forwarded as-is.
+Build the stage-grouped summary returned by `run_pipeline`. Each stage's paths,
+written-flags, and counts live in their own sub-NamedTuple (`preprocess`,
+`ground`, `agh`, `tree`). NBS refinement runs inside the tree stage, so `qsm` is
+the single final QSM result and `report` is forwarded as-is.
 """
 function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_output)
     return (
@@ -308,9 +313,7 @@ function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_
         agh        = (path=g_output.agh_path,
                       written=g_output.agh_written),
         tree       = (path=t_output.tree_path,
-                      skeleton_path=t_output.skeleton_path,
                       written=t_output.tree_written,
-                      skeleton_written=t_output.skeleton_written,
                       n_components=t_output.n_components),
         qsm        = q_output,
         report     = r_output,
