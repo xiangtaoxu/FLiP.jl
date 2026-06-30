@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -27,21 +27,27 @@ jobs:
           - '1.12'   # minimum (and only) supported Julia — FLiP requires >= 1.12
         os:
           - ubuntu-latest
-          - macOS-latest
+          - macos-13        # Intel/x64 runner: native x64 + Homebrew at /usr/local,
+                            # so pye57's E57 wheel finds /usr/local/lib/libxerces-c (see brew step)
           - windows-latest
         arch:
           - x64
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v1
+      - uses: actions/checkout@v5
+      # pye57 (E57 I/O) links xerces-c; the pip wheel expects it at the Homebrew
+      # prefix. Without this the macOS CondaPkg/pip install fails to find libxerces-c.
+      - name: Install xerces-c for pye57 (macOS / E57 support)
+        if: runner.os == 'macOS'
+        run: brew install xerces-c
+      - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v1
+      - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v3
+      - uses: codecov/codecov-action@v5
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
