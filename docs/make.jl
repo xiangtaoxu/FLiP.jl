@@ -14,13 +14,6 @@ makedocs(;
     pages=[
         "Home" => "index.md",
         "Getting Started" => "getting_started.md",
-        "User Guide" => [
-            "Data Structures" => "guide/types.md",
-            "File I/O" => "guide/io.md",
-            "Subsampling" => "guide/subsampling.md",
-            "Filtering" => "guide/filtering.md",
-            "Transformations" => "guide/transformations.md",
-        ],
         "API Reference" => "api.md",
         "Examples" => "examples.md",
     ],
@@ -28,5 +21,5 @@ makedocs(;
 
 deploydocs(;
     repo="github.com/xiangtaoxu/FLiP.jl",
-    devbranch="main",
+    devbranch="master",
 )
