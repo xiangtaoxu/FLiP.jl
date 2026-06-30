@@ -24,15 +24,16 @@
         cfg.pipeline.subsample_res = 0.05
         cfg.pipeline.output_dir    = outdir
         cfg.pipeline.output_prefix = "itest"
-        cfg.tree_segmentation.enable_nbs_refine = true
+        cfg.tree.refine.enable = true
         tres = FLiP.tree_segmentation(build_cloud(); cfg=cfg)
-        qres = FLiP.qsm(tree_result=tres, cfg=cfg, output_dir=outdir,
-                        output_prefix="itest", node_id_attr=:node_id)
-        return tres, qres
+        m = FLiP.model_nbs(pc=tres.pc_output, cfg=cfg, group_attr=:tree_nbs_id,
+                           node_id_attr=:node_id, emit_surface=true)
+        bm = FLiP.write_biometrics(m.nodes, cfg; output_dir=outdir, output_prefix="itest")
+        return tres, m, bm
     end
 
     outdir1 = mktempdir()
-    tres, qres = run_once(outdir1)
+    tres, m, bm = run_once(outdir1)
     pc = tres.pc_output
 
     @testset "tree cloud attributes" begin
@@ -50,14 +51,14 @@
     end
 
     @testset "final QSM produced nodes" begin
-        @test qres.status == :success
-        @test qres.n_nodes > 0
-        @test isfile(qres.node_csv_path)
+        @test m.status == :success
+        @test length(m.nodes) > 0
+        @test isfile(bm.node_csv_path)
     end
 
     @testset "determinism: identical re-run → byte-identical node CSV" begin
         outdir2 = mktempdir()
-        _, qres2 = run_once(outdir2)
-        @test read(qres.node_csv_path) == read(qres2.node_csv_path)
+        _, _, bm2 = run_once(outdir2)
+        @test read(bm.node_csv_path) == read(bm2.node_csv_path)
     end
 end

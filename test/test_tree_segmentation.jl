@@ -112,6 +112,14 @@
         @test all(==(Int32(0)), nbs_tree3)
     end
 
+    @testset "_assembly_rule (pure Rule A/B predicate)" begin
+        # Rule B only when enabled, frac strictly exceeds threshold, and a target exists.
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(3), true)  === :rule_b
+        @test FLiP._assembly_rule(0.8, 0.8, Int32(3), true)  === :rule_a   # not strictly >
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(0), true)  === :rule_a   # no valid target
+        @test FLiP._assembly_rule(0.9, 0.8, Int32(3), false) === :rule_a   # rule B disabled
+    end
+
     # Shared fixture: a 3-NBS linear chain. Each NBS has 2 skeleton nodes so
     # `frac_connected` can land on the Rule-A side of the merge threshold.
     #
@@ -306,7 +314,7 @@
         tree_id     = Int32[1, 0]
         tree_nbs_id = Int32[1, 5]
         cfg = FLiP.FLiPConfig(Dict{String,Any}())
-        cfg.tree_segmentation.assembly_occlusion_tolerance = 0.0
+        cfg.tree.assembly.occlusion_tolerance = 0.0
         FLiP.assemble_occluded_segments(coords, tree_id, tree_nbs_id; cfg=cfg)
         @test tree_id     == Int32[1, 0]   # untouched
         @test tree_nbs_id == Int32[1, 5]

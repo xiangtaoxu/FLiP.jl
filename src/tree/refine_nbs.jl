@@ -1,126 +1,8 @@
 """
-Pre-assembly NBS refinement for FLiP.jl.
-
-`refine_nbs` runs **inside the tree-segmentation stage, per connected component (CC)**,
-*before* trees are assembled. It cleans up over-segmented Non-Branching Segments (NBS)
-using a trial QSM (the lean fit-only pass) in **two steps**, with the donor/receiver of
-every merge decided by **total NBS cylinder volume** (the larger-volume NBS absorbs; ties
-broken so the smaller `nbs_id` is the receiver):
-
-1. **NBS-level merge (Rule B, connectivity):** a whole NBS is merged into a neighbor NBS
-   when at least `tree_segmentation.assembly_merge_threshold` of its skeleton nodes are
-   adjacent (in the skeleton graph) to that single neighbor. This is the tree-free
-   reformulation of assembly's old Rule B, and it bridges co-linear/straddling splits that
-   pure volume overlap cannot (no shared volume ⇒ no claim).
-2. **Node-level merge (volume overlap):** individual trial-QSM nodes (z-slices) are moved
-   into the largest-volume NBS whose cylinder union overlaps them, then the result is
-   **snapped to skeleton-node granularity** — every skeleton node's points take the
-   plurality `nbs_id` — so a single skeleton node never ends up split across NBS (which
-   would make the downstream `skel_to_nbs` map order-dependent).
-
-Because refinement runs per-CC with no tree context, there are no cross-tree gates: a node
-can only be claimed within its own component. Determinism: per-node overlap is estimated on
-a FIXED global voxel lattice; Rule B is snapshot-based (all merge edges are computed against
-the original labeling, then resolved by a greedy volume-ordered parent map — strictly
-increasing in `(volume, -nbs_id)` ⇒ a DAG, no cycles); candidate gathering and claiming use
-fixed orders. The pipeline then re-runs the full QSM on the relabeled cloud.
+Pre-assembly NBS refinement (per connected component), two strategies sharing the orchestrator,
+node-models, and skeleton-node snap: NBS-level Rule B (connectivity) and node-level volume
+overlap. The larger-volume NBS absorbs in both; deterministic (fixed global voxel lattice).
 """
-
-using NearestNeighbors: KDTree, inrange
-using Graphs: SimpleGraph, neighbors
-
-# A finite cylinder from one trial-QSM node: midpoint, unit axis, radius, half-height.
-const Cyl = NamedTuple{(:center, :axis, :radius, :half_height),
-                       Tuple{NTuple{3,Float64}, NTuple{3,Float64}, Float64, Float64}}
-
-"""Per-node cylinder model (one trial-QSM slice). `trial_node_id` links to per-point `:trial_node_id`."""
-struct NodeModel
-    trial_node_id::Int
-    seg_id::Int32                 # owning nbs_id (original, pre-refine)
-    cyl::Cyl
-    aabb::NTuple{6,Float64}
-    vol_vox::Float64             # deterministic per-node self-volume (global lattice)
-    n_points::Int
-    completeness::Float64
-    agh::Float64
-end
-
-"""Per-NBS focal anchor: union of the NBS's node cylinders + aggregates."""
-struct SegModel
-    seg_id::Int32
-    cyls::Vector{Cyl}
-    aabb::NTuple{6,Float64}       # union of node AABBs
-    vol_vox::Float64             # Σ node vol_vox (size for ordering & donor/receiver)
-    n_points::Int                # Σ node n_points (per-focal min_points_gate)
-    completeness::Float64        # mean node completeness
-end
-
-"""One whole-NBS merge for the Rule-B report (a donor NBS folded into a receiver NBS)."""
-struct RuleBMove
-    donor_nbs::Int32
-    receiver_nbs::Int32
-    donor_vol::Float64
-    receiver_vol::Float64
-    frac_connected::Float64
-    n_donor_skel_nodes::Int
-end
-
-"""One node reassignment for the volume-merge report (a node moved into another NBS)."""
-struct NodeMove
-    trial_node_id::Int
-    from_nbs::Int32
-    to_nbs::Int32
-    overlap_ratio::Float64
-    n_points::Int
-    completeness::Float64
-    agh::Float64
-end
-
-@inline function _unit3(x::Float64, y::Float64, z::Float64)
-    n = sqrt(x * x + y * y + z * z)
-    return n > 0 ? (x / n, y / n, z / n) : (0.0, 0.0, 1.0)
-end
-
-@inline _aabb_intersection(a::NTuple{6,Float64}, b::NTuple{6,Float64}) =
-    (max(a[1], b[1]), min(a[2], b[2]),
-     max(a[3], b[3]), min(a[4], b[4]),
-     max(a[5], b[5]), min(a[6], b[6]))
-
-@inline function _point_in_any(p::NTuple{3,Float64}, cyls::Vector{Cyl})
-    @inbounds for c in cyls
-        point_in_cylinder(p, c.center, c.axis, c.radius, c.half_height) && return true
-    end
-    return false
-end
-
-"""
-    _voxel_intersection_volume(cyls_a, cyls_b, box, voxel_res) -> Float64
-
-Deterministic volume of the 3-D intersection of two cylinder unions, restricted to
-`box`, on the same global lattice as `voxelized_cylinder_volume` (a voxel counts iff its
-center is inside some cylinder of `cyls_a` AND some cylinder of `cyls_b`). The shared
-lattice makes the result ≤ each side's self-volume, so the per-node overlap ratio is ≤ 1.
-"""
-function _voxel_intersection_volume(cyls_a::Vector{Cyl}, cyls_b::Vector{Cyl},
-                                    box::NTuple{6,Float64}, voxel_res::Float64)
-    (!(voxel_res > 0) || isempty(cyls_a) || isempty(cyls_b)) && return 0.0
-    kx0 = floor(Int, box[1] / voxel_res); kx1 = ceil(Int, box[2] / voxel_res) - 1
-    ky0 = floor(Int, box[3] / voxel_res); ky1 = ceil(Int, box[4] / voxel_res) - 1
-    kz0 = floor(Int, box[5] / voxel_res); kz1 = ceil(Int, box[6] / voxel_res) - 1
-    cnt = 0
-    @inbounds for kx in kx0:kx1
-        cx = (kx + 0.5) * voxel_res
-        for ky in ky0:ky1
-            cy = (ky + 0.5) * voxel_res
-            for kz in kz0:kz1
-                cz = (kz + 0.5) * voxel_res
-                p = (cx, cy, cz)
-                (_point_in_any(p, cyls_a) && _point_in_any(p, cyls_b)) && (cnt += 1)
-            end
-        end
-    end
-    return cnt * voxel_res^3
-end
 
 """
     _build_node_models(nodes, voxel_res, nthread) -> Vector{NodeModel}
@@ -175,16 +57,16 @@ function _nbs_skel_nodes(skel_to_nbs::AbstractVector{<:Integer})
 end
 
 """
-    _nbs_volumes(seg_of, nodemodels) -> Dict{Int32, Float64}
+    _nbs_volumes(node_seg, nodemodels) -> Dict{Int32, Float64}
 
-Total cylinder volume per NBS, keyed by the *current* segment label in `seg_of`
-(`seg_of[i]` is node `i`'s NBS, updated after Rule B). NBS with no nodes are absent (treated
+Total cylinder volume per NBS, keyed by the *current* segment label in `node_seg`
+(`node_seg[i]` is node `i`'s NBS, updated after Rule B). NBS with no nodes are absent (treated
 as volume 0 by callers).
 """
-function _nbs_volumes(seg_of::AbstractVector{Int32}, nodemodels::Vector{NodeModel})
+function _nbs_volumes(node_seg::AbstractVector{Int32}, nodemodels::Vector{NodeModel})
     vol = Dict{Int32, Float64}()
     @inbounds for i in eachindex(nodemodels)
-        vol[seg_of[i]] = get(vol, seg_of[i], 0.0) + nodemodels[i].vol_vox
+        vol[node_seg[i]] = get(vol, node_seg[i], 0.0) + nodemodels[i].vol_vox
     end
     return vol
 end
@@ -269,17 +151,17 @@ function _rule_b_merges(skel_to_nbs::AbstractVector{<:Integer},
 end
 
 """
-    _build_focal_models(seg_of, nodemodels, nbs_vol) -> (Vector{SegModel}, Dict{Int32,Vector{Int}})
+    _build_focal_models(node_seg, nodemodels, nbs_vol) -> (Vector{SegModel}, Dict{Int32,Vector{Int}})
 
-Group node indices by their current segment label (`seg_of`) and build a focal `SegModel`
+Group node indices by their current segment label (`node_seg`) and build a focal `SegModel`
 per NBS (union cylinders + AABB, total volume, mean completeness). Returns the seg models
 (ordered by `seg_id`) and the `seg_id → node-index` map.
 """
-function _build_focal_models(seg_of::AbstractVector{Int32}, nodemodels::Vector{NodeModel},
+function _build_focal_models(node_seg::AbstractVector{Int32}, nodemodels::Vector{NodeModel},
                              nbs_vol::Dict{Int32,Float64})
     seg_nodes = Dict{Int32,Vector{Int}}()
     for i in eachindex(nodemodels)
-        push!(get!(seg_nodes, seg_of[i], Int[]), i)
+        push!(get!(seg_nodes, node_seg[i], Int[]), i)
     end
     seg_ids = sort!(collect(keys(seg_nodes)))
     segs = SegModel[]
@@ -310,7 +192,7 @@ first failing gate: `:below_overlap_threshold`, `:node_completeness_gate`,
 refinement is pre-assembly, per-CC.)
 """
 function _node_merge_reason(F::SegModel, n::NodeModel, ratio::Float64, cfg::FLiPConfig)
-    rc = cfg.nbs_refine
+    rc = cfg.tree.refine
     ratio > rc.overlap_threshold || return :below_overlap_threshold
     n.completeness >= rc.completeness_gate || return :node_completeness_gate
     F.completeness >= rc.completeness_gate || return :focal_completeness_gate
@@ -319,20 +201,20 @@ function _node_merge_reason(F::SegModel, n::NodeModel, ratio::Float64, cfg::FLiP
 end
 
 """
-    _volume_node_moves(seg_of, nodemodels, nbs_vol, voxel_res, margin, cfg)
-        -> (claimed_by::Vector{Int32}, moves::Vector{NodeMove})
+    _volume_node_moves(node_seg, nodemodels, nbs_vol, voxel_res, margin, cfg)
+        -> (node_claimed_by::Vector{Int32}, moves::Vector{NodeMove})
 
 Node-level volume merge. Process NBS focals largest-volume first; each focal claims the
 individual nodes of smaller-volume NBS whose cylinder overlaps the focal's cylinder union
 (per-node ratio = inter_vol(node, focal) / vol(node) > `overlap_threshold`, gates pass).
-A node already claimed by a larger focal is skipped. `seg_of` is the post-Rule-B labeling.
+A node already claimed by a larger focal is skipped. `node_seg` is the post-Rule-B labeling.
 """
-function _volume_node_moves(seg_of::Vector{Int32}, nodemodels::Vector{NodeModel},
+function _volume_node_moves(node_seg::Vector{Int32}, nodemodels::Vector{NodeModel},
                             nbs_vol::Dict{Int32,Float64}, voxel_res::Float64,
                             margin::Float64, cfg::FLiPConfig)
     Nn = length(nodemodels)
     nthread = effective_nthreads(cfg)
-    segmodels, seg_nodes = _build_focal_models(seg_of, nodemodels, nbs_vol)
+    segmodels, seg_nodes = _build_focal_models(node_seg, nodemodels, nbs_vol)
 
     centers = Matrix{Float64}(undef, 3, Nn)
     reach = Vector{Float64}(undef, Nn)
@@ -351,7 +233,7 @@ function _volume_node_moves(seg_of::Vector{Int32}, nodemodels::Vector{NodeModel}
         rank_of[segmodels[oi].seg_id] = r
     end
 
-    claimed_by = copy(seg_of)
+    node_claimed_by = copy(node_seg)
     last_focal = zeros(Int, Nn)
     moves = NodeMove[]
     q = Vector{Float64}(undef, 3)
@@ -364,11 +246,11 @@ function _volume_node_moves(seg_of::Vector{Int32}, nodemodels::Vector{NodeModel}
             q[1] = c[1]; q[2] = c[2]; q[3] = c[3]
             for nj in inrange(tree, q, reach[ni] + Rmax + margin)
                 nm = nodemodels[nj]
-                seg_of[nj] == F.seg_id && continue        # same NBS
+                node_seg[nj] == F.seg_id && continue        # same NBS
                 last_focal[nj] == r && continue           # dedupe within this focal
                 last_focal[nj] = r
-                rank_of[seg_of[nj]] > r || continue        # candidate must be smaller/later
-                claimed_by[nj] == seg_of[nj] || continue   # not already claimed by a larger focal
+                rank_of[node_seg[nj]] > r || continue        # candidate must be smaller/later
+                node_claimed_by[nj] == node_seg[nj] || continue   # not already claimed by a larger focal
                 aabbs_overlap(nm.aabb, F.aabb) || continue
                 push!(cand, nj)
             end
@@ -387,12 +269,12 @@ function _volume_node_moves(seg_of::Vector{Int32}, nodemodels::Vector{NodeModel}
             nj = cand[t]
             nm = nodemodels[nj]
             _node_merge_reason(F, nm, ratios[t], cfg) === :ok || continue
-            claimed_by[nj] = F.seg_id
-            push!(moves, NodeMove(nm.trial_node_id, seg_of[nj], F.seg_id,
+            node_claimed_by[nj] = F.seg_id
+            push!(moves, NodeMove(nm.trial_node_id, node_seg[nj], F.seg_id,
                                   ratios[t], nm.n_points, nm.completeness, nm.agh))
         end
     end
-    return claimed_by, moves
+    return node_claimed_by, moves
 end
 
 """
@@ -405,7 +287,7 @@ vectors: `nbs_id` (rewritten), `node_id` (skeleton node, for the snap), `trial_n
 and `skel_to_nbs` (skeleton vertex → nbs) drive Rule B.
 
 Returns `(nbs_id, n_rule_b_merges, n_nodes_moved, rule_b_moves, node_moves)`. In
-`cfg.nbs_refine.mode == "flag_only"` the returned `nbs_id` is unchanged (moves are still
+`cfg.tree.refine.mode == "flag_only"` the returned `nbs_id` is unchanged (moves are still
 reported); in `"apply"` it is the rewritten, densely-relabeled labeling.
 """
 function refine_nbs(; nbs_id::AbstractVector{<:Integer},
@@ -415,7 +297,7 @@ function refine_nbs(; nbs_id::AbstractVector{<:Integer},
                       graph_skeleton::SimpleGraph{Int},
                       skel_to_nbs::AbstractVector{<:Integer},
                       cfg::FLiPConfig)
-    rc = cfg.nbs_refine
+    rc = cfg.tree.refine
     voxel_res = rc.voxel_res_scalar * cfg.pipeline.subsample_res
     nthread = effective_nthreads(cfg)
     new_nbs = Int32.(nbs_id)
@@ -425,22 +307,22 @@ function refine_nbs(; nbs_id::AbstractVector{<:Integer},
     voxel_res > 0 || (@warn "$_LOG_PREFIX refine_nbs: non-positive voxel resolution; skipping"; return nores)
 
     nodemodels = _build_node_models(nodes, voxel_res, nthread)
-    seg_of = Int32[nm.seg_id for nm in nodemodels]
+    node_seg = Int32[nm.seg_id for nm in nodemodels]
 
     # ── Step 1: NBS-level Rule B merge ───────────────────────────────────────
-    merge_threshold = cfg.tree_segmentation.assembly_merge_threshold
-    nbs_vol0 = _nbs_volumes(seg_of, nodemodels)
+    merge_threshold = cfg.tree.assembly.merge_threshold
+    nbs_vol0 = _nbs_volumes(node_seg, nodemodels)
     parent, rule_b_moves = _rule_b_merges(skel_to_nbs, graph_skeleton, nbs_vol0, merge_threshold)
     relabel(x::Int32) = get(parent, x, x)
-    @inbounds for i in eachindex(seg_of)
-        seg_of[i] = relabel(seg_of[i])
+    @inbounds for i in eachindex(node_seg)
+        node_seg[i] = relabel(node_seg[i])
     end
 
     # ── Step 2: node-level volume merge (on the Rule-B-merged labeling) ──────
-    nbs_vol1 = _nbs_volumes(seg_of, nodemodels)
+    nbs_vol1 = _nbs_volumes(node_seg, nodemodels)
     margin = max(0.0, rc.candidate_radius_scalar * cfg.pipeline.subsample_res)
-    claimed_by, node_moves = isempty(nodemodels) ? (seg_of, NodeMove[]) :
-        _volume_node_moves(seg_of, nodemodels, nbs_vol1, voxel_res, margin, cfg)
+    node_claimed_by, node_moves = isempty(nodemodels) ? (node_seg, NodeMove[]) :
+        _volume_node_moves(node_seg, nodemodels, nbs_vol1, voxel_res, margin, cfg)
 
     do_apply = rc.mode == "apply"
     if do_apply && (!isempty(rule_b_moves) || !isempty(node_moves))
@@ -452,7 +334,7 @@ function refine_nbs(; nbs_id::AbstractVector{<:Integer},
         if !isempty(node_moves)
             move_map = Dict{Int,Int32}()
             for k in eachindex(nodemodels)
-                claimed_by[k] != seg_of[k] && (move_map[nodemodels[k].trial_node_id] = claimed_by[k])
+                node_claimed_by[k] != node_seg[k] && (move_map[nodemodels[k].trial_node_id] = node_claimed_by[k])
             end
             if !isempty(move_map)
                 @inbounds for i in eachindex(new_nbs)
@@ -504,32 +386,3 @@ end
 
 # ── Report writers (called by the tree-segmentation stage under enable_debug_info) ──
 
-function _write_node_merge_report(path::String, moves::Vector{NodeMove})
-    ord = sortperm(moves; by = mv -> mv.trial_node_id)
-    n = length(ord)
-    tid = Vector{Int}(undef, n); fnb = Vector{Int32}(undef, n); tnb = Vector{Int32}(undef, n)
-    rat = Vector{Float64}(undef, n); npt = Vector{Int}(undef, n)
-    cmp = Vector{Float64}(undef, n); agv = Vector{Float64}(undef, n)
-    for (k, j) in enumerate(ord)
-        mv = moves[j]
-        tid[k] = mv.trial_node_id; fnb[k] = mv.from_nbs; tnb[k] = mv.to_nbs
-        rat[k] = mv.overlap_ratio; npt[k] = mv.n_points; cmp[k] = mv.completeness; agv[k] = mv.agh
-    end
-    headers = ["trial_node_id", "from_nbs", "to_nbs", "node_overlap_ratio",
-               "node_n_points", "node_completeness", "node_agh"]
-    _write_csv(path, AbstractVector[tid, fnb, tnb, rat, npt, cmp, agv], headers)
-end
-
-function _write_rule_b_report(path::String, moves::Vector{RuleBMove})
-    n = length(moves)
-    dn = Vector{Int32}(undef, n); rn = Vector{Int32}(undef, n)
-    dv = Vector{Float64}(undef, n); rv = Vector{Float64}(undef, n)
-    fr = Vector{Float64}(undef, n); ns = Vector{Int}(undef, n)
-    for (k, mv) in enumerate(moves)
-        dn[k] = mv.donor_nbs; rn[k] = mv.receiver_nbs; dv[k] = mv.donor_vol
-        rv[k] = mv.receiver_vol; fr[k] = mv.frac_connected; ns[k] = mv.n_donor_skel_nodes
-    end
-    headers = ["donor_nbs", "receiver_nbs", "donor_vol", "receiver_vol",
-               "frac_connected", "n_donor_skel_nodes"]
-    _write_csv(path, AbstractVector[dn, rn, dv, rv, fr, ns], headers)
-end

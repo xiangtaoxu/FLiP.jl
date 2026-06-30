@@ -66,24 +66,21 @@
         old_subsample = cfg.pipeline.subsample_res
         cfg.pipeline.subsample_res = 0.05
 
-        result = FLiP.qsm(
-            tree_result=tree_result,
-            config_path="",
-            output_dir=mktempdir(),
-            output_prefix="test",
-        )
+        outdir = mktempdir()
+        m  = FLiP.model_nbs(pc=tree_result.pc_output, cfg=cfg, emit_surface=true)
+        bm = FLiP.write_biometrics(m.nodes, cfg; output_dir=outdir, output_prefix="test")
 
         cfg.pipeline.subsample_res = old_subsample
 
-        @test result.status == :success || result.status == :no_linear_nbs
-        if result.status == :success
-            @test result.n_nodes > 0
-            @test result.n_trees >= 1
-            @test isfile(result.node_csv_path)
-            @test isfile(result.tree_csv_path)
+        @test m.status == :success || m.status == :no_linear_nbs
+        if m.status == :success
+            @test length(m.nodes) > 0
+            @test bm.n_trees >= 1
+            @test isfile(bm.node_csv_path)
+            @test isfile(bm.tree_csv_path)
 
             # Read back CSV and check radius is reasonable
-            lines = readlines(result.node_csv_path)
+            lines = readlines(bm.node_csv_path)
             @test length(lines) > 1  # header + at least one data row
             headers = split(lines[1], ",")
             r_area_col = findfirst(==("radius_area"), headers)
@@ -119,20 +116,17 @@
         cfg = FLiP._CFG
         old_subsample = cfg.pipeline.subsample_res
         cfg.pipeline.subsample_res = 0.05
-        outdir = mktempdir()
-        result = FLiP.qsm(tree_result=tree_result, output_dir=outdir, output_prefix="lean",
-                          lean=true, group_attr=:nbs_id, node_id_attr=:trial_node_id)
+        m = FLiP.model_nbs(pc=pc, cfg=cfg, group_attr=:nbs_id,
+                           node_id_attr=:trial_node_id, emit_surface=false)
         cfg.pipeline.subsample_res = old_subsample
 
-        @test result.status == :success || result.status == :no_linear_nbs
-        if result.status == :success
-            @test result.n_nodes > 0
-            @test result.n_trees == 0                          # no tree aggregation in lean
-            @test !isfile(result.tree_csv_path)                # tree CSV not written
-            @test npoints(result.qsm_surface_cloud) == 0       # no surface cloud
+        @test m.status == :success || m.status == :no_linear_nbs
+        if m.status == :success
+            @test length(m.nodes) > 0
+            @test isempty(m.surface_parts.coords)              # fit-only: no surface emitted
             @test hasattribute(pc, :trial_node_id)             # emitted under requested name
             # grouping label flows into both QSMNode.nbs_id and tree_nbs_id
-            @test all(nd.nbs_id == nd.tree_nbs_id == Int32(1) for nd in result.nodes)
+            @test all(nd.nbs_id == nd.tree_nbs_id == Int32(1) for nd in m.nodes)
         end
     end
 
@@ -171,9 +165,9 @@
     end
 
     @testset "QSM with no data" begin
-        result = FLiP.qsm(tree_result=nothing, output_dir=mktempdir(), output_prefix="empty")
+        result = FLiP.model_nbs(pc=nothing)
         @test result.status == :no_data
-        @test result.n_nodes == 0
+        @test isempty(result.nodes)
     end
 
     @testset "2D surface smoothing — uniform surface unchanged" begin
@@ -374,10 +368,10 @@
 
         cfg_off = deepcopy(FLiP._CFG)
         cfg_off.pipeline.subsample_res     = 0.05
-        cfg_off.qsm.completeness_threshold = 0.1
-        cfg_off.qsm.qc_enable              = false
+        cfg_off.tree.model.completeness_threshold = 0.1
+        cfg_off.tree.model.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm.qc_enable               = true
+        cfg_on.tree.model.qc_enable               = true
         # CC link radius = QC_CC_RADIUS_SCALAR (=2.0) × subsample_res = 0.10 m < cluster gap 0.20 m
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
@@ -428,10 +422,10 @@
 
         cfg_off = deepcopy(FLiP._CFG)
         cfg_off.pipeline.subsample_res     = 0.05
-        cfg_off.qsm.completeness_threshold = 0.1
-        cfg_off.qsm.qc_enable              = false
+        cfg_off.tree.model.completeness_threshold = 0.1
+        cfg_off.tree.model.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm.qc_enable               = true
+        cfg_on.tree.model.qc_enable               = true
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
         linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)
@@ -475,10 +469,10 @@
 
         cfg_off = deepcopy(FLiP._CFG)
         cfg_off.pipeline.subsample_res     = 0.05
-        cfg_off.qsm.completeness_threshold = 0.1
-        cfg_off.qsm.qc_enable              = false
+        cfg_off.tree.model.completeness_threshold = 0.1
+        cfg_off.tree.model.qc_enable              = false
         cfg_on = deepcopy(cfg_off)
-        cfg_on.qsm.qc_enable               = true
+        cfg_on.tree.model.qc_enable               = true
 
         linear_off = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_off)
         linear_on  = FLiP._filter_linear_nbs(coords_mat, nbs_ids, cfg_on)

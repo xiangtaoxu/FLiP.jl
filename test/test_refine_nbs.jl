@@ -12,13 +12,13 @@
                         comp_gate=0.25, min_pts=1)
         cfg = FLiP.FLiPConfig(Dict{String,Any}())
         cfg.pipeline.subsample_res                = 0.05
-        cfg.nbs_refine.mode                       = mode
-        cfg.nbs_refine.overlap_threshold          = overlap
-        cfg.nbs_refine.completeness_gate          = comp_gate
-        cfg.nbs_refine.min_points_gate            = min_pts
-        cfg.nbs_refine.voxel_res_scalar           = 1.0
-        cfg.nbs_refine.candidate_radius_scalar    = 1.0
-        cfg.tree_segmentation.assembly_merge_threshold = merge_threshold
+        cfg.tree.refine.mode                       = mode
+        cfg.tree.refine.overlap_threshold          = overlap
+        cfg.tree.refine.completeness_gate          = comp_gate
+        cfg.tree.refine.min_points_gate            = min_pts
+        cfg.tree.refine.voxel_res_scalar           = 1.0
+        cfg.tree.refine.candidate_radius_scalar    = 1.0
+        cfg.tree.assembly.merge_threshold = merge_threshold
         return cfg
     end
 

@@ -157,11 +157,11 @@ end
 """
     _stage_qsm(cfg, tree_res, config_path) -> NamedTuple
 
-Run the (single, final) QSM stage (or `(status=:skipped,)` if disabled). If
-`tree_res` is `nothing`, the tree result is reconstructed from disk via
-`_load_tree_result(cfg)`. NBS refinement already happened inside the tree
-stage, so this is the canonical pass writing `{prefix}qsm_*` and stamping
-`:node_id` onto the tree cloud.
+Run the (single, final) modeling + reporting QSM stage (or `(status=:skipped,)` if
+disabled). NBS refinement already happened inside the tree stage, so this fits the final
+per-node cylinder model (`model_nbs`), stamps `:node_id` onto the tree cloud, and writes the
+biometric CSVs (`report/`) + the surface cloud. If `tree_res` is `nothing`, the tree result is
+reconstructed from disk via `_load_tree_result(cfg)`.
 """
 function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
     if !cfg.pipeline.enable_qsm
@@ -170,13 +170,29 @@ function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
     end
     return _with_stage_timing("qsm") do
         tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
+        pc = tr.pc_output
         fmt = lowercase(cfg.pipeline.output_format)
-        tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
-        qsm(tree_result=tr,
-            config_path=String(config_path),
-            output_dir=cfg.pipeline.output_dir,
-            output_prefix=cfg.pipeline.output_prefix,
-            tree_cloud_path=tree_path)
+        dir = cfg.pipeline.output_dir; prefix = cfg.pipeline.output_prefix
+        tree_path = get_output_path(dir, prefix, "tree", fmt)
+
+        m = model_nbs(pc=pc, cfg=cfg, group_attr=:tree_nbs_id, node_id_attr=:node_id, emit_surface=true)
+        surf = assemble_surface_cloud(m.surface_parts)
+        surf_path = joinpath(dir, "$(prefix)qsm_surface.laz")
+        # Only the :success path writes outputs (matches the original early-return behavior on
+        # :no_data / :no_linear_nbs, which left the tree-stage file untouched).
+        bm = (n_trees=0, node_csv_path=joinpath(dir, "$(prefix)qsm_nodes.csv"),
+              tree_csv_path=joinpath(dir, "$(prefix)qsm_trees.csv"))
+        if m.status == :success
+            bm = write_biometrics(m.nodes, cfg; output_dir=dir, output_prefix=prefix)
+            if !isempty(dir)
+                write_pc(tree_path, pc)                              # tree cloud now carrying :node_id
+                npoints(surf) > 0 && write_pc(surf_path, surf)
+            end
+        end
+
+        (status=m.status, n_nodes=length(m.nodes), n_trees=bm.n_trees,
+         node_csv_path=bm.node_csv_path, tree_csv_path=bm.tree_csv_path,
+         pc_output=pc, qsm_surface_cloud=surf, surface_cloud_path=surf_path, nodes=m.nodes)
     end
 end
 

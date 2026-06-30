@@ -10,7 +10,7 @@
 # Run the pipeline:   FLiP.run_pipeline(config_path = "path/to/this/file")
 #
 # Field names below match Julia struct paths exactly, e.g.
-#   `qsm.min_node_size` (TOML) ↔ `cfg.qsm.min_node_size` (Julia).
+#   `tree.model.min_node_size` (TOML) ↔ `cfg.tree.model.min_node_size` (Julia).
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -86,59 +86,46 @@ enable_ground_crop = true             # Crop point cloud to buffered ground poly
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Stage 3: Tree segmentation
-# Splits the above-ground cloud into per-tree clusters via NBS extraction and
-# greedy assembly. Tuning is dataset-dependent (TLS vs MLS vs ALS).
+# Stage 3+4: Tree (the whole forest-structure pipeline, one merged domain)
+# label NBS → trial model → refine → assemble → final model. Configured as one
+# nested [tree] domain:
+#   [tree]          — KEY extraction dials you tune per dataset (TLS vs MLS vs ALS)
+#   [tree.assembly] — tree-assembly gates (also used by refine Rule B)
+#   [tree.refine]   — pre-assembly NBS refinement (advanced)
+#   [tree.model]    — QSM cylinder fitting; drives BOTH the trial and final model (advanced)
 # ════════════════════════════════════════════════════════════════════════════
-[tree_segmentation]
-nearground_agh_threshold     = 0.3    # Keep only points with AGH > threshold before tree segmentation
-neighbor_radius              = -1.0   # If ≤ 0, defaults to 1.5 × pipeline.subsample_res
-frontier_min_cc_size         = 3      # Minimum frontier CC size during NBS greedy expansion
-nbs_neighbor_distance        = 2      # Hop distance for greedy NBS search
-min_nbs_size                 = 5      # Minimum points per NBS segment (also min CC size for tree graph)
-linearity_angle_deg          = 80.0   # Max angular deviation (degrees) for NBS expansion direction filtering
-assembly_merge_threshold     = 0.8    # Fraction of nodes connected to tree NBS required to merge (0.0–1.0); reused by refine_nbs Rule B
-assembly_occlusion_tolerance = 0.1    # Max distance (m) when rescuing orphan NBS via occlusion gap
-enable_nbs_refine            = true   # Stage 3b: pre-assembly NBS refinement (Rule B + volume overlap) via a lean trial QSM; default true
+[tree]
+neighbor_radius          = -1.0   # CC/NBS graph radius; if ≤ 0, defaults to 2.0 × pipeline.subsample_res
+min_nbs_size             = 5      # Minimum points per NBS segment (also min CC size for tree graph)
+nearground_agh_threshold = 0.3    # Keep only points with AGH > threshold before tree segmentation
+linearity_angle_deg      = 80.0   # Max angular deviation (deg) for NBS expansion direction filtering
+nbs_neighbor_distance    = 2      # Hop distance for greedy NBS search
+frontier_min_cc_size     = 3      # Minimum frontier CC size during NBS greedy expansion
 
+[tree.assembly]
+merge_threshold     = 0.8         # Fraction of skeleton nodes connected required to merge (Rule A/B; also refine Rule B)
+occlusion_tolerance = 0.1         # Max distance (m) when rescuing orphan NBS via occlusion gap
 
-# ════════════════════════════════════════════════════════════════════════════
-# Stage 4: QSM (Quantitative Structural Modeling)
-# Fits per-branch cross-sections and aggregates to per-tree biometrics
-# (DBH, volume, surface area).
-# ════════════════════════════════════════════════════════════════════════════
-[qsm]
-nbs_linearity_threshold = 0.5         # Minimum linearity (λ₃-λ₂)/λ₃ for an NBS to be QSM-processed
-slice_height_scalar     = 3.0         # × subsample_res → z-slice height
-min_node_size           = 5           # Minimum points per slice to keep
-phi_bin_min             = 36          # Minimum angular bins for rho-phi grid
-phi_bin_max             = 360         # Maximum angular bins for rho-phi grid
-surface_res_scalar      = 0.5         # × subsample_res → 2D surface grid resolution
-completeness_threshold  = 0.25        # Minimum fraction of phi-bins filled to accept a slice
-breast_height           = 1.3         # Reference height (m) for DBH calculation
-spl_z_smoothing         = 0.3         # Cross-slice smoothing weight for spline method (0=disabled, 1=max)
-rho_percentile          = 1.0         # Per-slice rho filter before 2D surface fit (1.0 = no filtering; <1.0 = drop top fraction per slice, shrinks fit toward inner wood)
-min_octant_taubin       = 3           # Min distinct angular octants (of 8) for a slice to use Taubin circle fit
-
-# --- Per-slice quality control (drops SOR outliers, keeps dominant CC) ---
-# CC link radius = subsample_res × 2.0 (hardcoded module constant);
-# CC min size    = qsm.min_node_size; SOR uses statistical_filter.k_neighbors / n_sigma.
-qc_enable           = true
-qc_continuity_ratio = 0.7             # If 2nd-largest CC size ≥ ratio × largest, break tie by centroid distance to previous slice's center
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Stage 3b: NBS refinement (pre-assembly; runs inside tree_segmentation per
-# connected component, gated by tree_segmentation.enable_nbs_refine). A lean trial
-# QSM fits per-NBS cylinders, then refine_nbs merges over-segmented NBS in two
-# steps — (1) whole-NBS Rule B by skeleton connectivity, (2) node-level volume
-# overlap — with the larger-volume NBS absorbing in both. Deterministic: per-node
-# overlap is estimated on a fixed global voxel lattice (no Monte-Carlo).
-# ════════════════════════════════════════════════════════════════════════════
-[nbs_refine]
+[tree.refine]
+enable                  = true    # Run pre-assembly NBS refinement (Rule B + node-level volume overlap)
 overlap_threshold       = 0.2     # Claim a node when inter_vol(node, focal) / vol(node) exceeds this
 voxel_res_scalar        = 1.0     # × subsample_res → voxel edge for the overlap estimator (≈ point spacing)
 completeness_gate       = 0.25    # Both the moving node and the focal NBS need completeness ≥ this
 min_points_gate         = 20      # The focal NBS needs ≥ this many points (per-focal)
 candidate_radius_scalar = 1.0     # Extra KDTree candidate-search margin (× subsample_res)
 mode                    = "apply" # "apply" (relabel) | "flag_only" (report only)
+
+[tree.model]
+nbs_linearity_threshold = 0.5     # Minimum linearity (λ₃-λ₂)/λ₃ for an NBS to be modeled
+slice_height_scalar     = 3.0     # × subsample_res → z-slice height
+min_node_size           = 5       # Minimum points per slice to keep
+phi_bin_min             = 36      # Minimum angular bins for rho-phi grid
+phi_bin_max             = 360     # Maximum angular bins for rho-phi grid
+surface_res_scalar      = 0.5     # × subsample_res → 2D surface grid resolution
+completeness_threshold  = 0.25    # Minimum fraction of phi-bins filled to accept a slice
+breast_height           = 1.3     # Reference height (m) for DBH calculation
+spl_z_smoothing         = 0.3     # Cross-slice smoothing weight for spline method (0=disabled, 1=max)
+rho_percentile          = 1.0     # Per-slice rho filter before 2D surface fit (1.0 = no filtering)
+min_octant_taubin       = 3       # Min distinct angular octants (of 8) for a slice to use Taubin circle fit
+qc_enable               = true    # Per-slice quality control (drops SOR outliers, keeps dominant CC)
+qc_continuity_ratio     = 0.7     # If 2nd-largest CC size ≥ ratio × largest, break tie by centroid distance
