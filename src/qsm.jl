@@ -82,23 +82,32 @@ Run quantitative structural modeling on tree-segmented point cloud.
 - `config_path`: Path to TOML config file
 - `output_dir`: Directory for CSV output files
 - `output_prefix`: Filename prefix for outputs
+- `lean`: If true, run a fit-only "trial" pass — produce per-node cylinders but skip
+  surface-cloud generation and per-tree biometric aggregation (used by the in-stage NBS
+  refinement; the full final pass leaves this `false`).
+- `group_attr`: Per-point label attribute to group NBS by (`:tree_nbs_id` for the final
+  pass; `:nbs_id` for the pre-assembly lean trial).
+- `node_id_attr`: Per-point attribute name to write the assigned node id under (`:node_id`
+  for the final pass; `:trial_node_id` for the lean trial).
 
 # Returns
 NamedTuple with fields:
 - `status`: `:success` or `:no_linear_nbs`
 - `n_nodes`: Number of QSM nodes created
-- `n_trees`: Number of trees with QSM data
+- `n_trees`: Number of trees with QSM data (0 in lean mode)
 - `node_csv_path`: Path to node-level CSV (includes all NBS)
 - `tree_csv_path`: Path to tree-level CSV (tree NBS only)
-- `pc_output`: Point cloud with `:qsm_node_id` attribute added
+- `pc_output`: Point cloud with the `node_id_attr` attribute added
 - `qsm_surface_cloud`: Point cloud of QSM surface with `:tree_nbs_id` attribute
 - `surface_cloud_path`: Path to surface cloud LAZ file
 - `nodes`: `Vector{QSMNode}` of per-slice cylinder fits (in memory; consumed by
   the optional QSM-refinement stage). Empty for the early-return statuses.
 """
 function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::AbstractString="",
-               output_prefix::AbstractString="output", tree_cloud_path::AbstractString="", kwargs...)
-    cfg = isempty(config_path) ? _CFG : load_config!(String(config_path))
+               output_prefix::AbstractString="output", tree_cloud_path::AbstractString="",
+               lean::Bool=false, group_attr::Symbol=:tree_nbs_id, node_id_attr::Symbol=:node_id,
+               cfg::Union{Nothing,FLiPConfig}=nothing, kwargs...)
+    cfg = !isnothing(cfg) ? cfg : (isempty(config_path) ? _CFG : load_config!(String(config_path)))
 
     if isnothing(tree_result) || npoints(tree_result.pc_output) == 0
         @warn "$_LOG_PREFIX qsm: no tree segmentation data available"
@@ -110,20 +119,21 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     coords = coordinates(pc)
     N = size(coords, 1)
 
-    # Required attributes (group QSM by tree_nbs_id — the merged, post-assembly identifier)
+    # Group QSM by `group_attr` (`:tree_nbs_id` for the final pass — the merged,
+    # post-assembly identifier; `:nbs_id` for the lean trial pass run pre-assembly).
     tree_ids = hasattribute(pc, :tree_id) ? getattribute(pc, :tree_id) : zeros(Int32, N)
-    tree_nbs_ids = hasattribute(pc, :tree_nbs_id) ? getattribute(pc, :tree_nbs_id) : zeros(Int32, N)
+    group_ids = hasattribute(pc, group_attr) ? getattribute(pc, group_attr) : zeros(Int32, N)
     agh_values = hasattribute(pc, :AGH) ? getattribute(pc, :AGH) : zeros(Float64, N)
 
-    @info "$_LOG_PREFIX   processing $N points"
+    @info "$_LOG_PREFIX   processing $N points$(lean ? " (lean trial)" : "")"
 
     # Stage 1: Filter linear NBS segments
-    linear_nbs = _filter_linear_nbs(coords, tree_nbs_ids, cfg)
+    linear_nbs = _filter_linear_nbs(coords, group_ids, cfg)
     n_linear = count(!isnothing, linear_nbs)
     @info "$_LOG_PREFIX   $n_linear linear NBS (linearity_threshold=$(cfg.qsm.nbs_linearity_threshold))"
 
     if n_linear == 0
-        setattribute!(pc, :qsm_node_id, zeros(Int32, N))
+        setattribute!(pc, node_id_attr, zeros(Int32, N))
         return (status=:no_linear_nbs, n_nodes=0, n_trees=0,
                 node_csv_path="", tree_csv_path="", pc_output=pc, nodes=QSMNode[])
     end
@@ -152,7 +162,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
         nid32 = Int32(nid)
         next_node_id, surf_pts, surf_rho = _process_single_nbs!(nodes, qsm_node_ids,
                                             coords, info, nid32,
-                                            tree_ids, agh_values, cfg, next_node_id)
+                                            tree_ids, agh_values, cfg, next_node_id; lean=lean)
 
         # Accumulate surface point cloud
         if size(surf_pts, 1) > 0
@@ -167,9 +177,11 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
 
     @info "$_LOG_PREFIX   $(length(nodes)) QSM nodes created"
 
-    # Stage 3: Build output tables and write CSV / surface cloud
+    # Stage 3: Build output tables and write CSV / surface cloud. The lean trial
+    # pass skips per-tree aggregation entirely (no tree context pre-assembly).
     node_columns, node_headers, vol, sa = _build_node_table(nodes)
-    tree_columns, tree_headers = _build_tree_table(nodes, vol, sa, cfg)
+    tree_columns, tree_headers = lean ? (AbstractVector[], String[]) :
+                                        _build_tree_table(nodes, vol, sa, cfg)
 
     n_nodes_out = isempty(node_columns) ? 0 : length(first(node_columns))
     n_trees     = isempty(tree_columns) ? 0 : length(first(tree_columns))
@@ -226,7 +238,7 @@ function qsm(; tree_result=nothing, config_path::AbstractString="", output_dir::
     # copies qsm_node_ids into pc, so the local copy can be released; also drop the
     # now-empty surface part containers and GC before the full-cloud rewrite so the
     # surface-merge and tree-rewrite working sets don't stack.
-    setattribute!(pc, :qsm_node_id, qsm_node_ids)
+    setattribute!(pc, node_id_attr, qsm_node_ids)
     if !isempty(tree_cloud_path)
         empty!(surface_parts); empty!(surface_nbs_parts); empty!(surface_rho_parts)
         qsm_node_ids = Int32[]
@@ -335,7 +347,8 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
                               tree_ids::AbstractVector{<:Integer},
                               agh_values::AbstractVector{<:Real},
                               cfg::FLiPConfig,
-                              next_node_id::Int)
+                              next_node_id::Int;
+                              lean::Bool=false)
     qsm = cfg.qsm                                          # local alias for terseness
     slice_res = qsm.slice_height_scalar * cfg.pipeline.subsample_res
 
@@ -407,9 +420,15 @@ function _process_single_nbs!(nodes::Vector{QSMNode},
     end
 
     # 2d: Generate surface point cloud from the smoothed 2D surface, emitting
-    # the per-point surface radius as an attribute alongside coordinates.
-    gen_res = cfg.pipeline.subsample_res
-    surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res, eltype(coords))
+    # the per-point surface radius as an attribute alongside coordinates. The lean
+    # trial pass only needs the fitted node cylinders, so it skips this entirely.
+    if lean
+        surface_pts = Matrix{eltype(coords)}(undef, 0, 3)
+        surface_rho = eltype(coords)[]
+    else
+        gen_res = cfg.pipeline.subsample_res
+        surface_pts, surface_rho = _generate_surface_points(surface_grid, centers, e1, e2, slice_res, gen_res, eltype(coords))
+    end
 
     return (next_node_id, surface_pts, surface_rho)
 end

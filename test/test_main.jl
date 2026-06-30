@@ -63,7 +63,6 @@ enable_statistical_filter = false
         @test result.ground.written
         @test result.agh.written
         @test result.tree.written == false
-        @test result.tree.skeleton_written == false
         @test result.qsm.status == :skipped
         @test result.report.status == :skipped
 

@@ -15,18 +15,14 @@ function run_pipeline(config_path::AbstractString=_DEFAULT_CONFIG_PATH)
 
     pp_output = _stage_preprocess(cfg)
     g_output  = _stage_ground(cfg, pp_output.cloud);    pp_output = _drop_preprocess_clouds(pp_output)
+    # NBS refinement (lean trial QSM + refine_nbs) now runs INSIDE tree_segmentation,
+    # so the QSM stage is a single final pass over the refined tree cloud.
     t_output  = _stage_tree(cfg, g_output.agh);         g_output  = _drop_ground_clouds(g_output)
-    q_output   = _stage_qsm(cfg, t_output.result, config_path)
-    ref_output = _stage_qsm_refinement(cfg, t_output.result, q_output, config_path)
-    q2_output  = _stage_qsm(cfg, ref_output.tree_result, config_path;
-                            out_prefix=ref_output.out_prefix, tree_stem="tree_refined",
-                            label="qsm (refined)", run=ref_output.refined)
-    qsm_final  = ref_output.refined ? q2_output : q_output
-    r_output   = _stage_report(cfg, ref_output.tree_result, qsm_final, config_path)
-    t_output   = _drop_tree_clouds(t_output)
-    ref_output = _drop_refinement_clouds(ref_output); GC.gc()
+    q_output  = _stage_qsm(cfg, t_output.result, config_path)
+    r_output  = _stage_report(cfg, t_output.result, q_output, config_path)
+    t_output  = _drop_tree_clouds(t_output); GC.gc()
 
-    return _summarize(cfg, pp_output, g_output, t_output, q_output, ref_output, q2_output, r_output)
+    return _summarize(cfg, pp_output, g_output, t_output, q_output, r_output)
 end
 
 # ── Stage functions ────────────────────────────────────────────────
@@ -129,25 +125,21 @@ end
 """
     _stage_tree(cfg, pc_agh) -> NamedTuple
 
-Run tree segmentation, write the tree and skeleton outputs, and return the
-full `tree_segmentation` result plus path / written-flag / n_components
-metadata. If `pc_agh` is `nothing`, the input is loaded from disk via
-`_prepare_stage_input`.
+Run tree segmentation (which now internally runs the lean trial QSM + `refine_nbs`
+before assembly), write the tree output, and return the full `tree_segmentation`
+result plus path / written-flag / n_components metadata. If `pc_agh` is `nothing`,
+the input is loaded from disk via `_prepare_stage_input`.
 
-Returns `(result, tree_path, skeleton_path, tree_written, skeleton_written,
-n_components)`. `result` is `nothing` when the stage is disabled.
+Returns `(result, tree_path, tree_written, n_components)`. `result` is `nothing`
+when the stage is disabled.
 """
 function _stage_tree(cfg::FLiPConfig, pc_agh)
     fmt = lowercase(cfg.pipeline.output_format)
-    tree_path     = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree",     fmt)
-    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
+    tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
 
     if !cfg.pipeline.enable_tree_segmentation
         _log_stage_skipped("tree_segmentation")
-        return (result=nothing,
-                tree_path=tree_path, skeleton_path=skeleton_path,
-                tree_written=false, skeleton_written=false,
-                n_components=0)
+        return (result=nothing, tree_path=tree_path, tree_written=false, n_components=0)
     end
 
     return _with_stage_timing("tree_segmentation") do
@@ -157,97 +149,34 @@ function _stage_tree(cfg::FLiPConfig, pc_agh)
         tree_input = nothing  # release input
 
         write_pc(tree_path, res.pc_output); @info "$_LOG_PREFIX   wrote: $tree_path"
-        skel_written = cfg.pipeline.enable_skeleton_output
-        if skel_written
-            write_pc(skeleton_path, res.skeleton_cloud); @info "$_LOG_PREFIX   wrote: $skeleton_path"
-        end
 
-        (result=res,
-         tree_path=tree_path, skeleton_path=skeleton_path,
-         tree_written=true, skeleton_written=skel_written,
-         n_components=res.n_components)
+        (result=res, tree_path=tree_path, tree_written=true, n_components=res.n_components)
     end
 end
 
 """
-    _stage_qsm(cfg, tree_res, config_path; out_prefix, tree_stem, label, run) -> NamedTuple
+    _stage_qsm(cfg, tree_res, config_path) -> NamedTuple
 
-Run the QSM stage (or `(status=:skipped,)` if disabled or `run=false`). If
+Run the (single, final) QSM stage (or `(status=:skipped,)` if disabled). If
 `tree_res` is `nothing`, the tree result is reconstructed from disk via
-`_load_tree_result(cfg; stem=tree_stem)`.
-
-The keyword args let the pipeline run QSM twice without duplicated code: the
-first (canonical) pass uses the defaults (`tree_stem="tree"`,
-`out_prefix=output_prefix`); the post-refinement pass passes
-`tree_stem="tree_refined"` and a refined `out_prefix` so its CSV / surface
-outputs are written under distinct names, preserving the pre-merge results.
+`_load_tree_result(cfg)`. NBS refinement already happened inside the tree
+stage, so this is the canonical pass writing `{prefix}qsm_*` and stamping
+`:node_id` onto the tree cloud.
 """
-function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString;
-                    out_prefix::AbstractString=cfg.pipeline.output_prefix,
-                    tree_stem::AbstractString="tree",
-                    label::AbstractString="qsm",
-                    run::Bool=true)
-    if !cfg.pipeline.enable_qsm || !run
-        _log_stage_skipped(label)
+function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
+    if !cfg.pipeline.enable_qsm
+        _log_stage_skipped("qsm")
         return (status=:skipped,)
     end
-    return _with_stage_timing(label) do
-        tr = isnothing(tree_res) ? _load_tree_result(cfg; stem=tree_stem) : tree_res
+    return _with_stage_timing("qsm") do
+        tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
         fmt = lowercase(cfg.pipeline.output_format)
-        tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, tree_stem, fmt)
+        tree_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "tree", fmt)
         qsm(tree_result=tr,
             config_path=String(config_path),
             output_dir=cfg.pipeline.output_dir,
-            output_prefix=out_prefix,
+            output_prefix=cfg.pipeline.output_prefix,
             tree_cloud_path=tree_path)
-    end
-end
-
-"""
-    _stage_qsm_refinement(cfg, tree_res, qsm_res, config_path) -> NamedTuple
-
-Post-QSM refinement stage (or `(status=:skipped, …)` if disabled). Merges
-overlapping tree_nbs segments via [`nbs_merge_by_volume_overlap`] and, when a
-merge is applied, writes the relabeled `{prefix}tree_refined.{fmt}` cloud. Does
-NOT re-run QSM — `run_pipeline` does that explicitly as a second `_stage_qsm`
-call. Returns `(status, tree_result, refined, report_path, refined_tree_path,
-out_prefix)`; `tree_result` is the (possibly relabeled) tree result to feed the
-second QSM, and `out_prefix` names that pass's outputs.
-"""
-function _stage_qsm_refinement(cfg::FLiPConfig, tree_res, qsm_res, config_path::AbstractString)
-    base_prefix = cfg.pipeline.output_prefix
-    if !cfg.pipeline.enable_qsm_refinement
-        _log_stage_skipped("qsm_refinement")
-        return (status=:skipped, tree_result=tree_res, refined=false,
-                report_path="", refined_tree_path="", out_prefix=base_prefix)
-    end
-    return _with_stage_timing("qsm_refinement") do
-        nodes = if qsm_res !== nothing && hasproperty(qsm_res, :nodes) && !isempty(qsm_res.nodes)
-            qsm_res.nodes
-        else
-            _read_qsm_nodes_csv(joinpath(cfg.pipeline.output_dir, "$(base_prefix)qsm_nodes.csv"))
-        end
-        if isempty(nodes)
-            @warn "$_LOG_PREFIX qsm_refinement: no QSM nodes available (run QSM first); skipping"
-            return (status=:no_nodes, tree_result=tree_res, refined=false,
-                    report_path="", refined_tree_path="", out_prefix=base_prefix)
-        end
-        tr = isnothing(tree_res) ? _load_tree_result(cfg) : tree_res
-        pc = tr.pc_output
-        mres = nbs_merge_by_volume_overlap(pc=pc, nodes=nodes, cfg=cfg,
-                                           output_dir=cfg.pipeline.output_dir,
-                                           output_prefix=base_prefix)
-        if !mres.merged
-            return (status=mres.status, tree_result=tr, refined=false,
-                    report_path=mres.report_csv_path, refined_tree_path="", out_prefix=base_prefix)
-        end
-        fmt = lowercase(cfg.pipeline.output_format)
-        refined_path = get_output_path(cfg.pipeline.output_dir, base_prefix, "tree_refined", fmt)
-        write_pc(refined_path, pc)
-        @info "$_LOG_PREFIX   wrote refined tree cloud: $refined_path"
-        return (status=:success, tree_result=merge(tr, (pc_output=pc,)), refined=true,
-                report_path=mres.report_csv_path, refined_tree_path=refined_path,
-                out_prefix="$(base_prefix)refined_")
     end
 end
 
@@ -319,19 +248,15 @@ end
     _load_tree_result(cfg) -> NamedTuple
 
 Reconstruct a tree-segmentation result NamedTuple from disk (used by stages
-4 and 5 when stage 3 was disabled or skipped). Loads the tree output and the
-optional skeleton; fills `filtered_cloud`, `n_components`, `neighbor_radius`
-with empty / zero defaults. Throws if the tree output is not on disk.
+4 and 5 when stage 3 was disabled or skipped). Loads the tree output and fills
+`filtered_cloud`, `n_components`, `neighbor_radius` with empty / zero defaults.
+Throws if the tree output is not on disk.
 """
 function _load_tree_result(cfg::FLiPConfig; stem::AbstractString="tree")
     pc_tree = _prepare_stage_input(nothing, cfg, stem,
                                    "tree output", "qsm/report stage")
-    fmt = lowercase(cfg.pipeline.output_format)
-    skeleton_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "skeleton", fmt)
-    pc_skeleton = isfile(skeleton_path) ? read_pc(skeleton_path) : pc_tree[1:0]
     return (
         pc_output=pc_tree,
-        skeleton_cloud=pc_skeleton,
         filtered_cloud=pc_tree[1:0],
         n_components=0,
         neighbor_radius=0.0,
@@ -347,20 +272,16 @@ end
 _drop_preprocess_clouds(pp) = merge(pp, (cloud=nothing,))
 _drop_ground_clouds(g)      = merge(g,  (ground=nothing, agh=nothing))
 _drop_tree_clouds(t)        = merge(t,  (result=nothing,))
-_drop_refinement_clouds(r)  = merge(r,  (tree_result=nothing,))
 
 """
-    _summarize(cfg, pp_output, g_output, t_output, q_output, ref_output, q2_output, r_output) -> NamedTuple
+    _summarize(cfg, pp_output, g_output, t_output, q_output, r_output) -> NamedTuple
 
-Build the stage-grouped summary returned by `run_pipeline`. Each stage's
-paths, written-flags, and counts live in their own sub-NamedTuple
-(`preprocess`, `ground`, `agh`, `tree`, `refinement`). `qsm` is the **final**
-QSM result (the post-refinement pass when a merge was applied, else the
-first-pass result); `qsm_prelim` is always the first pass; `report` is forwarded
-as-is.
+Build the stage-grouped summary returned by `run_pipeline`. Each stage's paths,
+written-flags, and counts live in their own sub-NamedTuple (`preprocess`,
+`ground`, `agh`, `tree`). NBS refinement runs inside the tree stage, so `qsm` is
+the single final QSM result and `report` is forwarded as-is.
 """
-function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, ref_output, q2_output, r_output)
-    qsm_final = ref_output.refined ? q2_output : q_output
+function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_output)
     return (
         config = (
             input_path    = cfg.pipeline.input_path,
@@ -376,16 +297,9 @@ function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, re
         agh        = (path=g_output.agh_path,
                       written=g_output.agh_written),
         tree       = (path=t_output.tree_path,
-                      skeleton_path=t_output.skeleton_path,
                       written=t_output.tree_written,
-                      skeleton_written=t_output.skeleton_written,
                       n_components=t_output.n_components),
-        qsm        = qsm_final,
-        qsm_prelim = q_output,
-        refinement = (status=ref_output.status,
-                      refined=ref_output.refined,
-                      report_path=ref_output.report_path,
-                      refined_tree_path=ref_output.refined_tree_path),
+        qsm        = q_output,
         report     = r_output,
     )
 end

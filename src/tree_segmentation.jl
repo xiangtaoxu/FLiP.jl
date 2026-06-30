@@ -10,24 +10,23 @@ orchestrator-first, helpers below in call order.
 1. Filter to above-ground points (`:AGH > tree_nearground_agh_threshold`).
 2. Discover connected components via coordinate-only union-find (no graph),
    to bound the per-component memory of all later steps.
-3. Process each component independently
-   ([`_process_single_connected_component`](@ref)):
-   3a. Build a radius graph for the component.
-   3b. Label Non-Branching Segments (NBS) via
-       [`label_non_branching_segments`](@ref) — greedy expansion from
-       near-ground seeds, linearity-constrained.
-   3c. Build a skeleton cloud + skeleton graph
-       ([`create_skeleton_cloud`](@ref)) — one vertex per NBS-node.
-   3d. Assemble NBS into trees ([`assemble_segments`](@ref)) — grow from
-       near-ground NBS along the skeleton graph using Rule A (new branch)
-       or Rule B (merge into existing NBS).
-4. Concatenate per-component skeletons into one cloud + graph.
-5. Rescue orphan branches (`tree_id==0 && tree_nbs_id>0`) into neighboring grounded
+3. **Pass 1 (per component):** build a radius graph and label Non-Branching
+   Segments (NBS) via [`label_non_branching_segments`](@ref) — greedy expansion
+   from near-ground seeds, linearity-constrained. Produces global `nbs_id` plus a
+   transient per-component skeleton `node_id`.
+4. **Global lean trial QSM** grouped by `nbs_id` ([`qsm`](@ref) with `lean=true`):
+   fits a cylinder per NBS node, used only to drive refinement.
+5. **Pass 2 (per component):** rebuild the skeleton ([`create_skeleton_cloud`](@ref));
+   when `tree_segmentation.enable_nbs_refine`, run [`refine_nbs`](@ref) — whole-NBS
+   Rule B (skeleton connectivity) then node-level volume overlap, larger-volume NBS
+   absorbing — to clean up over-segmentation; then [`assemble_segments`](@ref) with
+   **Rule B disabled** grows trees from near-ground NBS (Rule A only).
+6. Rescue orphan branches (`tree_id==0 && tree_nbs_id>0`) into neighboring grounded
    trees across occlusion gaps ([`assemble_occluded_segments`](@ref)).
-6. Re-order tree IDs by descending point count (largest tree → 1), then make
-   `tree_nbs_id` contiguous within each tree.
-7. Stamp `:nbs_id`, `:node_id`, `:tree_id`, `:tree_nbs_id` onto the cloud
-   and optionally write a CloudCompare-readable skeleton OBJ.
+7. Dense relabels (tree_id by point count, tree_nbs_id contiguous within trees, nbs_id
+   densified) and stamp `:nbs_id`, `:tree_id`, `:tree_nbs_id` onto the cloud. The
+   persisted `:node_id` is added later by the final QSM stage; transient skeleton
+   `:node_id` / `:trial_node_id` are kept only under `enable_debug_info`.
 """
 
 # ── Entry point ───────────────────────────────────────────────────
@@ -46,15 +45,18 @@ coordinate-only union-find before any graph is built.
 
 `NamedTuple` with fields:
 - `filtered_cloud::PointCloud` — the above-ground points with `:nbs_id`,
-  `:node_id`, `:tree_id`, `:tree_nbs_id` attached
+  `:tree_id`, `:tree_nbs_id` attached (the persisted `:node_id` is added later by
+  the final QSM stage; under `enable_debug_info` the transient skeleton `:node_id`
+  and `:trial_node_id` are also attached)
 - `pc_output::PointCloud` — alias of `filtered_cloud` (back-compat)
-- `skeleton_cloud::PointCloud` — concatenated per-component skeleton (one
-  vertex per NBS node), carrying `:node_id` and `:n_points`
 - `n_components::Int` — number of valid connected components processed
 - `neighbor_radius::Float64` — the radius used for component discovery /
   per-component graph build
 
-See the file docstring for the seven-step pipeline outline.
+Internally: Pass 1 labels NBS per component; a global lean trial QSM fits per-NBS
+cylinders; Pass 2 rebuilds each component's skeleton, runs `refine_nbs` (when
+`tree_segmentation.enable_nbs_refine`), then assembles trees (Rule B off); finally
+the orphan rescue + dense relabels run.
 """
 function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     hasattribute(pc, :AGH) || throw(ArgumentError(
@@ -69,7 +71,6 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     empty_result = (
         filtered_cloud  = pc[1:0],
         pc_output       = pc[1:0],
-        skeleton_cloud  = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
         n_components    = 0,
         neighbor_radius = 0.0,
     )
@@ -88,10 +89,6 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
     # ── Step 2: discover components via coordinate-only union-find ──
     cc_labels = connected_component_labels(coords_filtered, neighbor_radius,
                                            cfg.tree_segmentation.min_nbs_size)
-
-    # Build component → indices dispatch in one O(N) pass. `connected_component_labels`
-    # already ranks valid components as dense 1..K_cc (and 0 for below-min-size), so a
-    # Vector indexed by component id is the natural container — no hashing.
     K_cc = Int(maximum(cc_labels; init=0))
     cc_indices_by_id = [Int[] for _ in 1:K_cc]
     @inbounds for i in eachindex(cc_labels)
@@ -102,184 +99,184 @@ function tree_segmentation(pc::PointCloud; cfg::FLiPConfig=_CFG)
 
     n_components = K_cc
     @info "$_LOG_PREFIX   $N filtered points → $n_components connected components (min_cc=$(cfg.tree_segmentation.min_nbs_size))"
-
     n_components == 0 && return empty_result
 
-    # ── Step 3: process each component independently ──────────────
-    want_skeleton = cfg.pipeline.enable_skeleton_output
+    nthread = effective_nthreads(cfg)
+    debug   = cfg.pipeline.enable_debug_info
 
-    global_nbs_id      = zeros(Int32, N)
-    global_node_id     = zeros(Int32, N)
-    global_tree_id     = zeros(Int32, N)
-    global_tree_nbs_id = zeros(Int32, N)
-
-    # Per-component skeleton holders — only allocated/populated when skeleton
-    # output is requested. The per-component skeleton is always computed inside
-    # `_process_single_connected_component` (it drives assembly); these slots
-    # just retain it for the cross-component merge below.
-    skel_clouds = want_skeleton ? Vector{PointCloud}(undef, n_components) : PointCloud[]
-    skel_graphs = want_skeleton ? Vector{SimpleGraph{Int}}(undef, n_components) : SimpleGraph{Int}[]
-
-    # Per-CC progress reported as % of cumulative points processed. The reporter
-    # is thread-safe (atomic CAS); the counter is a shared `Threads.Atomic{Int}`
-    # so it remains correct under `_parallel_for`.
-    progress = ProgressReporter("processing components", N)
-    processed_points = Threads.Atomic{Int}(0)
-
-    # Global id-range allocators. Each component reserves a contiguous, gap-free
-    # block via `atomic_add!` (which returns the pre-increment value), then remaps
-    # its local 1..local_max ids into that block. Reservation order is completion
-    # order under threads — harmless because every downstream consumer groups by
-    # label *value* (and `tree_id` is relabelled by point count in Step 6): the
-    # point→group partition is identical regardless of which component owns which
-    # block. `tree_nbs_id` shares the nbs block (same offset as `nbs_id`).
-    nbs_counter  = Threads.Atomic{Int}(0)
-    node_counter = Threads.Atomic{Int}(0)
-    tree_counter = Threads.Atomic{Int}(0)
-
-    # Phase 2 (parallel): run the per-component pipeline AND remap local→global ids
-    # within the same task, then drop the per-point arrays immediately (no
-    # `Vector{Any}` retention of all results). Writes target this component's
-    # `gi ∈ cc_indices`; those index sets are disjoint across components, so the
-    # shared `global_*` arrays are written race-free.
-    _parallel_for(n_components, effective_nthreads(cfg)) do ci
+    # ── Pass 1 (parallel per CC): NBS labeling only ───────────────
+    # Produces global `nbs_id` (atomic-offset, used to group the trial QSM) plus a
+    # CC-local skeleton `node_id` per component (transient — the skeleton + assembly
+    # need it, but it is not the persisted node id; the final QSM emits that).
+    global_nbs_id = zeros(Int32, N)
+    cc_node_ids   = Vector{Vector{Int32}}(undef, n_components)
+    nbs_counter   = Threads.Atomic{Int}(0)
+    _parallel_for(n_components, nthread) do ci
         @inbounds begin
             cc_indices = cc_indices_by_id[ci]
             cc_coords  = coords_filtered[cc_indices, :]
             cc_agh     = agh_filtered[cc_indices]
-            res = _process_single_connected_component(cc_coords, cc_agh,
-                                                      neighbor_radius; cfg=cfg)
-
-            local_nbs_max  = Int(maximum(res.nbs_id;  init=Int32(0)))
-            local_node_max = Int(maximum(res.node_id; init=Int32(0)))
-            local_tree_max = Int(maximum(res.tree_id; init=Int32(0)))
-            my_nbs_off  = Int32(Threads.atomic_add!(nbs_counter,  local_nbs_max))
-            my_node_off = Int32(Threads.atomic_add!(node_counter, local_node_max))
-            my_tree_off = Int32(Threads.atomic_add!(tree_counter, local_tree_max))
-
+            g_res   = build_radius_graph(cc_coords, neighbor_radius; weights=false)
+            nbs_res = label_non_branching_segments(g_res.graph, cc_coords, cc_agh; cfg=cfg)
+            local_nbs_max = Int(maximum(nbs_res.nbs_id; init=Int32(0)))
+            my_nbs_off    = Int32(Threads.atomic_add!(nbs_counter, local_nbs_max))
             for (li, gi) in enumerate(cc_indices)
-                nid  = res.nbs_id[li]
-                global_nbs_id[gi]      = nid  > 0 ? nid  + my_nbs_off  : Int32(0)
-                noid = res.node_id[li]
-                global_node_id[gi]     = noid > 0 ? noid + my_node_off : Int32(0)
-                tid  = res.tree_id[li]
-                global_tree_id[gi]     = tid  > 0 ? tid  + my_tree_off : Int32(0)
-                tnid = res.tree_nbs_id[li]
-                global_tree_nbs_id[gi] = tnid > 0 ? tnid + my_nbs_off  : Int32(0)
+                nid = nbs_res.nbs_id[li]
+                global_nbs_id[gi] = nid > 0 ? nid + my_nbs_off : Int32(0)
             end
-
-            if want_skeleton
-                skel_clouds[ci] = res.skeleton_cloud
-                skel_graphs[ci] = res.graph_skeleton
-            end
-
-            n_now = Threads.atomic_add!(processed_points, length(cc_indices)) +
-                    length(cc_indices)
-            report!(progress, n_now; extra="$ci/$n_components")
+            cc_node_ids[ci] = Int32.(nbs_res.node_id)
         end
     end
 
-    empty!(cc_indices_by_id)   # release after per-component loop
-    nbs_offset = Int32(nbs_counter[])
-
-    # ── Step 4: merge skeletons across components (only when requested) ──
-    # Kept serial: skeletons are tiny (≈ one vertex per NBS node ≪ N) so the
-    # merge is cheap, and the merged buffers cannot be presized before the loop.
-    if want_skeleton
-        all_skel_coords    = Matrix{eltype(coords_filtered)}[]
-        all_skel_attrs     = Dict{Symbol,Vector}[]
-        all_skel_edges     = Tuple{Int,Int}[]
-        skel_vertex_offset = 0
-        for ci in 1:n_components
-            skel_cloud = skel_clouds[ci]
-            npoints(skel_cloud) > 0 || continue
-            push!(all_skel_coords, coordinates(skel_cloud))
-            push!(all_skel_attrs, _all_attributes(skel_cloud))
-            for e in Graphs.edges(skel_graphs[ci])
-                push!(all_skel_edges, (src(e) + skel_vertex_offset,
-                                       dst(e) + skel_vertex_offset))
-            end
-            skel_vertex_offset += npoints(skel_cloud)
-        end
-        if isempty(all_skel_coords)
-            merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
-            merged_skel_graph = SimpleGraph{Int}(0)
-        else
-            merged_skel       = merge_pointclouds(all_skel_coords, all_skel_attrs;
-                                                  verbose=cfg.pipeline.enable_debug_info)
-            merged_skel_graph = SimpleGraph{Int}(skel_vertex_offset)
-            for (u, v) in all_skel_edges
-                add_edge!(merged_skel_graph, u, v)
-            end
-        end
-    else
-        merged_skel       = PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}())
-        merged_skel_graph = SimpleGraph{Int}(0)
+    # ── Global lean trial QSM (grouped by nbs_id) → cylinders for refinement ──
+    do_refine   = cfg.tree_segmentation.enable_nbs_refine
+    trial_nodes = QSMNode[]
+    if do_refine
+        setattribute!(pc_filtered, :nbs_id, global_nbs_id)
+        trial = qsm(tree_result=(pc_output=pc_filtered,), cfg=cfg,
+                    output_dir = debug ? cfg.pipeline.output_dir : "",
+                    output_prefix = "$(cfg.pipeline.output_prefix)trial_",
+                    lean=true, group_attr=:nbs_id, node_id_attr=:trial_node_id)
+        trial_nodes = trial.nodes
     end
+    # Partition trial nodes by CC (each nbs belongs to exactly one CC).
+    nbs_to_cc = zeros(Int32, Int(nbs_counter[]))
+    @inbounds for ci in 1:n_components, gi in cc_indices_by_id[ci]
+        nb = global_nbs_id[gi]
+        nb > 0 && (nbs_to_cc[nb] = Int32(ci))
+    end
+    cc_trial_nodes = [QSMNode[] for _ in 1:n_components]
+    for nd in trial_nodes
+        (nd.nbs_id > 0 && nd.nbs_id <= length(nbs_to_cc)) || continue
+        ci = nbs_to_cc[nd.nbs_id]
+        ci > 0 && push!(cc_trial_nodes[ci], nd)
+    end
+    trial_node_id_global = (do_refine && hasattribute(pc_filtered, :trial_node_id)) ?
+        Int32.(getattribute(pc_filtered, :trial_node_id)) : zeros(Int32, N)
+
+    # ── Pass 2 (parallel per CC): refine NBS (rebuilt skeleton) then assemble ──
+    # The skeleton is rebuilt here (transient, never tracked across passes). Trees
+    # use their own atomic id blocks; assembly runs with Rule B disabled because NBS
+    # merging is done by `refine_nbs`.
+    global_node_id     = zeros(Int32, N)   # CC-local node id, globally offset (debug only)
+    global_tree_id     = zeros(Int32, N)
+    global_tree_nbs_id = zeros(Int32, N)
+    node_counter     = Threads.Atomic{Int}(0)
+    tree_counter     = Threads.Atomic{Int}(0)
+    tree_nbs_counter = Threads.Atomic{Int}(0)
+    rb_lock        = ReentrantLock()
+    all_rule_b     = RuleBMove[]
+    all_node_moves = NodeMove[]
+    n_moves_total  = Threads.Atomic{Int}(0)
+    n_rb_total     = Threads.Atomic{Int}(0)
+
+    _parallel_for(n_components, nthread) do ci
+        @inbounds begin
+            cc_indices = cc_indices_by_id[ci]
+            cc_coords  = coords_filtered[cc_indices, :]
+            cc_agh     = agh_filtered[cc_indices]
+            local_node = cc_node_ids[ci]
+            cc_nbs     = Int32[global_nbs_id[gi] for gi in cc_indices]
+
+            g_res    = build_radius_graph(cc_coords, neighbor_radius; weights=false)
+            skel_res = create_skeleton_cloud(g_res.graph, cc_coords, local_node)
+
+            if do_refine && !isempty(cc_trial_nodes[ci])
+                # skeleton vertex → nbs (via this CC's local node id)
+                max_ln = Int(maximum(local_node; init=Int32(0)))
+                node_to_nbs = zeros(Int32, max_ln)
+                for li in eachindex(cc_indices)
+                    ln = Int(local_node[li]); nb = cc_nbs[li]
+                    (ln > 0 && nb > 0) && (node_to_nbs[ln] = nb)
+                end
+                skel_nids = getattribute(skel_res.skeleton_cloud, :node_id)
+                skel_to_nbs = Int32[(1 <= Int(ln) <= max_ln) ? node_to_nbs[Int(ln)] : Int32(0)
+                                    for ln in skel_nids]
+                cc_trial_pp = Int32[trial_node_id_global[gi] for gi in cc_indices]
+                rres = refine_nbs(nbs_id=cc_nbs, node_id=local_node, trial_node_id=cc_trial_pp,
+                                  nodes=cc_trial_nodes[ci], graph_skeleton=skel_res.graph_skeleton,
+                                  skel_to_nbs=skel_to_nbs, cfg=cfg)
+                cc_nbs = rres.nbs_id
+                for (li, gi) in enumerate(cc_indices)
+                    global_nbs_id[gi] = cc_nbs[li]
+                end
+                Threads.atomic_add!(n_moves_total, rres.n_nodes_moved)
+                Threads.atomic_add!(n_rb_total, rres.n_rule_b_merges)
+                if debug && (!isempty(rres.rule_b_moves) || !isempty(rres.node_moves))
+                    lock(rb_lock) do
+                        append!(all_rule_b, rres.rule_b_moves)
+                        append!(all_node_moves, rres.node_moves)
+                    end
+                end
+            end
+
+            # Assembly array-indexes by max(nbs_id); the refined `cc_nbs` carries (sparse,
+            # large) GLOBAL ids, so relabel to a dense CC-local block just for this call.
+            # The global nbs labeling is stored separately above.
+            cc_nbs_local = relabel_by_occurrence(cc_nbs; positive_only=true, T_out=Int32)
+            asm = assemble_segments(g_res.graph, cc_coords, cc_nbs_local, local_node, cc_agh,
+                                    skel_res.graph_skeleton, skel_res.skeleton_cloud;
+                                    cfg=cfg, enable_rule_b=false)
+
+            local_node_max     = Int(maximum(local_node;      init=Int32(0)))
+            local_tree_max     = Int(maximum(asm.tree_id;     init=Int32(0)))
+            local_tree_nbs_max = Int(maximum(asm.tree_nbs_id; init=Int32(0)))
+            my_node_off     = Int32(Threads.atomic_add!(node_counter,     local_node_max))
+            my_tree_off     = Int32(Threads.atomic_add!(tree_counter,     local_tree_max))
+            my_tree_nbs_off = Int32(Threads.atomic_add!(tree_nbs_counter, local_tree_nbs_max))
+            for (li, gi) in enumerate(cc_indices)
+                noid = local_node[li]
+                global_node_id[gi]     = noid > 0 ? noid + my_node_off     : Int32(0)
+                tid  = asm.tree_id[li]
+                global_tree_id[gi]     = tid  > 0 ? tid  + my_tree_off     : Int32(0)
+                tnid = asm.tree_nbs_id[li]
+                global_tree_nbs_id[gi] = tnid > 0 ? tnid + my_tree_nbs_off : Int32(0)
+            end
+        end
+    end
+
+    empty!(cc_indices_by_id)
 
     # ── Step 5: rescue orphan branches into neighboring grounded trees across
     # occlusion gaps (orphan ⟺ tree_id==0 && tree_nbs_id>0) ──
     assemble_occluded_segments(coords_filtered, global_tree_id, global_tree_nbs_id; cfg=cfg)
 
-    # ── Step 6: reorder tree_id by descending point count, then make tree_nbs_id
-    # contiguous within each tree (globally-unique sequential blocks) ──
+    # ── Step 6: dense relabels — tree_id by point count, tree_nbs_id contiguous
+    # within trees, and nbs_id densified (refinement leaves gaps where NBS merged) ──
     global_tree_id = relabel_by_occurrence(global_tree_id; positive_only=true, T_out=Int32)
     tree_offset    = Int32(maximum(global_tree_id; init=0))
     _relabel_tree_nbs_within_trees!(global_tree_id, global_tree_nbs_id)
+    global_nbs_id  = relabel_by_occurrence(global_nbs_id; positive_only=true, T_out=Int32)
 
-    # ── Step 7: attach attributes + write skeleton OBJ ────────────
+    # ── Step 7: attach attributes ─────────────────────────────────
+    # The persisted node id comes from the FINAL QSM stage, so `:node_id` is NOT set
+    # here. Transient ids (skeleton node_id, trial_node_id) are kept only under debug.
     setattribute!(pc_filtered, :nbs_id,      global_nbs_id)
-    setattribute!(pc_filtered, :node_id,     global_node_id)
     setattribute!(pc_filtered, :tree_id,     global_tree_id)
     setattribute!(pc_filtered, :tree_nbs_id, global_tree_nbs_id)
-
-    if want_skeleton && !isempty(cfg.pipeline.output_dir)
-        obj_path = joinpath(expanduser(cfg.pipeline.output_dir),
-                            "$(cfg.pipeline.output_prefix)skeleton_graph.obj")
-        _write_polyline_obj(obj_path, coordinates(merged_skel), merged_skel_graph)
-        @info "$_LOG_PREFIX   wrote: $obj_path"
+    if debug
+        setattribute!(pc_filtered, :node_id, global_node_id)
+        if !isempty(cfg.pipeline.output_dir)
+            prefix = cfg.pipeline.output_prefix
+            isempty(all_rule_b) || _write_rule_b_report(
+                joinpath(cfg.pipeline.output_dir, "$(prefix)nbs_ruleB_merge_report.csv"), all_rule_b)
+            isempty(all_node_moves) || _write_node_merge_report(
+                joinpath(cfg.pipeline.output_dir, "$(prefix)nbs_merge_report.csv"), all_node_moves)
+        end
+    else
+        haskey(pc_filtered.attrs, :trial_node_id) && delete!(pc_filtered.attrs, :trial_node_id)
     end
 
-    @info "$_LOG_PREFIX   n_components=$n_components, n_trees=$tree_offset, n_nbs=$nbs_offset"
+    @info "$_LOG_PREFIX   n_components=$n_components, n_trees=$tree_offset, " *
+          "n_nbs=$(Int(maximum(global_nbs_id; init=Int32(0))))" *
+          (do_refine ? " (refined: $(n_moves_total[]) node moves, $(n_rb_total[]) NBS merges)" : "")
 
     return (
         filtered_cloud  = pc_filtered,
         pc_output       = pc_filtered,
-        skeleton_cloud  = merged_skel,
         n_components    = Int(n_components),
         neighbor_radius = neighbor_radius,
     )
-end
-
-# ── Per-component processing ──────────────────────────────────────
-
-"""
-    _process_single_connected_component(cc_coords, cc_agh, neighbor_radius; cfg)
-        -> NamedTuple
-
-Run the NBS → skeleton → assembly chain for one component. All four sub-stages
-share the same per-component radius graph. Returns NamedTuple fields:
-`nbs_id`, `node_id`, `tree_id`, `tree_nbs_id`, `skeleton_cloud`, `graph_skeleton`.
-A ground-disconnected component yields `tree_id == 0` everywhere (its branches keep
-`tree_nbs_id`), so its points are orphans for the occlusion rescue.
-"""
-function _process_single_connected_component(cc_coords::AbstractMatrix{<:Real},
-                                             cc_agh::AbstractVector{<:Real},
-                                             neighbor_radius::Real;
-                                             cfg::FLiPConfig)
-    g_res    = build_radius_graph(cc_coords, neighbor_radius; weights=false)
-    nbs_res  = label_non_branching_segments(g_res.graph, cc_coords, cc_agh; cfg=cfg)
-    skel_res = create_skeleton_cloud(g_res.graph, cc_coords, nbs_res.node_id)
-    asm_res  = assemble_segments(g_res.graph, cc_coords,
-                                 nbs_res.nbs_id, nbs_res.node_id, cc_agh,
-                                 skel_res.graph_skeleton, skel_res.skeleton_cloud;
-                                 cfg=cfg)
-    return (nbs_id         = nbs_res.nbs_id,
-            node_id        = nbs_res.node_id,
-            tree_id        = asm_res.tree_id,
-            tree_nbs_id    = asm_res.tree_nbs_id,
-            skeleton_cloud = skel_res.skeleton_cloud,
-            graph_skeleton = skel_res.graph_skeleton)
 end
 
 # ── Step 3b: NBS labeling ─────────────────────────────────────────
@@ -591,6 +588,8 @@ from near-ground seed NBS outward through the skeleton graph.
 - `graph_skeleton::SimpleGraph{Int}`: skeleton graph (one vertex per node)
 - `skeleton_cloud::PointCloud`: skeleton point cloud with `:node_id` attribute
 - `cfg::FLiPConfig`: uses `tree_nearground_agh_threshold`, `tree_assembly_merge_threshold`
+- `enable_rule_b::Bool`: if `false`, skip connectivity-based NBS merging (Rule B) so each
+  NBS stays its own branch — used when NBS merging is done upstream (`refine_nbs`)
 
 # Returns
 `(tree_nbs_id::Vector{Int32}, tree_id::Vector{Int32})` where `tree_id` is the
@@ -606,6 +605,7 @@ function assemble_segments(
     graph_skeleton::SimpleGraph{Int},
     skeleton_cloud::PointCloud;
     cfg::FLiPConfig = _CFG,
+    enable_rule_b::Bool = true,
 )
     N = size(coords, 1)
     length(nbs_id) == N      || throw(ArgumentError("nbs_id length must match number of points"))
@@ -661,7 +661,7 @@ function assemble_segments(
     iteration = _iterative_tree_growth!(tree_id, tree_nbs_id, nbs_tree, assigned_nbs,
                                         K_nbs, nbs_points, nbs_skel_nodes, skel_to_nbs,
                                         nbs_adj, graph_skeleton, Float64(merge_threshold);
-                                        cfg=cfg)
+                                        cfg=cfg, enable_rule_b=enable_rule_b)
 
     # ── Step 4.3: re-order tree_nbs_id by descending group size ──────
     # Within this assemble_segments call, every non-zero tree_nbs_id value belongs
@@ -856,9 +856,13 @@ Apply the Rule A / Rule B merge decision to every index in `point_idxs`.
 
 - **Rule B** fires when `frac > merge_threshold` AND `tnid_if_merge > 0`:
   `tree_id[i] = tid_if_merge`, `tree_nbs_id[i] = tnid_if_merge` for each point.
-- **Rule A** otherwise (frac below threshold OR no valid merge target):
-  `tree_id[i] = tid_if_branch`, `tree_nbs_id[i] = tnid_if_branch` — the NBS is
-  preserved as its own branch.
+- **Rule A** otherwise (frac below threshold OR no valid merge target OR
+  `enable_rule_b == false`): `tree_id[i] = tid_if_branch`,
+  `tree_nbs_id[i] = tnid_if_branch` — the NBS is preserved as its own branch.
+
+`enable_rule_b = false` disables connectivity merging entirely (every NBS stays its
+own branch); used when NBS merging has already been done upstream (e.g. by the
+in-stage `refine_nbs`), so assembly only groups NBS into trees.
 
 Returns `:rule_a` or `:rule_b`. Used by `_iterative_tree_growth!` so the merge rule
 has a single implementation.
@@ -871,8 +875,9 @@ has a single implementation.
     merge_threshold::Float64,
     tid_if_branch::Int32, tnid_if_branch::Int32,
     tid_if_merge::Int32,  tnid_if_merge::Int32,
+    enable_rule_b::Bool = true,
 )
-    is_merge = (frac > merge_threshold) && (tnid_if_merge > 0)
+    is_merge = enable_rule_b && (frac > merge_threshold) && (tnid_if_merge > 0)
     out_tid  = is_merge ? tid_if_merge  : tid_if_branch
     out_tnid = is_merge ? tnid_if_merge : tnid_if_branch
     @inbounds for i in point_idxs
@@ -921,7 +926,8 @@ function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
                                  nbs_adj::SparseMatrixCSC{Int,Int},
                                  graph_skeleton::SimpleGraph{Int},
                                  merge_threshold::Float64;
-                                 cfg::FLiPConfig=_CFG)
+                                 cfg::FLiPConfig=_CFG,
+                                 enable_rule_b::Bool=true)
     # `frontier_info` is built once and maintained INCREMENTALLY: each time an NBS
     # transitions to assigned we add its contributions to its unassigned skeleton
     # neighbors and remove it from the frontier set. Updates from within an iteration
@@ -1007,6 +1013,7 @@ function _iterative_tree_growth!(tree_id::AbstractVector{Int32},
                 frac_connected, merge_threshold,
                 best_tree,  Int32(k),       # Rule A: new branch under best_tree, keep own NBS id
                 target_tid, target_tnid,    # Rule B: merge into target NBS within its tree
+                enable_rule_b,
             )
 
             if rule === :rule_a

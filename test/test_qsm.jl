@@ -96,6 +96,46 @@
         end
     end
 
+    @testset "Lean trial QSM — fit-only, grouped by nbs_id" begin
+        # Same synthetic cylinder, but run the lean trial pass: group by :nbs_id,
+        # emit :trial_node_id, and skip surface cloud + per-tree aggregation.
+        n = 2000
+        r_true = 0.1; h = 0.5
+        theta = 2π .* rand(n); z = h .* rand(n)
+        x = r_true .* cos.(theta) .+ 0.001 .* randn(n)
+        y = r_true .* sin.(theta) .+ 0.001 .* randn(n)
+        coords = hcat(x, y, z)
+
+        pc = make_test_pointcloud(coords; attrs=Dict(
+            :nbs_id => ones(Int32, n),
+            :AGH    => z,
+        ))
+        tree_result = (
+            pc_output=pc,
+            skeleton_cloud=FLiP.PointCloud(zeros(Float64, 0, 3), Dict{Symbol,Vector}()),
+            filtered_cloud=pc, n_components=1, neighbor_radius=0.1,
+        )
+
+        cfg = FLiP._CFG
+        old_subsample = cfg.pipeline.subsample_res
+        cfg.pipeline.subsample_res = 0.05
+        outdir = mktempdir()
+        result = FLiP.qsm(tree_result=tree_result, output_dir=outdir, output_prefix="lean",
+                          lean=true, group_attr=:nbs_id, node_id_attr=:trial_node_id)
+        cfg.pipeline.subsample_res = old_subsample
+
+        @test result.status == :success || result.status == :no_linear_nbs
+        if result.status == :success
+            @test result.n_nodes > 0
+            @test result.n_trees == 0                          # no tree aggregation in lean
+            @test !isfile(result.tree_csv_path)                # tree CSV not written
+            @test npoints(result.qsm_surface_cloud) == 0       # no surface cloud
+            @test hasattribute(pc, :trial_node_id)             # emitted under requested name
+            # grouping label flows into both QSMNode.nbs_id and tree_nbs_id
+            @test all(nd.nbs_id == nd.tree_nbs_id == Int32(1) for nd in result.nodes)
+        end
+    end
+
     @testset "NBS linearity filtering" begin
         # Linear point set along z-axis: high linearity
         n = 100

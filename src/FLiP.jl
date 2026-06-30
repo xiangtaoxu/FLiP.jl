@@ -61,7 +61,7 @@ include("types/mesh.jl")
 include("util/graph_utils.jl")
 include("tree_segmentation.jl")
 include("qsm.jl")
-include("qsm_refinement.jl")
+include("refine_nbs.jl")
 include("generate_report.jl")
 include("main.jl")
 include("util/transformations.jl")
@@ -130,7 +130,7 @@ export assemble_segments
 export preprocess, find_input_files
 export calculate_aboveground_height
 export qsm
-export nbs_merge_by_volume_overlap
+export refine_nbs
 export generate_report
 export run_pipeline
 

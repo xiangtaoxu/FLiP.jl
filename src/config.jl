@@ -57,6 +57,7 @@ mutable struct TreeSegmentationCfg
     linearity_angle_deg::Float64
     assembly_merge_threshold::Float64
     assembly_occlusion_tolerance::Float64
+    enable_nbs_refine::Bool
 end
 TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
     Float64(get(d, "nearground_agh_threshold",     0.3)),
@@ -67,6 +68,7 @@ TreeSegmentationCfg(d::Dict) = TreeSegmentationCfg(
     Float64(get(d, "linearity_angle_deg",          80.0)),
     Float64(get(d, "assembly_merge_threshold",     0.5)),
     Float64(get(d, "assembly_occlusion_tolerance", 0.1)),
+    Bool(   get(d, "enable_nbs_refine",            true)),
 )
 
 mutable struct QSMCfg
@@ -100,28 +102,24 @@ QSMCfg(d::Dict) = QSMCfg(
     Float64(get(d, "qc_continuity_ratio",     0.7)),
 )
 
-# Post-QSM refinement (umbrella for QSM-quality improvements). The current method,
-# `nbs_merge_by_volume_overlap`, works at the NODE level: NBS are processed as
-# focals largest→smallest, and a focal claims the individual nodes of smaller NBS
-# whose fitted cylinder overlaps it; QSM is then re-run on the relabeled cloud.
-mutable struct QSMRefinementCfg
+# Pre-assembly NBS refinement (runs inside the tree-segmentation stage, per connected
+# component, before tree assembly). `refine_nbs` merges over-segmented NBS in two steps:
+# (1) whole-NBS Rule B by skeleton connectivity, (2) node-level volume overlap; the
+# larger-volume NBS absorbs in both. No tree/cross-tree gates exist pre-assembly.
+mutable struct NBSRefineCfg
     overlap_threshold::Float64        # claim a node when inter_vol(node, focal) / vol(node) exceeds this
     voxel_res_scalar::Float64         # voxel edge = voxel_res_scalar × pipeline.subsample_res
     completeness_gate::Float64        # both the moving node and the focal need completeness ≥ this
     min_points_gate::Int              # the focal NBS needs total points ≥ this (per-focal)
     candidate_radius_scalar::Float64  # extra KDTree candidate-search margin (× subsample_res)
-    cross_tree::Bool                  # allow claiming a node from a different tree
-    protect_grounded_trunks::Bool     # block a cross-tree claim when BOTH node and focal reach the ground
-    mode::String                      # "apply" (relabel + re-QSM) | "flag_only" (report only) | "iterate" (reserved)
+    mode::String                      # "apply" (relabel) | "flag_only" (report only)
 end
-QSMRefinementCfg(d::Dict) = QSMRefinementCfg(
+NBSRefineCfg(d::Dict) = NBSRefineCfg(
     Float64(get(d, "overlap_threshold",       0.2)),
     Float64(get(d, "voxel_res_scalar",        1.0)),
     Float64(get(d, "completeness_gate",       0.25)),
     Int(    get(d, "min_points_gate",         20)),
     Float64(get(d, "candidate_radius_scalar", 1.0)),
-    Bool(   get(d, "cross_tree",              true)),
-    Bool(   get(d, "protect_grounded_trunks", true)),
     String( get(d, "mode",                    "apply")),
 )
 
@@ -149,8 +147,6 @@ mutable struct PipelineCfg
     enable_tree_segmentation::Bool
     enable_qsm::Bool
     enable_generate_report::Bool
-    enable_skeleton_output::Bool
-    enable_qsm_refinement::Bool
 
     # Logging
     enable_debug_info::Bool
@@ -181,8 +177,6 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),
-    Bool(get(d, "enable_skeleton_output",     false)),
-    Bool(get(d, "enable_qsm_refinement",      false)),
     Bool(get(d, "enable_debug_info",          false)),
     Int( get(d, "n_thread",                   1)),
 )
@@ -213,7 +207,7 @@ mutable struct FLiPConfig
     segment_ground::SegmentGroundCfg
     tree_segmentation::TreeSegmentationCfg
     qsm::QSMCfg
-    qsm_refinement::QSMRefinementCfg
+    nbs_refine::NBSRefineCfg
 end
 
 FLiPConfig(d::Dict) = FLiPConfig(
@@ -223,7 +217,7 @@ FLiPConfig(d::Dict) = FLiPConfig(
     SegmentGroundCfg(    get(d, "segment_ground",     Dict{String,Any}())),
     TreeSegmentationCfg( get(d, "tree_segmentation",  Dict{String,Any}())),
     QSMCfg(              get(d, "qsm",                Dict{String,Any}())),
-    QSMRefinementCfg(    get(d, "qsm_refinement",     Dict{String,Any}())),
+    NBSRefineCfg(        get(d, "nbs_refine",         Dict{String,Any}())),
 )
 
 # ── Loader + singleton ───────────────────────────────────────────────────────

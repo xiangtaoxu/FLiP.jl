@@ -222,6 +222,38 @@
         @test all(==(Int32(0)), res_none.tree_nbs_id)
     end
 
+    @testset "assemble_segments: enable_rule_b toggles connectivity merge" begin
+        # NBS1 (pts 1-2, node 1) grounded; NBS2 (pts 3-6, nodes 2,3) fully straddles
+        # NBS1 — both NBS2 skeleton nodes touch node 1, so frac_connected = 1.0 > 0.5.
+        nbs_id  = Int[1,1, 2,2, 2,2]
+        node_id = Int[1,1, 2,2, 3,3]
+        graph = Graphs.SimpleGraph(6)
+        for (u, v) in [(1,2), (3,4), (5,6), (4,5), (2,3)]   # incl. one cross-NBS edge (2-3)
+            Graphs.add_edge!(graph, u, v)
+        end
+        graph_skeleton = Graphs.SimpleGraph(3)
+        for (u, v) in [(1,2), (1,3), (2,3)]
+            Graphs.add_edge!(graph_skeleton, u, v)
+        end
+        skel_pc = FLiP.PointCloud(Float64[0 0 0; 1 0 0; 1 1 0], Dict{Symbol,Vector}())
+        FLiP.setattribute!(skel_pc, :node_id,  Int32[1, 2, 3])
+        FLiP.setattribute!(skel_pc, :n_points, Int32[2, 2, 2])
+        coords = hcat(collect(1.0:6.0), zeros(6), zeros(6))
+        agh = Float64[0.1, 0.1, 1.0, 1.0, 2.0, 2.0]   # only NBS1 near ground
+
+        # Rule B ON (default): NBS2 merges into NBS1 → a single branch in one tree.
+        res_on = FLiP.assemble_segments(graph, coords, nbs_id, node_id, agh,
+                                        graph_skeleton, skel_pc)
+        @test all(>(Int32(0)), res_on.tree_id)
+        @test length(unique(res_on.tree_nbs_id[res_on.tree_nbs_id .> 0])) == 1
+
+        # Rule B OFF: NBS2 stays its own branch → two branches within the one tree.
+        res_off = FLiP.assemble_segments(graph, coords, nbs_id, node_id, agh,
+                                         graph_skeleton, skel_pc; enable_rule_b=false)
+        @test length(unique(res_off.tree_id[res_off.tree_id .> 0])) == 1      # still one tree
+        @test length(unique(res_off.tree_nbs_id[res_off.tree_nbs_id .> 0])) == 2  # two branches
+    end
+
     # Defaults: occlusion_tol=0.1, sub_res=0.05 → exact link distance 0.15, voxel 0.2.
     @testset "assemble_occluded_segments: orphan branch adjacent to grounded tree" begin
         coords = Float64[
