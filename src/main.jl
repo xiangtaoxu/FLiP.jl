@@ -94,12 +94,15 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
     fmt = lowercase(cfg.pipeline.output_format)
     ground_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "ground", fmt)
     agh_path    = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "agh",    fmt)
+    # Ground mesh is a triangulated surface, always written as PLY (CloudCompare-readable)
+    ground_mesh_path = get_output_path(cfg.pipeline.output_dir, cfg.pipeline.output_prefix, "ground_mesh", "ply")
 
     if !cfg.pipeline.enable_ground_segmentation
         _log_stage_skipped("ground_segmentation")
         return (ground=nothing, agh=nothing,
                 ground_path=ground_path, agh_path=agh_path,
-                ground_written=false, agh_written=false,
+                ground_mesh_path=ground_mesh_path,
+                ground_written=false, agh_written=false, ground_mesh_written=false,
                 n_preprocess=0, n_ground=0)
     end
 
@@ -115,9 +118,29 @@ function _stage_ground(cfg::FLiPConfig, pc_preprocess)
             agh_written = true
         end
 
+        # Triangulated ground surface from the dense interpolated lattice (PLY for CloudCompare)
+        ground_mesh_written = false
+        if cfg.pipeline.enable_ground_mesh
+            if npoints(res.ground_points) >= 3
+                mesh = build_ground_mesh(res.ground_points;
+                                         xy_resolution=cfg.pipeline.xy_resolution,
+                                         idw_k=cfg.pipeline.idw_k,
+                                         idw_power=cfg.pipeline.idw_power)
+                if isempty(mesh.faces)
+                    @warn "$_LOG_PREFIX   ground mesh: lattice too small to triangulate; skipping"
+                else
+                    write_ply_mesh(ground_mesh_path, mesh.vertices, mesh.faces)
+                    @info "$_LOG_PREFIX   wrote: $ground_mesh_path"
+                    ground_mesh_written = true
+                end
+            else
+                @warn "$_LOG_PREFIX   ground mesh: fewer than 3 ground points; skipping"
+            end
+        end
+
         (ground=res.ground_points, agh=res.agh_cloud,
-         ground_path=ground_path, agh_path=agh_path,
-         ground_written=true, agh_written=agh_written,
+         ground_path=ground_path, agh_path=agh_path, ground_mesh_path=ground_mesh_path,
+         ground_written=true, agh_written=agh_written, ground_mesh_written=ground_mesh_written,
          n_preprocess=npoints(res.agh_cloud), n_ground=npoints(res.ground_points))
     end
 end
@@ -312,6 +335,8 @@ function _summarize(cfg::FLiPConfig, pp_output, g_output, t_output, q_output, r_
                       n_points=g_output.n_ground),
         agh        = (path=g_output.agh_path,
                       written=g_output.agh_written),
+        ground_mesh = (path=g_output.ground_mesh_path,
+                       written=g_output.ground_mesh_written),
         tree       = (path=t_output.tree_path,
                       written=t_output.tree_written,
                       n_components=t_output.n_components),

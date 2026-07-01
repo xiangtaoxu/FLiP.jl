@@ -148,6 +148,43 @@
         @test any(isfinite, agh)
     end
 
+    @testset "build_ground_mesh + write_ply_mesh" begin
+        # 3×3 ground lattice over [0,2]×[0,2] at 1 m spacing → 9 vertices, 8 triangles
+        coords = Matrix{Float64}(undef, 9, 3)
+        i = 1
+        for y in 0.0:1.0:2.0, x in 0.0:1.0:2.0
+            coords[i, :] .= (x, y, 0.1 * x + 0.2 * y)   # tilted plane
+            i += 1
+        end
+        ground = make_test_pointcloud(coords)
+
+        mesh = build_ground_mesh(ground; xy_resolution=1.0, idw_k=4, idw_power=2.0)
+        @test size(mesh.vertices) == (9, 3)
+        @test length(mesh.faces) == 8                       # 2*(3-1)*(3-1)
+        @test all(f -> all(x -> 1 <= x <= 9, f), mesh.faces)
+        @test all(isfinite, mesh.vertices)
+
+        # PLY round-trip: header counts + 0-based, in-range face indices
+        path = joinpath(mktempdir(), "g_ground_mesh.ply")
+        @test write_ply_mesh(path, mesh.vertices, mesh.faces) == path
+        lines = readlines(path)
+        @test lines[1] == "ply"
+        @test "element vertex 9" in lines
+        @test "element face 8" in lines
+        face_lines = filter(l -> startswith(l, "3 "), lines)
+        @test length(face_lines) == 8
+        for fl in face_lines
+            idxs = parse.(Int, split(fl)[2:end])
+            @test length(idxs) == 3
+            @test all(x -> 0 <= x <= 8, idxs)               # PLY indices are 0-based
+        end
+
+        # Degenerate single-cell lattice → no triangles
+        flat = make_test_pointcloud(Float64[0.0 0.0 0.0; 0.1 0.0 0.0; 0.0 0.1 0.0])
+        deg = build_ground_mesh(flat; xy_resolution=10.0, idw_k=3)
+        @test isempty(deg.faces)
+    end
+
     @testset "Convex hull 2D" begin
         # Square points
         pts = [0.0 0.0; 1.0 0.0; 1.0 1.0; 0.0 1.0; 0.5 0.5]

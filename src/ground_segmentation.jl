@@ -156,6 +156,58 @@ end
 # ── Step 3: above-ground height ───────────────────────────────────
 
 """
+    _interpolate_ground_grid(ground_coords; xy_resolution, idw_k, idw_power)
+        -> (grid_xy::Matrix{Float64}, grid_z::Vector{Float64}, nx::Int, ny::Int)
+
+Build the regular XY lattice over the ground bounding box at `xy_resolution`
+spacing and fill every cell with IDW-interpolated z from the `idw_k` nearest
+ground points (one [`interpolate_idw`](@ref) call). Shared by
+`calculate_aboveground_height` (snap-to-cell AGH) and `build_ground_mesh`
+(dense ground surface) so both use the identical lattice. `grid_xy` is
+row-major: `row = iy*nx + ix + 1` for 0-based `ix ∈ 0:nx-1`, `iy ∈ 0:ny-1`.
+"""
+function _interpolate_ground_grid(ground_coords::AbstractMatrix{<:Real};
+                                  xy_resolution::Real, idw_k::Integer, idw_power::Real)
+    size(ground_coords, 2) == 3 || throw(ArgumentError("ground coordinates must be N×3 matrix"))
+    xy_resolution > 0 || throw(ArgumentError("xy_resolution must be > 0"))
+    idw_k >= 1 || throw(ArgumentError("idw_k must be >= 1"))
+    idw_power > 0 || throw(ArgumentError("idw_power must be > 0"))
+
+    # Ground XY bbox (single pass; also validates finiteness)
+    xmin = Inf; ymin = Inf
+    xmax = -Inf; ymax = -Inf
+    @inbounds for i in 1:size(ground_coords, 1)
+        x = float(ground_coords[i, 1])
+        y = float(ground_coords[i, 2])
+        z = float(ground_coords[i, 3])
+        (isfinite(x) && isfinite(y) && isfinite(z)) ||
+            throw(ArgumentError("ground_points contain non-finite values"))
+        x < xmin && (xmin = x); x > xmax && (xmax = x)
+        y < ymin && (ymin = y); y > ymax && (ymax = y)
+    end
+
+    # Regular grid covering the bbox at xy_resolution spacing
+    step = float(xy_resolution)
+    nx = max(1, floor(Int, (xmax - xmin) / step) + 1)
+    ny = max(1, floor(Int, (ymax - ymin) / step) + 1)
+    n_grid = nx * ny
+    grid_xy = Matrix{Float64}(undef, n_grid, 2)
+    @inbounds for iy in 0:(ny - 1), ix in 0:(nx - 1)
+        row = iy * nx + ix + 1
+        grid_xy[row, 1] = xmin + ix * step
+        grid_xy[row, 2] = ymin + iy * step
+    end
+
+    # One batched IDW call fills every grid cell from k nearest ground points
+    grid_z = interpolate_idw(@view(ground_coords[:, 1:2]),
+                             @view(ground_coords[:, 3]),
+                             grid_xy;
+                             k=idw_k, power=idw_power)
+
+    return (grid_xy=grid_xy, grid_z=grid_z, nx=nx, ny=ny)
+end
+
+"""
     calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
         xy_resolution::Real, idw_k::Int=8, idw_power::Real=2.0,
         ground_polygon::Union{Nothing,AbstractMatrix}=nothing) -> Vector{Float64}
@@ -204,36 +256,13 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     size(points, 2) == 3 || throw(ArgumentError("points must be N×3 matrix"))
     n = size(points, 1)
 
-    # 1. Ground XY bbox (single pass; also validates finiteness)
-    xmin = Inf; ymin = Inf
-    xmax = -Inf; ymax = -Inf
-    @inbounds for i in 1:size(ground_coords, 1)
-        x = float(ground_coords[i, 1])
-        y = float(ground_coords[i, 2])
-        z = float(ground_coords[i, 3])
-        (isfinite(x) && isfinite(y) && isfinite(z)) ||
-            throw(ArgumentError("ground_points contain non-finite values"))
-        x < xmin && (xmin = x); x > xmax && (xmax = x)
-        y < ymin && (ymin = y); y > ymax && (ymax = y)
-    end
-
-    # 2. Regular grid covering the bbox at xy_resolution spacing
-    step = float(xy_resolution)
-    nx = max(1, floor(Int, (xmax - xmin) / step) + 1)
-    ny = max(1, floor(Int, (ymax - ymin) / step) + 1)
-    n_grid = nx * ny
-    grid_xy = Matrix{Float64}(undef, n_grid, 2)
-    @inbounds for iy in 0:(ny - 1), ix in 0:(nx - 1)
-        row = iy * nx + ix + 1
-        grid_xy[row, 1] = xmin + ix * step
-        grid_xy[row, 2] = ymin + iy * step
-    end
-
-    # 3. One batched IDW call fills every grid cell from k nearest ground points
-    grid_z = interpolate_idw(@view(ground_coords[:, 1:2]),
-                             @view(ground_coords[:, 3]),
-                             grid_xy;
-                             k=idw_k, power=idw_power)
+    # 1-3. Build + IDW-fill the dense ground lattice (shared with build_ground_mesh)
+    grid = _interpolate_ground_grid(ground_coords;
+                                    xy_resolution=xy_resolution, idw_k=idw_k, idw_power=idw_power)
+    grid_xy = grid.grid_xy
+    grid_z  = grid.grid_z
+    n_grid  = size(grid_xy, 1)
+    step    = float(xy_resolution)
 
     # 4. KDTree on grid samples (2 × n_grid layout for NearestNeighbors)
     grid_xy_t = Matrix{Float64}(undef, 2, n_grid)
@@ -273,4 +302,50 @@ function calculate_aboveground_height(pc::PointCloud, ground_points::PointCloud;
     end
 
     return agh
+end
+
+"""
+    build_ground_mesh(ground_points::PointCloud;
+                      xy_resolution, idw_k=8, idw_power=2.0)
+        -> (vertices::Matrix{Float64}, faces::Vector{NTuple{3,Int}})
+
+Build a triangulated ground surface from the dense IDW-interpolated ground
+lattice — the same grid [`calculate_aboveground_height`](@ref) uses (via
+[`_interpolate_ground_grid`](@ref)). Vertices are the lattice points
+`(x, y, z_idw)`; `faces` are the structured two-triangles-per-cell mesh of the
+regular `nx × ny` grid, as 1-based vertex-index triples. `faces` is empty if the
+lattice is too thin (`nx < 2` or `ny < 2`) to form a triangle.
+"""
+function build_ground_mesh(ground_points::PointCloud;
+                           xy_resolution::Real, idw_k::Integer=8, idw_power::Real=2.0)
+    npoints(ground_points) >= 3 || throw(ArgumentError(
+        "ground_points must contain at least 3 points to build a mesh; got $(npoints(ground_points))"))
+
+    grid = _interpolate_ground_grid(coordinates(ground_points);
+                                    xy_resolution=xy_resolution, idw_k=idw_k, idw_power=idw_power)
+    nx, ny = grid.nx, grid.ny
+    n_grid = nx * ny
+
+    vertices = Matrix{Float64}(undef, n_grid, 3)
+    @inbounds for i in 1:n_grid
+        vertices[i, 1] = grid.grid_xy[i, 1]
+        vertices[i, 2] = grid.grid_xy[i, 2]
+        vertices[i, 3] = grid.grid_z[i]
+    end
+
+    # Structured triangulation of the regular lattice (row = iy*nx + ix + 1).
+    faces = NTuple{3,Int}[]
+    if nx >= 2 && ny >= 2
+        sizehint!(faces, 2 * (nx - 1) * (ny - 1))
+        @inbounds for iy in 0:(ny - 2), ix in 0:(nx - 2)
+            v00 = iy * nx + ix + 1
+            v10 = iy * nx + (ix + 1) + 1
+            v01 = (iy + 1) * nx + ix + 1
+            v11 = (iy + 1) * nx + (ix + 1) + 1
+            push!(faces, (v00, v10, v11))
+            push!(faces, (v00, v11, v01))
+        end
+    end
+
+    return (vertices=vertices, faces=faces)
 end

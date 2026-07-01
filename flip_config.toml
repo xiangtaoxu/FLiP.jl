@@ -35,6 +35,7 @@ enable_subsample           = true    # If true, downstream stages use the subsam
 enable_preprocess          = true     # Stage 1: optional denoising
 enable_ground_segmentation = true     # Stage 2: ground vs. above-ground split
 enable_agh                 = true     # Above-ground-height attribute via IDW interpolation
+enable_ground_mesh         = true     # Triangulated dense ground surface → <prefix>ground_mesh.ply (CloudCompare)
 enable_tree_segmentation   = true     # Stage 3: per-tree clustering
 enable_qsm                 = true     # Stage 4: quantitative structural modeling
 enable_generate_report     = true     # Optional summary report (currently placeholder)

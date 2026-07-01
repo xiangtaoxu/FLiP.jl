@@ -88,6 +88,7 @@ export bounds, center
 export read_las, read_laz, write_las, write_laz
 export read_e57, write_e57
 export read_pc, write_pc
+export write_ply_mesh
 export PointCloudMetadata
 export read_las_metadata, read_laz_metadata, read_e57_metadata, read_pc_metadata
 
@@ -139,6 +140,7 @@ export assemble_segments
 # Export pipeline functions
 export preprocess, find_input_files
 export calculate_aboveground_height
+export build_ground_mesh
 export model_nbs
 export write_biometrics, assemble_surface_cloud
 export refine_nbs

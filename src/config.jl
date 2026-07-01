@@ -171,6 +171,7 @@ mutable struct PipelineCfg
     enable_preprocess::Bool
     enable_ground_segmentation::Bool
     enable_agh::Bool
+    enable_ground_mesh::Bool
     enable_tree_segmentation::Bool
     enable_qsm::Bool
     enable_generate_report::Bool
@@ -201,6 +202,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_preprocess",          true)),
     Bool(get(d, "enable_ground_segmentation", true)),
     Bool(get(d, "enable_agh",                 true)),
+    Bool(get(d, "enable_ground_mesh",         true)),
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
     Bool(get(d, "enable_generate_report",     true)),

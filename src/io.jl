@@ -517,6 +517,44 @@ function write_pc(path::AbstractString, pc::PointCloud)
     end
 end
 
+# ── Mesh output ───────────────────────────────────────────────────
+
+"""
+    write_ply_mesh(path, vertices::AbstractMatrix{<:Real},
+                   faces::AbstractVector{<:NTuple{3,<:Integer}})
+
+Write a triangular mesh to an ASCII PLY file readable by CloudCompare, MeshLab,
+etc. `vertices` is an N×3 matrix of XYZ; `faces` are 1-based triangle vertex
+indices (written as PLY's 0-based `vertex_indices`). Coordinates are written as
+`double` to preserve full precision.
+"""
+function write_ply_mesh(path::AbstractString,
+                        vertices::AbstractMatrix{<:Real},
+                        faces::AbstractVector{<:NTuple{3,<:Integer}})
+    size(vertices, 2) == 3 || throw(ArgumentError("vertices must be an N×3 matrix"))
+    nv = size(vertices, 1)
+    nf = length(faces)
+    open(path, "w") do io
+        println(io, "ply")
+        println(io, "format ascii 1.0")
+        println(io, "comment created by FLiP.jl")
+        println(io, "element vertex ", nv)
+        println(io, "property double x")
+        println(io, "property double y")
+        println(io, "property double z")
+        println(io, "element face ", nf)
+        println(io, "property list uchar int vertex_indices")
+        println(io, "end_header")
+        @inbounds for i in 1:nv
+            println(io, vertices[i, 1], " ", vertices[i, 2], " ", vertices[i, 3])
+        end
+        @inbounds for f in faces                # PLY vertex indices are 0-based
+            println(io, "3 ", f[1] - 1, " ", f[2] - 1, " ", f[3] - 1)
+        end
+    end
+    return path
+end
+
 # ── Metadata-only reads ───────────────────────────────────────────
 
 """
