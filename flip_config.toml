@@ -2,22 +2,32 @@
 # FLiP.jl configuration file
 # ════════════════════════════════════════════════════════════════════════════
 #
-# This file controls the FLiP forest LiDAR processing pipeline. Sections are
-# ordered to match pipeline execution: I/O → preprocess → ground → tree → QSM.
-# Each section banner explains what stage it controls; edit values to tune.
+# This file controls the FLiP forest LiDAR processing pipeline. It is split into
+# two parts:
+#
+#   BASIC    — everything a typical user needs to process a dataset: input/output
+#              paths, subsampling, and which stages to run. Most users only edit
+#              this part.
+#
+#   ADVANCED — tuning parameters for technical users, researchers, and developers
+#              (interpolation, threading, and per-stage algorithm settings). The
+#              defaults are sensible; change these only when you know why.
 #
 # Reload at runtime:  FLiP.load_config!("path/to/this/file")
 # Run the pipeline:   FLiP.run_pipeline(config_path = "path/to/this/file")
 #
 # Field names below match Julia struct paths exactly, e.g.
 #   `tree.model.min_node_size` (TOML) ↔ `cfg.tree.model.min_node_size` (Julia).
+# Section order and comments are cosmetic — only the [section] and key names matter.
 # ════════════════════════════════════════════════════════════════════════════
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Pipeline — I/O paths, stage toggles, shared data parameters
-# ════════════════════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                                  BASIC                                     ║
+# ║        I/O paths · subsampling · which pipeline stages to run             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 [pipeline]
+
 # --- I/O ---
 input_path           = ""             # File path OR directory (use input_prefix to filter)
 input_prefix         = ""             # Filename prefix filter when input_path is a directory ("" = all files)
@@ -27,11 +37,11 @@ output_prefix        = "output"       # Prefix prepended to every written file
 output_format        = "las"          # "las" or "e57"
 coordinate_precision = "Float32"      # "Float32" (memory-efficient) or "Float64" (high precision)
 
-# --- Data parameters ---
-subsample_res = 0.05                  # Minimum point spacing (m) for optional subsampling
+# --- Subsampling ---
+subsample_res    = 0.05               # Minimum point spacing (m) for optional subsampling
+enable_subsample = true               # If true, downstream stages use the subsampled cloud
 
-# --- Stage toggles (true = run, false = skip) ---
-enable_subsample           = true    # If true, downstream stages use the subsampled cloud
+# --- Pipeline control (stage toggles; true = run, false = skip) ---
 enable_preprocess          = true     # Stage 1: optional denoising
 enable_ground_segmentation = true     # Stage 2: ground vs. above-ground split
 enable_agh                 = true     # Above-ground-height attribute via IDW interpolation
@@ -40,10 +50,29 @@ enable_tree_segmentation   = true     # Stage 3: per-tree clustering
 enable_qsm                 = true     # Stage 4: quantitative structural modeling
 enable_generate_report     = true     # Optional summary report (currently placeholder)
 
-# --- Logging ---
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                                ADVANCED                                    ║
+# ║   Tuning for technical users / researchers / developers. Defaults are     ║
+# ║   sensible; change only when you understand the effect.                    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ── Pipeline-level tuning ────────────────────────────────────────────────────
+# NOTE: the keys below still belong to the [pipeline] table above (TOML requires
+# a single [pipeline] table); they are grouped here because they are advanced.
+
+# Ground interpolation (only used if enable_agh = true)
+xy_resolution = 0.05                  # Grid cell size (m) for IDW interpolation
+idw_k         = 8                     # Number of nearest neighbors
+idw_power     = 2.0                   # IDW distance-weighting exponent
+
+# Extra diagnostic output
+enable_surface_cloud = false          # Write the per-NBS QSM surface point cloud (<prefix>qsm_surface.laz); off by default
+
+# Logging
 enable_debug_info = false             # If true, show low-level helper @info logs (assembly iteration, orphan rescue, etc.); default false silences them
 
-# --- Threading ---
+# Threading
 # Number of threads for parallelizable inner loops (statistical_filter, NBS PCA,
 # orphan KDTree voting, tree aggregation, per-connected-component segmentation).
 # Positive  → use that many threads (capped by Julia's --threads count).
@@ -52,11 +81,6 @@ enable_debug_info = false             # If true, show low-level helper @info log
 # Julia must be launched with `julia --threads=N` (or JULIA_NUM_THREADS=N) for
 # this to have any effect.
 n_thread = 1
-
-# --- Ground interpolation (only used if enable_agh = true) ---
-xy_resolution = 0.05                  # Grid cell size (m) for IDW interpolation
-idw_k         = 8                     # Number of nearest neighbors
-idw_power     = 2.0                   # IDW distance-weighting exponent
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -80,7 +104,7 @@ n_sigma     = 1.0                     # Outlier threshold: mean + n_sigma × std
 [segment_ground]
 voxel_size         = 0.5              # Voxel size (m) for connected-component pre-filter
 min_cc_size        = 50               # Minimum component size for the CC pre-filter
-grid_size          = 0.5              # XY grid cell size (m) for grid z-min filter
+grid_size          = 0.5             # XY grid cell size (m) for grid z-min filter
 cone_theta_deg     = 60.0             # Upward-cone half-angle (degrees) for vegetation removal
 polygon_buffer     = 0.0              # Buffer distance (m) around ground convex hull for cropping
 enable_ground_crop = true             # Crop point cloud to buffered ground polygon before AGH
@@ -92,8 +116,8 @@ enable_ground_crop = true             # Crop point cloud to buffered ground poly
 # nested [tree] domain:
 #   [tree]          — KEY extraction dials you tune per dataset (TLS vs MLS vs ALS)
 #   [tree.assembly] — tree-assembly gates (also used by refine Rule B)
-#   [tree.refine]   — pre-assembly NBS refinement (advanced)
-#   [tree.model]    — QSM cylinder fitting; drives BOTH the trial and final model (advanced)
+#   [tree.refine]   — pre-assembly NBS refinement
+#   [tree.model]    — QSM cylinder fitting; drives BOTH the trial and final model
 # ════════════════════════════════════════════════════════════════════════════
 [tree]
 neighbor_radius          = -1.0   # CC/NBS graph radius; if ≤ 0, defaults to 2.0 × pipeline.subsample_res

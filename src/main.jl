@@ -198,8 +198,9 @@ function _stage_qsm(cfg::FLiPConfig, tree_res, config_path::AbstractString)
         dir = cfg.pipeline.output_dir; prefix = cfg.pipeline.output_prefix
         tree_path = get_output_path(dir, prefix, "tree", fmt)
 
-        m = model_nbs(pc=pc, cfg=cfg, group_attr=:tree_nbs_id, node_id_attr=:node_id, emit_surface=true)
-        surf = assemble_surface_cloud(m.surface_parts)
+        emit_surface = cfg.pipeline.enable_surface_cloud
+        m = model_nbs(pc=pc, cfg=cfg, group_attr=:tree_nbs_id, node_id_attr=:node_id, emit_surface=emit_surface)
+        surf = assemble_surface_cloud(m.surface_parts)   # empty when emit_surface is off → not written below
         surf_path = joinpath(dir, "$(prefix)qsm_surface.laz")
         # Only the :success path writes outputs (matches the original early-return behavior on
         # :no_data / :no_linear_nbs, which left the tree-stage file untouched).

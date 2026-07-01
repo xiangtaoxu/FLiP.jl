@@ -174,6 +174,7 @@ mutable struct PipelineCfg
     enable_ground_mesh::Bool
     enable_tree_segmentation::Bool
     enable_qsm::Bool
+    enable_surface_cloud::Bool
     enable_generate_report::Bool
 
     # Logging
@@ -205,6 +206,7 @@ PipelineCfg(d::Dict) = PipelineCfg(
     Bool(get(d, "enable_ground_mesh",         true)),
     Bool(get(d, "enable_tree_segmentation",   true)),
     Bool(get(d, "enable_qsm",                 true)),
+    Bool(get(d, "enable_surface_cloud",       false)),
     Bool(get(d, "enable_generate_report",     true)),
     Bool(get(d, "enable_debug_info",          false)),
     Int( get(d, "n_thread",                   1)),
